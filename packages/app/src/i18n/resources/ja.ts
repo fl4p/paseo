@@ -362,6 +362,10 @@ export const ja: TranslationResources = {
       withTokens: "コンテキストを圧縮しました（{{tokens}}Kトークン）",
       completed: "コンテキストを圧縮しました",
     },
+    peer: {
+      from: "{{sender}} から",
+      fromUnknown: "別のセッションから",
+    },
   },
   importSession: {
     chooseHostTitle: en.importSession.chooseHostTitle,

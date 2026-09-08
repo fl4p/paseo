@@ -363,6 +363,10 @@ export const fr: TranslationResources = {
       withTokens: "Contexte compacté (jetons{{tokens}}K)",
       completed: "Contexte compacté",
     },
+    peer: {
+      from: "De {{sender}}",
+      fromUnknown: "D'une autre session",
+    },
   },
   importSession: {
     chooseHostTitle: en.importSession.chooseHostTitle,

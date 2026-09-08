@@ -362,6 +362,10 @@ export const ptBR: TranslationResources = {
       withTokens: "Contexto compactado ({{tokens}}K tokens)",
       completed: "Contexto compactado",
     },
+    peer: {
+      from: "De {{sender}}",
+      fromUnknown: "De outra sessão",
+    },
   },
   importSession: {
     chooseHostTitle: en.importSession.chooseHostTitle,

@@ -44,6 +44,7 @@ import {
 } from "./model-manifest.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
+import { readClaudePeerMessage } from "./peer-message.js";
 import { ClaudeTaskState } from "./task-state.js";
 import {
   ClaudeTaskProtocolSource,
@@ -4330,6 +4331,26 @@ class ClaudeAgentSession implements AgentSession {
     message: Extract<SDKMessage, { type: "user" }>,
     events: AgentStreamEvent[],
   ): void {
+    const messageId =
+      typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
+    const peerMessage = readClaudePeerMessage(message);
+    if (peerMessage) {
+      if (messageId && this.emittedUserMessageIds.has(messageId)) {
+        return;
+      }
+      this.rememberEmittedUserMessageId(messageId);
+      events.push({
+        type: "timeline",
+        item: {
+          type: "user_message",
+          text: peerMessage.text,
+          origin: peerMessage.origin,
+          ...(messageId ? { messageId } : {}),
+        },
+        provider: "claude",
+      });
+      return;
+    }
     if (isSyntheticUserEntry(message)) {
       return;
     }
@@ -4337,8 +4358,6 @@ class ClaudeAgentSession implements AgentSession {
       this.compacting = false;
       return;
     }
-    const messageId =
-      typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
     if (messageId && this.emittedUserMessageIds.has(messageId)) {
       return;
     }
@@ -4989,10 +5008,7 @@ class ClaudeAgentSession implements AgentSession {
       typeof entry.uuid === "string" &&
       !isSyntheticHistoryUserEntry(entry) &&
       !isToolResultUserEntry(entry);
-    if (isVisibleUserEntry && typeof entry.uuid === "string") {
-      this.rememberUserMessageId(entry.uuid);
-      this.rememberRewindUserAnchor(entry.uuid);
-    }
+    this.rememberReplayedUserEntry(entry, isVisibleUserEntry);
     if (entry.type === "assistant" && typeof entry.uuid === "string") {
       this.rememberRewindAssistantAnchor(entry.uuid);
     }
@@ -5004,6 +5020,24 @@ class ClaudeAgentSession implements AgentSession {
           timestamp: historyTimestamp ?? undefined,
         })),
       );
+    }
+  }
+
+  /**
+   * A peer's message is not a rewind point, but the live stream can deliver it again after a
+   * resume, so its id still has to be remembered as emitted.
+   */
+  private rememberReplayedUserEntry(entry: Record<string, unknown>, isVisible: boolean): void {
+    if (typeof entry.uuid !== "string") {
+      return;
+    }
+    if (isVisible) {
+      this.rememberUserMessageId(entry.uuid);
+      this.rememberRewindUserAnchor(entry.uuid);
+      return;
+    }
+    if (readClaudePeerMessage(entry)) {
+      this.rememberEmittedUserMessageId(entry.uuid);
     }
   }
 
@@ -5952,6 +5986,20 @@ function mapAssistantHistoryBlocksWithMessageId(
   return items;
 }
 
+function buildPeerMessageTimelineItem(entry: ClaudeHistoryEntry): AgentTimelineItem | null {
+  const peerMessage = readClaudePeerMessage(entry);
+  if (!peerMessage) {
+    return null;
+  }
+  const messageId = typeof entry.uuid === "string" && entry.uuid.length > 0 ? entry.uuid : null;
+  return {
+    type: "user_message",
+    text: peerMessage.text,
+    origin: peerMessage.origin,
+    ...(messageId ? { messageId } : {}),
+  };
+}
+
 function convertClaudeHistoryEntryPreamble(
   entry: ClaudeHistoryEntry,
 ): { shortCircuit: AgentTimelineItem[] } | { proceed: { content: unknown } } {
@@ -5976,6 +6024,10 @@ function convertClaudeHistoryEntryPreamble(
 
   if (entry.isCompactSummary) {
     return { shortCircuit: [] };
+  }
+  const peerMessageItem = buildPeerMessageTimelineItem(entry);
+  if (peerMessageItem) {
+    return { shortCircuit: [peerMessageItem] };
   }
   if (entry.type === "user" && isSyntheticHistoryUserEntry(entry)) {
     return { shortCircuit: [] };

@@ -360,6 +360,10 @@ export const ko: TranslationResources = {
       withTokens: "컨텍스트가 압축되었습니다 ({{tokens}}K 토큰)",
       completed: "컨텍스트가 압축되었습니다",
     },
+    peer: {
+      from: "{{sender}}(으)로부터",
+      fromUnknown: "다른 세션에서",
+    },
   },
   importSession: {
     chooseHostTitle: en.importSession.chooseHostTitle,

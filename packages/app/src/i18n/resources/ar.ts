@@ -359,6 +359,10 @@ export const ar: TranslationResources = {
       withTokens: "تم ضغط السياق (رموز{{tokens}}K)",
       completed: "تم ضغط السياق",
     },
+    peer: {
+      from: "من {{sender}}",
+      fromUnknown: "من جلسة أخرى",
+    },
   },
   importSession: {
     chooseHostTitle: en.importSession.chooseHostTitle,

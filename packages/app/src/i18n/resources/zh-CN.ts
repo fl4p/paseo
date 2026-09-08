@@ -359,6 +359,10 @@ export const zhCN: TranslationResources = {
       withTokens: "上下文已压缩（{{tokens}}K tokens）",
       completed: "上下文已压缩",
     },
+    peer: {
+      from: "来自 {{sender}}",
+      fromUnknown: "来自另一个会话",
+    },
   },
   importSession: {
     chooseHostTitle: en.importSession.chooseHostTitle,

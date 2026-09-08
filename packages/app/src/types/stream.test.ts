@@ -149,6 +149,61 @@ describe("user message identity", () => {
     );
   });
 
+  it("keeps the sender on a peer message", () => {
+    const result = applyStreamEvent({
+      tail: [],
+      head: [],
+      event: {
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "user_message",
+          text: "I changed things under you on farmgw.",
+          messageId: "peer-1",
+          origin: { kind: "peer", name: "dragino", address: "uds:/tmp/cc-socks/65428.sock" },
+        },
+      },
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+    });
+
+    expect(result.tail[0]).toEqual(
+      expect.objectContaining({
+        kind: "user_message",
+        messageId: "peer-1",
+        origin: { kind: "peer", name: "dragino", address: "uds:/tmp/cc-socks/65428.sock" },
+      }),
+    );
+  });
+
+  it("does not reconcile a peer message into a local submission that shares its text", () => {
+    const optimistic = createUserMessage({
+      clientMessageId: "hello-client",
+      text: "hello",
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+    });
+
+    const result = applyStreamEvent({
+      tail: [optimistic],
+      head: [],
+      event: {
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "user_message",
+          text: "hello",
+          messageId: "peer-1",
+          origin: { kind: "peer", name: "dragino" },
+        },
+      },
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+    });
+
+    expect(result.tail).toHaveLength(2);
+    expect(result.tail[1]).toEqual(
+      expect.objectContaining({ messageId: "peer-1", origin: { kind: "peer", name: "dragino" } }),
+    );
+  });
+
   it("clears provisional optimistic turn membership for a legacy canonical row", () => {
     const optimistic = createUserMessage({
       clientMessageId: "hello-client",

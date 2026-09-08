@@ -361,6 +361,10 @@ export const ru: TranslationResources = {
       withTokens: "Контекст сжат ({{tokens}} тыс. токенов)",
       completed: "Контекст сжат",
     },
+    peer: {
+      from: "От {{sender}}",
+      fromUnknown: "Из другой сессии",
+    },
   },
   importSession: {
     chooseHostTitle: en.importSession.chooseHostTitle,

@@ -357,6 +357,10 @@ export const en = {
       withTokens: "Context compacted ({{tokens}}K tokens)",
       completed: "Context compacted",
     },
+    peer: {
+      from: "From {{sender}}",
+      fromUnknown: "From another session",
+    },
   },
   importSession: {
     title: "Import session",

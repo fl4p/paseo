@@ -2,6 +2,7 @@ import type {
   AgentProvider,
   AgentTimelineItem,
   JsonValue,
+  PeerMessageOrigin,
   ToolCallDetail,
 } from "@getpaseo/protocol/agent-types";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
@@ -101,6 +102,7 @@ export interface UserMessageItem {
   timestamp: Date;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
+  origin?: PeerMessageOrigin;
 }
 
 export interface UserMessageInput {
@@ -113,6 +115,7 @@ export interface UserMessageInput {
   timestamp: Date;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
+  origin?: PeerMessageOrigin;
 }
 
 export function createUserMessage(input: UserMessageInput): UserMessageItem {
@@ -133,6 +136,7 @@ export function createUserMessage(input: UserMessageInput): UserMessageItem {
     ...(input.attachments && input.attachments.length > 0
       ? { attachments: input.attachments }
       : {}),
+    ...(input.origin ? { origin: input.origin } : {}),
   };
 }
 
@@ -192,6 +196,9 @@ function matchesLegacyCanonicalUserMessage(
 ): boolean {
   if (submitted.clientMessageId === undefined || submitted.messageId !== undefined) return false;
   if (canonical.messageId === undefined) return false;
+  // A peer's message is nobody's local submission, and matching on text alone would swallow one
+  // that quotes what you just sent.
+  if (canonical.origin) return false;
   return canonical.messageId === submitted.clientMessageId || canonical.text === submitted.text;
 }
 
@@ -881,17 +888,20 @@ export function handoffCreatedAgentUserMessageToStream(params: {
   });
 }
 
-function appendUserMessage(
-  state: StreamItem[],
-  text: string,
-  timestamp: Date,
-  _source: StreamUpdateSource,
-  messageId?: string,
-  clientMessageId?: string,
-  timelineCursor?: TimelinePosition,
-  turnId?: string,
-): StreamItem[] {
-  const { chunk, hasContent } = normalizeChunk(text);
+interface AppendUserMessageInput {
+  state: StreamItem[];
+  text: string;
+  timestamp: Date;
+  messageId?: string;
+  clientMessageId?: string;
+  timelineCursor?: TimelinePosition;
+  turnId?: string;
+  origin?: PeerMessageOrigin;
+}
+
+function appendUserMessage(input: AppendUserMessageInput): StreamItem[] {
+  const { state, timestamp, messageId } = input;
+  const { chunk, hasContent } = normalizeChunk(input.text);
   if (!hasContent) {
     return state;
   }
@@ -899,12 +909,13 @@ function appendUserMessage(
   const chunkSeed = chunk.trim() || chunk;
   const nextItem = createUserMessage({
     id: messageId ?? createUniqueTimelineId(state, "user", chunkSeed, timestamp),
-    clientMessageId,
+    clientMessageId: input.clientMessageId,
     messageId,
-    timelineCursor,
-    turnId,
+    timelineCursor: input.timelineCursor,
+    turnId: input.turnId,
     text: chunk,
     timestamp,
+    origin: input.origin,
   });
   return upsertUserMessage(state, nextItem);
 }
@@ -1507,16 +1518,16 @@ function reduceTimelineEvent(
   switch (item.type) {
     case "user_message":
       return finalizeActiveThoughts(
-        appendUserMessage(
+        appendUserMessage({
           state,
-          item.text,
+          text: item.text,
           timestamp,
-          source,
-          item.messageId,
-          item.clientMessageId,
+          messageId: item.messageId,
+          clientMessageId: item.clientMessageId,
           timelineCursor,
-          event.turnId,
-        ),
+          turnId: event.turnId,
+          origin: item.origin,
+        }),
       );
     case "assistant_message":
       return finalizeActiveThoughts(
@@ -1964,6 +1975,7 @@ function applyCanonicalUserMessageEvent(params: {
     timelineCursor,
     text: normalized.chunk,
     timestamp,
+    origin: event.item.origin,
   });
   if (unmatchedInsert === "head") {
     const reconciled = upsertUserMessageAcrossStream({
