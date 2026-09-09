@@ -3391,7 +3391,7 @@ export class AgentManager {
       owner?: AgentOwner;
     },
   ): Promise<ManagedAgent> {
-    let registered = false;
+    let registeredAgent: ActiveManagedAgent | null = null;
     try {
       this.assertAcceptingAgentRegistrations();
       const resolvedAgentId = validateAgentId(agentId, "registerSession");
@@ -3422,7 +3422,7 @@ export class AgentManager {
 
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
-      registered = true;
+      registeredAgent = managed;
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       await this.refreshRuntimeInfo(managed, { emit: false });
@@ -3445,11 +3445,68 @@ export class AgentManager {
       this.subscribeToSession(managed);
       return { ...managed };
     } catch (error) {
-      if (!registered) {
+      if (registeredAgent) {
+        await this.unwindFailedRegistration(registeredAgent, session);
+      } else {
         await this.closeUnregisteredSession(session);
       }
       throw error;
     }
+  }
+
+  /**
+   * Undo a registration whose later steps failed.
+   *
+   * `registerSession` puts the agent into `this.agents` BEFORE the persistence
+   * writes that follow it, so a failure in any of them used to answer the
+   * caller with an error while a live agent record stayed behind. A caller that
+   * treats its own failure as atomic then rolls back what IT created: the
+   * native fork deletes the branched provider transcript, and the surviving
+   * record is left pointing at a file that is gone, so resuming it loses the
+   * provider history the fork existed to keep.
+   *
+   * The registration is this method's own, so it unwinds it here rather than
+   * asking every caller to clean up a half-built agent it cannot see. The
+   * caller keeps and reports the ORIGINAL error: every step below is best
+   * effort and a failure is logged, never thrown.
+   *
+   * Skipped when `this.agents` no longer holds the record we put there — a
+   * concurrent close or a shutdown already took ownership of it, and removing
+   * someone else's agent would be worse than leaking ours.
+   */
+  private async unwindFailedRegistration(
+    agent: ActiveManagedAgent,
+    session: AgentSession,
+  ): Promise<void> {
+    if (this.agents.get(agent.id) !== agent) {
+      return;
+    }
+    // Same in-memory teardown a close performs, minus the events: this agent
+    // must end up as if it had never been registered, not as a closed one.
+    this.prepareAgentForClosure(agent, "agent registration failed");
+    await this.closeUnregisteredSession(session);
+    try {
+      await this.deleteAgentState(agent.id);
+    } catch (error) {
+      this.logger.warn(
+        { err: error, agentId: agent.id },
+        "agent.register.unwind_state_failed: retained state may survive a failed registration",
+      );
+    }
+    try {
+      // Snapshot writes may already have landed; without this the agent comes
+      // back on the next daemon start, still pointing at a rolled-back session.
+      await this.registry?.remove(agent.id);
+    } catch (error) {
+      this.logger.warn(
+        { err: error, agentId: agent.id },
+        "agent.register.unwind_snapshot_failed: a durable record may survive a failed registration",
+      );
+    }
+    this.logger.warn(
+      { agentId: agent.id },
+      "agent.register.unwound: removed the agent registered by a failed registerSession",
+    );
   }
 
   private assertAcceptingAgentRegistrations(): void {
