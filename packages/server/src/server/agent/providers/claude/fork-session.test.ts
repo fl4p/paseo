@@ -15,13 +15,13 @@ const TRANSCRIPT = [
   JSON.stringify({
     type: "assistant",
     uuid: "uuid-assistant-1",
-    message: { id: "msg_live_1", content: [] },
+    message: { id: "msg_live_1", content: [], stop_reason: "end_turn" },
   }),
   JSON.stringify({ type: "user", uuid: "uuid-user-2", message: { content: "again" } }),
   JSON.stringify({
     type: "assistant",
     uuid: "uuid-assistant-2",
-    message: { id: "msg_live_2", content: [] },
+    message: { id: "msg_live_2", content: [], stop_reason: "end_turn" },
   }),
 ].join("\n");
 
@@ -61,13 +61,17 @@ const IN_FLIGHT_TRANSCRIPT = [
   JSON.stringify({
     type: "assistant",
     uuid: "a1",
-    message: { id: "msg_1", content: [{ type: "text", text: "done" }] },
+    message: { id: "msg_1", content: [{ type: "text", text: "done" }], stop_reason: "end_turn" },
   }),
   JSON.stringify({ type: "user", uuid: "u2", message: { content: "next" } }),
   JSON.stringify({
     type: "assistant",
     uuid: "a2",
-    message: { id: "msg_2", content: [{ type: "tool_use", id: "tool_1", name: "Read" }] },
+    message: {
+      id: "msg_2",
+      content: [{ type: "tool_use", id: "tool_1", name: "Read" }],
+      stop_reason: "tool_use",
+    },
   }),
 ].join("\n");
 
@@ -93,7 +97,11 @@ describe("resolveSafeForkUuid", () => {
       })}\n${JSON.stringify({
         type: "assistant",
         uuid: "a3",
-        message: { id: "msg_3", content: [{ type: "text", text: "ok" }] },
+        message: {
+          id: "msg_3",
+          content: [{ type: "text", text: "ok" }],
+          stop_reason: "end_turn",
+        },
       })}`,
     );
     expect(resolveSafeForkUuid(settled)).toBe("a3");
@@ -108,16 +116,108 @@ describe("resolveSafeForkUuid", () => {
           type: "assistant",
           uuid: "s1",
           isSidechain: true,
-          message: { content: [{ type: "tool_use", id: "sub_1", name: "Grep" }] },
+          message: {
+            content: [{ type: "tool_use", id: "sub_1", name: "Grep" }],
+            stop_reason: "tool_use",
+          },
         }),
         JSON.stringify({
           type: "assistant",
           uuid: "a1",
-          message: { id: "msg_1", content: [{ type: "text", text: "done" }] },
+          message: {
+            id: "msg_1",
+            content: [{ type: "text", text: "done" }],
+            stop_reason: "end_turn",
+          },
         }),
       ].join("\n"),
     );
     expect(resolveSafeForkUuid(withSidechain, { requireTurnEnd: true })).toBe("a1");
+  });
+
+  /**
+   * The shape a real transcript actually has. Claude splits one assistant reply
+   * across separate entries carrying `thinking`, `text` and `tool_use` blocks,
+   * and every one of them repeats the WHOLE message's `stop_reason`. Sampled
+   * over ~2000 transcripts under `~/.claude/projects`, the commonest split in
+   * the corpus is exactly this: a leading `thinking`-only entry on a message
+   * whose stop reason is `tool_use`.
+   */
+  const SPLIT_TRANSCRIPT = parseTranscriptBoundaryEntries(
+    [
+      JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "done-think",
+        message: {
+          id: "msg_done",
+          content: [{ type: "thinking", thinking: "plan" }],
+          stop_reason: "end_turn",
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "done-text",
+        message: {
+          id: "msg_done",
+          content: [{ type: "text", text: "here you go" }],
+          stop_reason: "end_turn",
+        },
+      }),
+      JSON.stringify({ type: "user", uuid: "u2", message: { content: "next" } }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "live-think",
+        message: {
+          id: "msg_live",
+          content: [{ type: "thinking", thinking: "still working" }],
+          stop_reason: "tool_use",
+        },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "live-text",
+        message: {
+          id: "msg_live",
+          content: [{ type: "text", text: "let me check" }],
+          stop_reason: "tool_use",
+        },
+      }),
+    ].join("\n"),
+  );
+
+  it("does not mistake a mid-reply entry for a completed turn", () => {
+    // `live-think` and `live-text` open no tool call, so the old rule ("an
+    // assistant entry that opened nothing") accepted them -- while the reply
+    // they belong to still has a `tool_use` block coming.
+    expect(resolveSafeForkUuid(SPLIT_TRANSCRIPT, { requireTurnEnd: true })).toBe("done-text");
+  });
+
+  it("cuts at the LAST entry of a completed reply, not its first", () => {
+    // `done-think` already carries stop_reason end_turn, because the field
+    // describes the whole message; cutting there would drop the reply's text.
+    const untilFirstOfGroup = resolveSafeForkUuid(SPLIT_TRANSCRIPT, {
+      requireTurnEnd: true,
+      untilUuid: "done-think",
+    });
+    expect(untilFirstOfGroup).toBeNull();
+  });
+
+  it("treats an entry with no stop_reason as an unfinished turn, not a completed one", () => {
+    const noStopReason = parseTranscriptBoundaryEntries(
+      [
+        JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "a1",
+          message: { id: "msg_1", content: [{ type: "text", text: "partial" }] },
+        }),
+      ].join("\n"),
+    );
+    expect(resolveSafeForkUuid(noStopReason, { requireTurnEnd: true })).toBeNull();
+    // The tool-pairing invariant is unaffected: without turn-end enforcement
+    // this is still a safe place to cut.
+    expect(resolveSafeForkUuid(noStopReason)).toBe("a1");
   });
 
   it("stops at the requested boundary", () => {
@@ -132,7 +232,11 @@ describe("resolveSafeForkUuid", () => {
         JSON.stringify({
           type: "assistant",
           uuid: "a1",
-          message: { content: [{ type: "tool_use", id: "tool_1", name: "Read" }] },
+          message: {
+            id: "msg_1",
+            content: [{ type: "tool_use", id: "tool_1", name: "Read" }],
+            stop_reason: "tool_use",
+          },
         }),
       ].join("\n"),
     );
@@ -258,7 +362,11 @@ describe("forkClaudeSession", () => {
             JSON.stringify({
               type: "assistant",
               uuid: "a1",
-              message: { content: [{ type: "tool_use", id: "tool_1", name: "Read" }] },
+              message: {
+                id: "msg_1",
+                content: [{ type: "tool_use", id: "tool_1", name: "Read" }],
+                stop_reason: "tool_use",
+              },
             }),
           ].join("\n"),
       }),

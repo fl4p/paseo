@@ -31,7 +31,12 @@ const SOURCE_ENTRIES = [
   {
     type: "assistant",
     uuid: "a1",
-    message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "on it" }] },
+    message: {
+      id: "msg_1",
+      role: "assistant",
+      content: [{ type: "text", text: "on it" }],
+      stop_reason: "end_turn",
+    },
   },
   {
     type: "system",
@@ -43,13 +48,23 @@ const SOURCE_ENTRIES = [
   {
     type: "assistant",
     uuid: "a2",
-    message: { id: "msg_2", role: "assistant", content: [{ type: "text", text: "done" }] },
+    message: {
+      id: "msg_2",
+      role: "assistant",
+      content: [{ type: "text", text: "done" }],
+      stop_reason: "end_turn",
+    },
   },
   { type: "user", uuid: "u3", message: { role: "user", content: "third task" } },
   {
     type: "assistant",
     uuid: "a3",
-    message: { id: "msg_3", role: "assistant", content: [{ type: "text", text: "also done" }] },
+    message: {
+      id: "msg_3",
+      role: "assistant",
+      content: [{ type: "text", text: "also done" }],
+      stop_reason: "end_turn",
+    },
   },
 ];
 
@@ -459,6 +474,7 @@ describe("forkAgentSessionNatively", () => {
             id: "msg_4",
             role: "assistant",
             content: [{ type: "tool_use", id: "tool_1", name: "Read", input: {} }],
+            stop_reason: "tool_use",
           },
         },
       ]),

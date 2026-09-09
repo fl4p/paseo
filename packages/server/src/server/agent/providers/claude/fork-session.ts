@@ -44,7 +44,7 @@ export interface ClaudeForkBoundaryEntry {
   uuid?: unknown;
   type?: unknown;
   isSidechain?: unknown;
-  message?: { id?: unknown; content?: unknown } | null;
+  message?: { id?: unknown; content?: unknown; stop_reason?: unknown } | null;
 }
 
 function readString(value: unknown): string | null {
@@ -108,6 +108,53 @@ export function resolveForkBoundaryUuid(
   return apiMatch;
 }
 
+/**
+ * `stop_reason` values that mean the assistant's reply is OVER.
+ *
+ * `tool_use` is the odd one out: it ends the API response but not the turn — a
+ * tool result and another assistant message still have to follow. Values not
+ * listed here (including a missing or null one) are not treated as an ending.
+ */
+const TURN_ENDING_STOP_REASONS = new Set(["end_turn", "stop_sequence", "max_tokens"]);
+
+/**
+ * Does `entry` end an assistant turn?
+ *
+ * NOT "an assistant entry that opened no tool call". Claude splits one
+ * assistant reply across several transcript entries — thinking, then text,
+ * then tool_use — and the earlier ones open nothing at all. Measured over the
+ * ~2000 real transcripts under `~/.claude/projects`: of 92k split replies,
+ * 86,127 opened with an entry carrying only a `thinking` block while the
+ * message they belong to ended with `stop_reason: "tool_use"`. The old test
+ * called every one of those a completed turn, in the middle of a reply with a
+ * tool call still to come — exactly the case `requireTurnEnd` exists for.
+ *
+ * `message.stop_reason` is the signal that actually means it, and it is there
+ * to be read: all 266,976 real assistant entries carried the field, 57 of them
+ * null. It describes the whole API message rather than the entry, so it is
+ * paired with a check that this is the LAST entry of its `message.id` group —
+ * otherwise the opening `thinking` entry of an `end_turn` reply would still be
+ * picked while its text was still to come.
+ *
+ * An entry with no usable `stop_reason` is not a proven turn end. Refusing the
+ * fork ("no turn has completed yet") is recoverable; guessing produces a fork
+ * cut mid-reply, which is not.
+ */
+function endsAssistantTurn(
+  entry: ClaudeForkBoundaryEntry,
+  next: ClaudeForkBoundaryEntry | undefined,
+): boolean {
+  if (entry.type !== "assistant") {
+    return false;
+  }
+  const stopReason = readString(entry.message?.stop_reason);
+  if (!stopReason || !TURN_ENDING_STOP_REASONS.has(stopReason)) {
+    return false;
+  }
+  const messageId = readString(entry.message?.id);
+  return !messageId || readString(next?.message?.id) !== messageId;
+}
+
 /** Tool ids opened and closed by one transcript entry. */
 function readToolBlockIds(entry: ClaudeForkBoundaryEntry): {
   opened: string[];
@@ -147,8 +194,10 @@ function readToolBlockIds(entry: ClaudeForkBoundaryEntry): {
  * partially flushed trailing line can never reach the fork.
  *
  * `requireTurnEnd` additionally demands that the cut land on the END of an
- * assistant turn (an assistant entry that opens no tool call). That is what the
- * caller asks for when a run is in flight and no explicit boundary was picked:
+ * assistant turn, decided from `message.stop_reason` rather than from whether
+ * the entry happened to open a tool call — see `endsAssistantTurn`. That is
+ * what the caller asks for when a run is in flight and no explicit boundary was
+ * picked:
  * the fork then reproduces the last COMPLETED turn rather than half of the one
  * still streaming. With an explicit boundary the user has chosen the position,
  * so only the tool-pairing invariant is enforced.
@@ -160,12 +209,15 @@ export function resolveSafeForkUuid(
   options: { untilUuid?: string | null; requireTurnEnd?: boolean } = {},
 ): string | null {
   const until = options.untilUuid?.trim() || null;
+  // Subagent transcripts carry their own tool pairs; they neither open nor
+  // close anything in the main conversation. Dropping them up front also makes
+  // "the next entry" below mean the next MAIN-conversation entry.
+  const conversation = entries.filter((entry) => entry.isSidechain !== true);
   const open = new Set<string>();
   let safe: string | null = null;
-  for (const entry of entries) {
-    // Subagent transcripts carry their own tool pairs; they neither open nor
-    // close anything in the main conversation.
-    if (entry.isSidechain === true) {
+  for (let index = 0; index < conversation.length; index += 1) {
+    const entry = conversation[index];
+    if (!entry) {
       continue;
     }
     const uuid = readString(entry.uuid);
@@ -176,7 +228,7 @@ export function resolveSafeForkUuid(
     for (const id of opened) {
       open.add(id);
     }
-    const endsATurn = entry.type === "assistant" && opened.length === 0;
+    const endsATurn = endsAssistantTurn(entry, conversation[index + 1]);
     if (uuid && open.size === 0 && (!options.requireTurnEnd || endsATurn)) {
       safe = uuid;
     }
