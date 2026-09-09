@@ -1344,6 +1344,12 @@ export class AgentManager {
     cwd: string;
     workspaceId: string;
     labels?: Record<string, string>;
+    /**
+     * Settings the imported agent must start from. A native fork passes the
+     * source agent's config here so the fork does not silently land on the
+     * daemon's current defaults (which would also cost it the prompt cache).
+     */
+    config?: Partial<AgentSessionConfig>;
   }): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(this.importProviderSessionInternal(input));
   }
@@ -1354,6 +1360,7 @@ export class AgentManager {
     cwd: string;
     workspaceId: string;
     labels?: Record<string, string>;
+    config?: Partial<AgentSessionConfig>;
   }): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
@@ -1366,6 +1373,7 @@ export class AgentManager {
 
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       {
+        ...input.config,
         provider: input.provider,
         cwd: input.cwd,
       },

@@ -3976,6 +3976,62 @@ test("importProviderSession imports the selected session without listing and pub
   expect((await storage.get(imported.id))?.title).toBe("Trace provider imports");
 });
 
+test("importProviderSession starts the agent on the caller's config, not the daemon defaults", async () => {
+  // The native fork imports a branched provider session and must land on the
+  // SOURCE agent's settings: the prompt cache is a prefix match over
+  // `tools -> system -> messages`, so re-deriving model/mode/tools from today's
+  // defaults gives the fork a correct transcript and a cold cache.
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-import-config-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class ConfigCaptureImportClient extends TestAgentClient {
+    storedConfig: AgentSessionConfig | null = null;
+    launchedConfig: AgentSessionConfig | null = null;
+
+    async listImportableSessions() {
+      return [];
+    }
+
+    async importSession(input: ImportProviderSessionInput, context: ImportProviderSessionContext) {
+      this.storedConfig = context.storedConfig;
+      this.launchedConfig = context.config;
+      return {
+        // Mirrors importSessionFromPersistence: the provider hands back the
+        // stored config it was launched with.
+        session: new TestAgentSession(context.storedConfig),
+        config: context.storedConfig,
+        persistence: {
+          provider: "codex" as const,
+          sessionId: input.providerHandleId,
+          nativeHandle: input.providerHandleId,
+          metadata: { provider: "codex" as const, cwd: workdir },
+        },
+        timeline: [{ item: { type: "user_message" as const, text: "forked" } }],
+        providerSubagentEvents: [],
+      };
+    }
+  }
+
+  const client = new ConfigCaptureImportClient();
+  const manager = new AgentManager({ clients: { codex: client }, registry: storage, logger });
+
+  const imported = await manager.importProviderSession({
+    provider: "codex",
+    providerHandleId: "thread-forked",
+    cwd: workdir,
+    workspaceId: "ws-forked",
+    config: { model: "gpt-5.2-codex", modeId: "plan" },
+  });
+
+  expect(client.storedConfig).toMatchObject({ model: "gpt-5.2-codex", modeId: "plan" });
+  expect(client.launchedConfig).toMatchObject({ model: "gpt-5.2-codex", modeId: "plan" });
+  expect(imported.config).toMatchObject({ model: "gpt-5.2-codex", modeId: "plan" });
+  expect((await storage.get(imported.id))?.config).toMatchObject({
+    model: "gpt-5.2-codex",
+    modeId: "plan",
+  });
+});
+
 test("reloadAgentSession passes daemon launch env through the provider launch context", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-reload-context-"));
   const storagePath = join(workdir, "agents");

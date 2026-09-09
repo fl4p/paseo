@@ -7561,7 +7561,7 @@ export class Session {
           agentStorage: this.agentStorage,
           logger: this.sessionLogger,
         });
-        return { cwd: snapshot.cwd, workspaceId: snapshot.workspaceId };
+        return { cwd: snapshot.cwd, workspaceId: snapshot.workspaceId, config: snapshot.config };
       },
       fetchTimeline: (agentId) =>
         this.agentManager.fetchTimeline(agentId, {
@@ -7578,6 +7578,7 @@ export class Session {
             cwd: input.cwd,
             workspaceId: input.workspaceId,
             requestId: input.requestId,
+            config: input.config,
           },
           workspaceProvisioning: this.workspaceProvisioning,
           agentManager: this.agentManager,

@@ -7,7 +7,7 @@ import { forkAgentSessionNatively, type ForkAgentSessionDeps } from "./fork-agen
 import { forkClaudeSession } from "./providers/claude/fork-session.js";
 import { FakeClaudeSdk } from "./providers/claude/test-rewind-claude-sdk.js";
 import { convertClaudeHistoryEntry } from "./providers/claude/agent.js";
-import type { AgentTimelineItem } from "./agent-sdk-types.js";
+import type { AgentSessionConfig, AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
 const logger = pino({ level: "silent" });
@@ -114,11 +114,31 @@ const SOURCE_ROWS: AgentTimelineRow[] = [
   row(7, { type: "assistant_message", text: "also done", messageId: "msg_3" }),
 ];
 
+/**
+ * The source agent is deliberately NOT on the daemon defaults: a fork that
+ * re-derives its config would silently move it back onto them, which also
+ * throws away the `tools`/`system` half of the prompt-cache prefix.
+ */
+const SOURCE_CONFIG: AgentSessionConfig = {
+  provider: "claude",
+  cwd: "/workspace",
+  model: "claude-opus-4-5",
+  modeId: "acceptEdits",
+  thinkingOptionId: "think-hard",
+  systemPrompt: "you are forked",
+  toolPolicy: { mode: "allowlist", tools: ["Read"] } as AgentSessionConfig["toolPolicy"],
+  mcpServers: { docs: { type: "http", url: "https://example.test/mcp" } },
+  providerOptions: { claude: { dangerouslySkipPermissions: false } },
+  title: "source agent",
+  internal: true,
+};
+
 describe("forkAgentSessionNatively", () => {
   let dir: string;
   let sdk: TranscriptWritingClaudeSdk;
   let deps: ForkAgentSessionDeps;
   let importedTimelines: AgentTimelineItem[][];
+  let importedConfigs: Partial<AgentSessionConfig>[];
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), "paseo-fork-"));
@@ -126,8 +146,13 @@ describe("forkAgentSessionNatively", () => {
     sdk = new TranscriptWritingClaudeSdk(dir, "source-session");
     sdk.setNextSessionId("forked-session");
     importedTimelines = [];
+    importedConfigs = [];
     deps = {
-      loadAgent: vi.fn(async () => ({ cwd: "/workspace", workspaceId: "ws-1" })),
+      loadAgent: vi.fn(async () => ({
+        cwd: "/workspace",
+        workspaceId: "ws-1",
+        config: SOURCE_CONFIG,
+      })),
       fetchTimeline: vi.fn(() => ({ epoch: "epoch-1", rows: SOURCE_ROWS })),
       forkProviderSession: async (_agentId, input) => {
         const fork = await forkClaudeSession({
@@ -141,6 +166,7 @@ describe("forkAgentSessionNatively", () => {
       importProviderSession: async (input) => {
         const timeline = timelineFromTranscript(join(dir, `${input.providerHandleId}.jsonl`));
         importedTimelines.push(timeline);
+        importedConfigs.push(input.config);
         return { agentId: "agent-forked", timelineSize: timeline.length, createdWorkspace: null };
       },
       registerCreatedWorkspace: vi.fn(async () => {}),
@@ -225,6 +251,33 @@ describe("forkAgentSessionNatively", () => {
       ),
     ).rejects.toThrow(/same working directory/);
     expect(sdk.recordedForkCalls).toEqual([]);
+  });
+
+  it("starts the fork on the source agent's model, mode and tools, not the daemon defaults", async () => {
+    await forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-config" }, deps);
+
+    expect(importedConfigs[0]).toEqual({
+      model: "claude-opus-4-5",
+      modeId: "acceptEdits",
+      thinkingOptionId: "think-hard",
+      systemPrompt: "you are forked",
+      toolPolicy: SOURCE_CONFIG.toolPolicy,
+      mcpServers: SOURCE_CONFIG.mcpServers,
+      providerOptions: SOURCE_CONFIG.providerOptions,
+    });
+  });
+
+  it("does not carry over what names the source rather than how it runs", async () => {
+    await forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-config-2" }, deps);
+
+    const config = importedConfigs[0] ?? {};
+    // cwd and provider come from the fork itself, the title is re-derived from
+    // the imported timeline, and a fork is a user-visible agent even when the
+    // source was an internal system one.
+    expect(config).not.toHaveProperty("cwd");
+    expect(config).not.toHaveProperty("provider");
+    expect(config).not.toHaveProperty("title");
+    expect(config).not.toHaveProperty("internal");
   });
 
   it("registers a workspace the import had to create", async () => {
