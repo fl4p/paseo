@@ -26,7 +26,9 @@ export interface FindInPageContents {
   ): number;
   stopFindInPage(action: FindInPageStopAction): void;
   on(event: "found-in-page", listener: FoundInPageListener): unknown;
+  once(event: "destroyed", listener: () => void): unknown;
   removeListener(event: "found-in-page", listener: FoundInPageListener): unknown;
+  removeListener(event: "destroyed", listener: () => void): unknown;
 }
 
 /** The window renderer that owns the find bar and receives match counts. */
@@ -36,13 +38,16 @@ export interface FindInPageHostContents extends FindInPageContents {
 
 export interface FindInPageStartInput {
   query: string;
+  /** Search direction; defaults to forward. */
   forward?: boolean;
+  /** Advance within the current query instead of restarting the search. */
   findNext?: boolean;
 }
 
 interface FindSession {
   target: FindInPageContents;
   listener: FoundInPageListener;
+  onTargetDestroyed: () => void;
   query: string;
 }
 
@@ -94,57 +99,72 @@ export class FindInPageController {
 
     const target = this.resolveTarget(host);
     if (!target || target.isDestroyed()) {
-      this.endSession(host.id);
+      this.endSession(host.id, null);
       this.sendResult(host, { activeMatchOrdinal: 0, matches: 0, finalUpdate: true });
       return;
     }
 
     const existing = this.sessionsByHostId.get(host.id);
     if (existing && existing.target !== target) {
-      this.endSession(host.id);
+      // The pane being left keeps its highlight until it is told to stop.
+      this.endSession(host.id, "clearSelection");
     }
 
     const session = this.sessionsByHostId.get(host.id) ?? this.beginSession(host, target);
-    // `findNext` only means "advance" while Chromium is still holding the
-    // previous query; asking it to advance a query it never ran finds nothing.
-    const findNext = input.findNext === true && session.query === input.query;
+    // Electron's `findNext` means "begin a new finding session": true for the
+    // first request, false for follow-ups. That is the inverse of this bridge's
+    // "advance to the next match", and advancing a query Chromium is not
+    // already holding has nothing to continue, so that starts a session too.
+    const advances = input.findNext === true && session.query === input.query;
     session.query = input.query;
-    target.findInPage(input.query, { forward: input.forward !== false, findNext });
+    target.findInPage(input.query, {
+      forward: input.forward !== false,
+      findNext: !advances,
+    });
   }
 
   public stop(host: FindInPageHostContents, action: FindInPageStopAction): void {
-    const session = this.sessionsByHostId.get(host.id);
-    if (!session) {
-      return;
-    }
-    if (!session.target.isDestroyed()) {
-      session.target.stopFindInPage(action);
-    }
-    this.endSession(host.id);
+    this.endSession(host.id, action);
   }
 
   public releaseHost(hostWebContentsId: number): void {
-    this.endSession(hostWebContentsId);
+    // A guest pane outlives the window that was searching it, so clear it.
+    this.endSession(hostWebContentsId, "clearSelection");
   }
 
   private beginSession(host: FindInPageHostContents, target: FindInPageContents): FindSession {
     const listener: FoundInPageListener = (_event, result) => {
       this.sendResult(host, result);
     };
+    const onTargetDestroyed = () => {
+      // Only this session's own target death is ours to clean up; a later
+      // session on the same host owns its target from here on.
+      if (this.sessionsByHostId.get(host.id) !== session) {
+        return;
+      }
+      this.sessionsByHostId.delete(host.id);
+      this.sendResult(host, { activeMatchOrdinal: 0, matches: 0, finalUpdate: true });
+    };
+    const session: FindSession = { target, listener, onTargetDestroyed, query: "" };
     target.on("found-in-page", listener);
-    const session: FindSession = { target, listener, query: "" };
+    target.once("destroyed", onTargetDestroyed);
     this.sessionsByHostId.set(host.id, session);
     return session;
   }
 
-  private endSession(hostWebContentsId: number): void {
+  private endSession(hostWebContentsId: number, action: FindInPageStopAction | null): void {
     const session = this.sessionsByHostId.get(hostWebContentsId);
     if (!session) {
       return;
     }
     this.sessionsByHostId.delete(hostWebContentsId);
-    if (!session.target.isDestroyed()) {
-      session.target.removeListener("found-in-page", session.listener);
+    if (session.target.isDestroyed()) {
+      return;
+    }
+    session.target.removeListener("found-in-page", session.listener);
+    session.target.removeListener("destroyed", session.onTargetDestroyed);
+    if (action) {
+      session.target.stopFindInPage(action);
     }
   }
 
