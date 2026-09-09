@@ -524,6 +524,106 @@ describe("fork context budget and compaction boundary", () => {
     expect(result.attachment.text).toContain("earlier history omitted");
   });
 
+  it("caps an oversized opening message instead of keeping it whole", () => {
+    // The opener is pinned, but pinned is not the same as unbounded: a single
+    // 70k-character first message used to walk straight past the budget.
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: `OPENING ${"o".repeat(70_000)}`, messageId: "user-1" }),
+      row(2, { type: "user_message", text: "middle", messageId: "user-2" }),
+      row(3, { type: "user_message", text: "THE LATEST TASK", messageId: "user-3" }),
+    ];
+
+    const result = buildAgentForkContextAttachment({ rows, maxChars: 2000 });
+
+    expect(result.attachment.text.length).toBeLessThan(2500);
+    expect(result.attachment.text).toContain("OPENING ooo");
+    expect(result.attachment.text).toContain("THE LATEST TASK");
+    expect(result.attachment.text).toContain("message truncated");
+  });
+
+  it("keeps the selected boundary message even when it alone exceeds the budget", () => {
+    // The newest entry of a bounded fork IS the message the user picked. The
+    // old tail loop broke on it and emitted a header claiming only "earlier"
+    // history had been dropped.
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: "THE ORIGINAL TASK", messageId: "user-1" }),
+      row(2, { type: "user_message", text: "middle", messageId: "user-2" }),
+      row(3, {
+        type: "assistant_message",
+        text: `BOUNDARY ${"b".repeat(70_000)}`,
+        messageId: "assistant-3",
+      }),
+    ];
+
+    const result = buildAgentForkContextAttachment({
+      rows,
+      boundaryMessageId: "assistant-3",
+      maxChars: 2000,
+    });
+
+    expect(result.attachment.text).toContain("THE ORIGINAL TASK");
+    expect(result.attachment.text).toContain("BOUNDARY bbb");
+    expect(result.attachment.text).toContain("message truncated");
+    expect(result.attachment.text.length).toBeLessThan(2500);
+  });
+
+  it("says in the header that history was omitted, not that it was cut short", () => {
+    const filler = "x".repeat(400);
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: "THE ORIGINAL TASK", messageId: "user-1" }),
+    ];
+    for (let index = 0; index < 20; index += 1) {
+      rows.push(
+        row(index + 2, {
+          type: "user_message",
+          text: `middle ${index} ${filler}`,
+          messageId: `user-mid-${index}`,
+        }),
+      );
+    }
+    rows.push(row(100, { type: "user_message", text: "THE LATEST TASK", messageId: "user-last" }));
+
+    const header = buildAgentForkContextAttachment({ rows, maxChars: 2000 }).attachment.text;
+
+    expect(header).toContain("Some earlier history was omitted");
+    expect(header).not.toContain("cut short");
+  });
+
+  it("says in the header that a message was cut short, not that history was dropped", () => {
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: `OPENING ${"o".repeat(9_000)}`, messageId: "user-1" }),
+      row(2, { type: "user_message", text: "THE LATEST TASK", messageId: "user-2" }),
+    ];
+
+    const header = buildAgentForkContextAttachment({ rows, maxChars: 2000 }).attachment.text;
+
+    // Nothing was dropped here: both entries are still present, one is shorter.
+    expect(header).toContain("cut short");
+    expect(header).not.toContain("Some earlier history was omitted");
+    expect(header).toContain("THE LATEST TASK");
+  });
+
+  it("reports both when history was dropped and a message was cut short", () => {
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: `OPENING ${"o".repeat(9_000)}`, messageId: "user-1" }),
+    ];
+    for (let index = 0; index < 20; index += 1) {
+      rows.push(
+        row(index + 2, {
+          type: "user_message",
+          text: `middle ${index} ${"x".repeat(400)}`,
+          messageId: `user-mid-${index}`,
+        }),
+      );
+    }
+    rows.push(row(100, { type: "user_message", text: "THE LATEST TASK", messageId: "user-last" }));
+
+    const header = buildAgentForkContextAttachment({ rows, maxChars: 2000 }).attachment.text;
+
+    expect(header).toContain("Some earlier history was omitted");
+    expect(header).toContain("cut short");
+  });
+
   it("leaves a within-budget history untouched", () => {
     const result = buildAgentForkContextAttachment({
       rows: [

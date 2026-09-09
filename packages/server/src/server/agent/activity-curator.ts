@@ -231,7 +231,19 @@ interface ForkCursorBoundary {
  */
 const DEFAULT_FORK_CONTEXT_MAX_CHARS = 60_000;
 
-const FORK_CONTEXT_TRUNCATION_MARKER = "[… earlier history omitted to fit the context budget …]";
+/** Body marker standing where entries were dropped. */
+const FORK_CONTEXT_OMISSION_MARKER = "[… earlier history omitted to fit the context budget …]";
+/** Body marker closing an entry that was cut short. */
+const FORK_CONTEXT_ENTRY_TRUNCATION_MARKER = "[… message truncated to fit the context budget …]";
+/**
+ * Header notes. They point at the inline markers rather than repeating them,
+ * so a reader can tell an omission from a truncation and each marker is
+ * emitted in exactly one place.
+ */
+const FORK_CONTEXT_OMITTED_NOTE =
+  "Some earlier history was omitted to fit the context budget; the gap is marked inline.";
+const FORK_CONTEXT_ENTRY_TRUNCATED_NOTE =
+  "Long messages were cut short to fit the context budget; each cut is marked inline.";
 const FORK_CONTEXT_COMPACTION_MARKER =
   "[… history before the source session's last compaction omitted …]";
 
@@ -347,43 +359,147 @@ function selectForkContextRows(input: {
 }
 
 /**
- * Trim rendered entries to `maxChars`, keeping the tail (the most recent, most
- * relevant turns) plus the first entry when that first entry is the opening
- * user message — losing the original task statement is the one truncation that
- * reliably makes a fork useless.
+ * Trim rendered entries to `maxChars`.
+ *
+ * Three things this has to get right, each of which it previously did not:
+ *
+ * - the cap is a cap. An entry that does not fit is truncated with a marker,
+ *   never kept whole, so no single oversized message can blow past `maxChars`;
+ * - the opening user message survives, because losing the original task
+ *   statement reliably makes a fork useless;
+ * - the newest entry survives, because on a bounded fork that is the message
+ *   the user picked as the boundary. Dropping it silently forks at a point the
+ *   user did not choose.
+ *
+ * What was dropped or cut is marked inline, and the caller turns the two flags
+ * into a header that says which of the two actually happened.
  */
 function applyForkContextBudget(
   entries: readonly ActivityEntry[],
   maxChars: number,
-): { entries: ActivityEntry[]; truncated: boolean } {
+): { entries: ActivityEntry[]; omitted: boolean; truncatedEntries: boolean } {
   const joinedLength = entries.reduce((total, entry) => total + entry.text.length + 1, 0);
   if (maxChars <= 0 || joinedLength <= maxChars) {
-    return { entries: [...entries], truncated: false };
+    return { entries: [...entries], omitted: false, truncatedEntries: false };
   }
 
   const first = entries[0];
   const head = first && first.text.startsWith("[User] ") ? first : null;
-  const reserved = (head ? head.text.length + 1 : 0) + FORK_CONTEXT_TRUNCATION_MARKER.length + 1;
+  const lastIndex = entries.length - 1;
+  const last = entries[lastIndex] && entries[lastIndex] !== head ? entries[lastIndex]! : null;
+  const middleStart = head ? 1 : 0;
+  const middleEnd = last ? lastIndex - 1 : lastIndex;
+  const middleCount = middleEnd - middleStart + 1;
+  // The gap marker is part of the body, so it has to be paid for out of the
+  // same budget it announces.
+  const markerCost = middleCount > 0 ? FORK_CONTEXT_OMISSION_MARKER.length + 1 : 0;
 
+  const pinned = fitPinnedEntries(head, last, Math.max(0, maxChars - markerCost));
+  const middle = collectForkContextTail(entries, {
+    from: middleEnd,
+    to: middleStart,
+    budget: Math.max(0, maxChars - markerCost - pinned.used),
+  });
+  const omitted = middle.length < middleCount;
+
+  return {
+    entries: [
+      ...(pinned.head ? [pinned.head] : []),
+      ...(omitted ? [activityEntry(FORK_CONTEXT_OMISSION_MARKER)] : []),
+      ...middle,
+      ...(pinned.last ? [pinned.last] : []),
+    ],
+    omitted,
+    truncatedEntries: pinned.truncatedEntries,
+  };
+}
+
+/**
+ * Fit the two pinned entries — the opening task and the newest/selected message
+ * — into `budget`, truncating rather than dropping either. When both are too
+ * big they split the budget; when only one is, it may use whatever the other
+ * left behind.
+ */
+function fitPinnedEntries(
+  head: ActivityEntry | null,
+  last: ActivityEntry | null,
+  budget: number,
+): {
+  head: ActivityEntry | null;
+  last: ActivityEntry | null;
+  used: number;
+  truncatedEntries: boolean;
+} {
+  const headCost = head ? head.text.length + 1 : 0;
+  const lastCost = last ? last.text.length + 1 : 0;
+  if (headCost + lastCost <= budget) {
+    return { head, last, used: headCost + lastCost, truncatedEntries: false };
+  }
+  const share = (mine: number, other: number): number => {
+    const half = Math.floor(budget / 2);
+    return mine <= half ? mine : Math.max(half, budget - other);
+  };
+  const headCap = head && last ? share(headCost, lastCost) : budget;
+  const lastCap = head && last ? share(lastCost, headCost) : budget;
+  const fittedHead = fitEntry(head, headCap);
+  const fittedLast = fitEntry(last, lastCap);
+  return {
+    head: fittedHead.entry,
+    last: fittedLast.entry,
+    used: fittedHead.cost + fittedLast.cost,
+    truncatedEntries: fittedHead.truncated || fittedLast.truncated,
+  };
+}
+
+/** Fit one entry into `cost` characters (text plus its newline), or drop it. */
+function fitEntry(
+  entry: ActivityEntry | null,
+  cost: number,
+): { entry: ActivityEntry | null; cost: number; truncated: boolean } {
+  if (!entry) {
+    return { entry: null, cost: 0, truncated: false };
+  }
+  if (entry.text.length + 1 <= cost) {
+    return { entry, cost: entry.text.length + 1, truncated: false };
+  }
+  const cap = cost - 1;
+  if (cap <= FORK_CONTEXT_ENTRY_TRUNCATION_MARKER.length) {
+    // Not even the marker fits: the budget is too small for this entry to say
+    // anything, so drop it rather than emit a stub that breaks the cap.
+    return { entry: null, cost: 0, truncated: true };
+  }
+  const kept = entry.text.slice(0, cap - FORK_CONTEXT_ENTRY_TRUNCATION_MARKER.length);
+  return {
+    entry: activityEntry(`${kept}${FORK_CONTEXT_ENTRY_TRUNCATION_MARKER}`),
+    cost: cap + 1,
+    truncated: true,
+  };
+}
+
+/**
+ * Collect entries backwards from the newest, keeping the run contiguous: the
+ * first entry that does not fit ends the walk, and everything before it is
+ * announced by the gap marker.
+ */
+function collectForkContextTail(
+  entries: readonly ActivityEntry[],
+  window: { from: number; to: number; budget: number },
+): ActivityEntry[] {
   const tail: ActivityEntry[] = [];
   let used = 0;
-  for (let index = entries.length - 1; index >= (head ? 1 : 0); index -= 1) {
+  for (let index = window.from; index >= window.to; index -= 1) {
     const entry = entries[index];
     if (!entry) {
       continue;
     }
     const cost = entry.text.length + 1;
-    if (used + cost + reserved > maxChars) {
+    if (used + cost > window.budget) {
       break;
     }
     used += cost;
     tail.unshift(entry);
   }
-
-  return {
-    entries: [...(head ? [head] : []), activityEntry(FORK_CONTEXT_TRUNCATION_MARKER), ...tail],
-    truncated: true,
-  };
+  return tail;
 }
 
 function trimContextMetadata(value: string | null | undefined): string | null {
@@ -396,7 +512,8 @@ function buildForkContextText(input: {
   agentTitle?: string | null;
   cwd?: string | null;
   startedAtCompaction: boolean;
-  truncated: boolean;
+  omitted: boolean;
+  truncatedEntries: boolean;
 }): string {
   const header = ["Chat history from a previous Paseo agent."];
   const agentTitle = trimContextMetadata(input.agentTitle);
@@ -410,8 +527,11 @@ function buildForkContextText(input: {
   if (input.startedAtCompaction) {
     header.push(FORK_CONTEXT_COMPACTION_MARKER);
   }
-  if (input.truncated) {
-    header.push(FORK_CONTEXT_TRUNCATION_MARKER);
+  if (input.omitted) {
+    header.push(FORK_CONTEXT_OMITTED_NOTE);
+  }
+  if (input.truncatedEntries) {
+    header.push(FORK_CONTEXT_ENTRY_TRUNCATED_NOTE);
   }
   return `<chat-history-summary>\n${header.join("\n")}\n\n${input.body}\n</chat-history-summary>`;
 }
@@ -459,7 +579,8 @@ export function buildAgentForkContextAttachment(input: {
         agentTitle: input.agentTitle,
         cwd: input.cwd,
         startedAtCompaction: selected.startedAtCompaction,
-        truncated: budgeted.truncated,
+        omitted: budgeted.omitted,
+        truncatedEntries: budgeted.truncatedEntries,
       }),
     },
     itemCount: selected.items.length,
