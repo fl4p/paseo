@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 import { z } from "zod";
 import {
   AgentSnapshotPayloadSchema,
+  SessionInboundMessageSchema,
   AgentTimelineItemPayloadSchema,
   ServerInfoStatusPayloadSchema,
   SessionOutboundMessageSchema,
@@ -388,4 +389,89 @@ test("blocked setup preserves the legacy failed shape and optional provenance", 
   expect(WorkspaceSetupSnapshotSchema.parse(legacySnapshot.parse(failed))).toEqual(
     legacySnapshot.parse(failed),
   );
+});
+
+const BASE_SERVER_INFO = {
+  status: "server_info",
+  serverId: "fork-server",
+  features: { agentForkContext: true },
+} as const;
+
+describe("agent.fork_session compatibility", () => {
+  const request = {
+    type: "agent.fork_session.request",
+    agentId: "agent-1",
+    requestId: "req-1",
+  };
+  const response = {
+    type: "agent.fork_session.response",
+    payload: {
+      requestId: "req-1",
+      agentId: "agent-1",
+      forkedAgentId: "agent-2",
+      providerHandleId: "claude-session-2",
+      timelineSize: 12,
+      error: null,
+    },
+  };
+
+  test("the native fork is a new message type, not a new enum member", () => {
+    expect(SessionInboundMessageSchema.parse(request)).toEqual(request);
+    expect(SessionOutboundMessageSchema.parse(response)).toEqual(response);
+    // A peer that predates the native fork keeps working precisely because the
+    // fork did NOT widen an existing enum: `agent.fork_context.*` is unchanged,
+    // so anything an old peer already parses still parses.
+    const legacyForkContextResponse = {
+      type: "agent.fork_context.response",
+      payload: {
+        requestId: "req-0",
+        agentId: "agent-1",
+        attachment: { type: "text", mimeType: "text/plain", text: "history" },
+        itemCount: 3,
+        boundaryMessageId: null,
+        error: null,
+      },
+    };
+    expect(SessionOutboundMessageSchema.parse(legacyForkContextResponse)).toEqual(
+      legacyForkContextResponse,
+    );
+  });
+
+  test("old peers reject the new message type, so it must stay capability-gated", () => {
+    // Mirrors what a client built before v0.8.0 does: its union has no
+    // `agent.fork_session.*` member. This is exactly why the daemon advertises
+    // `features.agentForkSession` and only capable clients ever send the
+    // request (and therefore only they ever receive the response).
+    const legacyOutbound = z.object({
+      type: z.enum(["agent.fork_context.response", "agent.rewind.response"]),
+    });
+    expect(legacyOutbound.safeParse(response).success).toBe(false);
+    const legacyInbound = z.object({
+      type: z.enum(["agent.fork_context.request", "agent.rewind.request"]),
+    });
+    expect(legacyInbound.safeParse(request).success).toBe(false);
+  });
+
+  test("boundary, cwd and workspace are optional so a whole-session fork is one field", () => {
+    const full = {
+      ...request,
+      boundaryCursor: { epoch: "e1", seq: 42 },
+      boundaryMessageId: "msg-9",
+      cwd: "/workspace",
+      workspaceId: "ws-1",
+    };
+    expect(SessionInboundMessageSchema.parse(full)).toEqual(full);
+  });
+
+  test("the daemon fork feature stays an optional server-info flag", () => {
+    const withFlag = ServerInfoStatusPayloadSchema.parse({
+      ...BASE_SERVER_INFO,
+      features: { agentForkContext: true, agentForkSession: true },
+    });
+    expect(withFlag.features?.agentForkSession).toBe(true);
+    // Absent on daemons that only know the attachment fork; clients must read
+    // that as "no native fork", not as a parse failure.
+    const withoutFlag = ServerInfoStatusPayloadSchema.parse(BASE_SERVER_INFO);
+    expect(withoutFlag.features?.agentForkSession).toBeUndefined();
+  });
 });
