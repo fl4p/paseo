@@ -78,7 +78,7 @@ import {
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
 import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
-import { forkClaudeSession } from "./fork-session.js";
+import { createClaudeForkTranscriptStore, forkClaudeSession } from "./fork-session.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
@@ -2807,6 +2807,13 @@ class ClaudeAgentSession implements AgentSession {
       sessionId,
       boundaryMessageId: input.boundaryMessageId,
       readTranscript: () => this.readSessionTranscript(sessionId),
+      // The forked file needs a post-pass: `forkSession` remaps top-level uuids
+      // but not the ones embedded in a compact boundary, which would make the
+      // resumed fork skip the relink and replay the pre-compaction history.
+      forkTranscript: createClaudeForkTranscriptStore((forkSessionId) =>
+        this.resolveHistoryPath(forkSessionId),
+      ),
+      logger: this.logger,
     });
     return { providerHandleId: fork.sessionId };
   }
