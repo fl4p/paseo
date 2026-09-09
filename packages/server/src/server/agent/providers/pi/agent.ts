@@ -65,6 +65,7 @@ import {
 } from "./history-mapper.js";
 import { materializeProviderImage } from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
+import { shouldDisplayPiCustomMessage } from "./custom-message.js";
 import { revertPiConversation } from "./rewind.js";
 import { listPiImportableSessions, readPiImportSessionConfig } from "./session-descriptor.js";
 import type { PiRuntime, PiRuntimeSession, PiStartSessionInput } from "./runtime.js";
@@ -2403,14 +2404,16 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     if (event.message.role === "custom") {
-      const text = getUserMessageText(event.message.content);
-      if (text) {
-        this.emit({
-          type: "timeline",
-          provider: this.provider,
-          turnId,
-          item: { type: "assistant_message", text },
-        });
+      if (shouldDisplayPiCustomMessage(event.message)) {
+        const text = getUserMessageText(event.message.content);
+        if (text) {
+          this.emit({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: { type: "assistant_message", text },
+          });
+        }
       }
       if (!this.activeTurnStarted) {
         this.completeTurn(turnId, []);

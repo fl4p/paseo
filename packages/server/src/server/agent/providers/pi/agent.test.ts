@@ -895,6 +895,50 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("hides context-only custom messages that Pi marks display:false", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("/plan");
+    // Pi's plan extension re-injects this prompt on every turn via
+    // before_agent_start; without the display gate it was printed each time.
+    fakeSession.emit({
+      type: "message_end",
+      message: {
+        role: "custom",
+        customType: "pi-plan-context",
+        display: false,
+        content: [{ type: "text", text: "[PLAN MODE ACTIVE]\nPlan mode is active." }],
+      },
+    });
+
+    expect(events.timelineAndCompletionEvents()).toEqual([{ type: "turn_completed" }]);
+  });
+
+  test("still shows custom messages Pi marks display:true", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("/plan");
+    fakeSession.emit({
+      type: "message_end",
+      message: {
+        role: "custom",
+        customType: "pi-plan-todo-list",
+        display: true,
+        content: [{ type: "text", text: "**Plan Steps (2):**" }],
+      },
+    });
+
+    expect(events.timelineAndCompletionEvents()).toEqual([
+      {
+        type: "timeline",
+        item: { type: "assistant_message", text: "**Plan Steps (2):**" },
+      },
+      { type: "turn_completed" },
+    ]);
+  });
+
   test("settles an autonomous turn triggered by a Pi extension custom message", async () => {
     const { pi, events } = await createSession();
     const fakeSession = pi.latestSession();
