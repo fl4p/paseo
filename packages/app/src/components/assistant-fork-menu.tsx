@@ -11,6 +11,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
+import { useForkModes } from "@/contexts/fork-mode-context";
 
 export type AssistantForkTarget = "tab" | "workspace";
 
@@ -29,6 +30,14 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
   testID = "assistant-fork-menu",
 }: AssistantForkMenuProps) {
   const { t } = useTranslation();
+  const forkModes = useForkModes();
+  const describeMode = useCallback(
+    (mode: "native" | "attachment") =>
+      mode === "native"
+        ? t("message.actions.forkKeepsContext")
+        : t("message.actions.forkCopiesSummary"),
+    [t],
+  );
   const [isOpen, setIsOpen] = useState(false);
   const [pendingTarget, setPendingTarget] = useState<AssistantForkTarget | null>(null);
   const isLocked = pendingTarget !== null;
@@ -100,6 +109,7 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
       <DropdownMenuContent align="start" minWidth={220} side="bottom" testID={`${testID}-content`}>
         <DropdownMenuItem
           closeOnSelect={false}
+          description={describeMode(forkModes.tab)}
           disabled={isLocked && pendingTarget !== "tab"}
           leading={forkIcon}
           onSelect={handleSelect("tab")}
@@ -110,6 +120,7 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
         </DropdownMenuItem>
         <DropdownMenuItem
           closeOnSelect={false}
+          description={describeMode(forkModes.workspace)}
           disabled={isLocked && pendingTarget !== "workspace"}
           leading={forkIcon}
           onSelect={handleSelect("workspace")}

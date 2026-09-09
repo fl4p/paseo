@@ -102,6 +102,8 @@ import {
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useForkAgent } from "@/hooks/use-fork-agent";
+import { resolveForkMode, resolveForkTargetCwd } from "@/hooks/fork-mode";
+import { ForkModeProvider } from "@/contexts/fork-mode-context";
 import { isWeb } from "@/constants/platform";
 import type { Theme } from "@/styles/theme";
 import { recordRenderProfileReasons } from "@/utils/render-profiler";
@@ -384,6 +386,21 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
     );
     const streamHead = providedStreamHead ?? sessionStreamHead;
     const forkAgent = useForkAgent({ serverId: resolvedServerId, toast, readOnly });
+    const supportsAgentForkSession = useSessionStore(
+      (state) => state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkSession === true,
+    );
+    // Published to the fork menu so each entry can say whether it will keep the
+    // provider context and prompt cache (native) or re-send a text summary.
+    const forkModes = useMemo(() => {
+      const resolveFor = (target: "tab" | "workspace") =>
+        resolveForkMode({
+          hostSupportsNativeFork: supportsAgentForkSession && !readOnly,
+          provider: context.provider,
+          sourceCwd: context.cwd,
+          targetCwd: resolveForkTargetCwd({ target, sourceCwd: context.cwd }),
+        });
+      return { tab: resolveFor("tab"), workspace: resolveFor("workspace") };
+    }, [context.cwd, context.provider, readOnly, supportsAgentForkSession]);
     const supportsAgentForkContextCursor = useSessionStore(
       (state) =>
         state.sessions[resolvedServerId]?.serverInfo?.features?.agentForkContextCursor === true,
@@ -1090,52 +1107,54 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     return (
       <ToolCallSheetProvider>
-        <AssistantSelectionCopySurface style={stylesheet.container}>
-          <MessageOuterSpacingProvider disableOuterSpacing>
-            {streamRenderStrategy.render({
-              agentId,
-              segments: renderModel.segments,
-              historyRowRevision,
-              liveHeadRowRevision: expandedToolCallGroupIds,
-              boundary,
-              renderers,
-              listEmptyComponent,
-              viewportRef,
-              routeBottomAnchorRequest,
-              isAuthoritativeHistoryReady,
-              onNearBottomChange: setIsNearBottom,
-              onReadingPositionChange: chatOutline.reportReadingPosition,
-              onNearHistoryStart: loadOlder,
-              isLoadingOlderHistory: isLoadingOlder,
-              hasOlderHistory: hasOlder,
-              olderHistoryProgressKey: progressKey,
-              scrollEnabled: streamScrollEnabled,
-              listStyle: stylesheet.list,
-              baseListContentContainerStyle: stylesheet.listContentContainer,
-              forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
-            })}
-          </MessageOuterSpacingProvider>
-          <ChatOutlineRail
-            prompts={chatOutline.prompts}
-            activePrompt={chatOutline.activePrompt}
-            onJumpToPrompt={chatOutline.jumpToPrompt}
-          />
-          {(!isNearBottom || isTimelineDetached) && (
-            <View style={scrollToBottomContainerStyle} pointerEvents="box-none">
-              <Animated.View entering={scrollIndicatorFadeIn} exiting={scrollIndicatorFadeOut}>
-                <Pressable
-                  style={stylesheet.scrollToBottomButton}
-                  onPress={scrollToBottom}
-                  accessibilityRole="button"
-                  accessibilityLabel={t("agentStream.scrollToBottom")}
-                  testID="scroll-to-bottom-button"
-                >
-                  <ChevronDown size={24} color={stylesheet.scrollToBottomIcon.color} />
-                </Pressable>
-              </Animated.View>
-            </View>
-          )}
-        </AssistantSelectionCopySurface>
+        <ForkModeProvider tab={forkModes.tab} workspace={forkModes.workspace}>
+          <AssistantSelectionCopySurface style={stylesheet.container}>
+            <MessageOuterSpacingProvider disableOuterSpacing>
+              {streamRenderStrategy.render({
+                agentId,
+                segments: renderModel.segments,
+                historyRowRevision,
+                liveHeadRowRevision: expandedToolCallGroupIds,
+                boundary,
+                renderers,
+                listEmptyComponent,
+                viewportRef,
+                routeBottomAnchorRequest,
+                isAuthoritativeHistoryReady,
+                onNearBottomChange: setIsNearBottom,
+                onReadingPositionChange: chatOutline.reportReadingPosition,
+                onNearHistoryStart: loadOlder,
+                isLoadingOlderHistory: isLoadingOlder,
+                hasOlderHistory: hasOlder,
+                olderHistoryProgressKey: progressKey,
+                scrollEnabled: streamScrollEnabled,
+                listStyle: stylesheet.list,
+                baseListContentContainerStyle: stylesheet.listContentContainer,
+                forwardListContentContainerStyle: stylesheet.forwardListContentContainer,
+              })}
+            </MessageOuterSpacingProvider>
+            <ChatOutlineRail
+              prompts={chatOutline.prompts}
+              activePrompt={chatOutline.activePrompt}
+              onJumpToPrompt={chatOutline.jumpToPrompt}
+            />
+            {(!isNearBottom || isTimelineDetached) && (
+              <View style={scrollToBottomContainerStyle} pointerEvents="box-none">
+                <Animated.View entering={scrollIndicatorFadeIn} exiting={scrollIndicatorFadeOut}>
+                  <Pressable
+                    style={stylesheet.scrollToBottomButton}
+                    onPress={scrollToBottom}
+                    accessibilityRole="button"
+                    accessibilityLabel={t("agentStream.scrollToBottom")}
+                    testID="scroll-to-bottom-button"
+                  >
+                    <ChevronDown size={24} color={stylesheet.scrollToBottomIcon.color} />
+                  </Pressable>
+                </Animated.View>
+              </View>
+            )}
+          </AssistantSelectionCopySurface>
+        </ForkModeProvider>
       </ToolCallSheetProvider>
     );
   },

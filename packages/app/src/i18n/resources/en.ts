@@ -298,6 +298,8 @@ export const en = {
       forkMenu: "Fork chat from here",
       forkInNewTab: "Fork in a new tab",
       forkInNewWorkspace: "Fork in a new workspace",
+      forkKeepsContext: "Keeps the full context and prompt cache",
+      forkCopiesSummary: "Copies a text summary of this chat",
       forkUnavailable: "Update the host to use this.",
       forkMissingWorkspace: "This agent is not in a workspace.",
       forkFailed: "Failed to fork chat",

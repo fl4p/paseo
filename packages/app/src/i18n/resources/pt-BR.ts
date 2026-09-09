@@ -303,6 +303,8 @@ export const ptBR: TranslationResources = {
       forkMenu: "Bifurcar mensagem",
       forkInNewTab: "Bifurcar em uma nova aba",
       forkInNewWorkspace: "Bifurcar em um novo workspace",
+      forkKeepsContext: "Mantém o contexto completo e o cache de prompts",
+      forkCopiesSummary: "Copia um resumo em texto deste chat",
       forkUnavailable: "Atualize o host para usar isto.",
       forkMissingWorkspace: "Este agente não está em um workspace.",
       forkFailed: "Falha ao bifurcar o chat",

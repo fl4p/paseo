@@ -300,6 +300,8 @@ export const zhCN: TranslationResources = {
       forkMenu: "分叉消息",
       forkInNewTab: "分叉到新标签页",
       forkInNewWorkspace: "分叉到新工作区",
+      forkKeepsContext: "保留完整上下文和提示缓存",
+      forkCopiesSummary: "复制此对话的文本摘要",
       forkUnavailable: "请更新主机以使用此功能。",
       forkMissingWorkspace: "此 Agent 不在工作区中。",
       forkFailed: "分叉聊天失败",
