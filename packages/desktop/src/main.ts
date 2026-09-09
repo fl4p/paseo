@@ -53,6 +53,7 @@ import { createExternalUrlOpener } from "./features/opener.js";
 import { createBrowserCaptureService } from "./features/browser-capture.js";
 import { registerEditorTargetHandlers } from "./features/editor-targets/ipc.js";
 import { resolveAppIconPath } from "./features/stamped-icon.js";
+import { registerFindInPageHandlers } from "./features/find-in-page.js";
 import { setupApplicationMenu } from "./features/menu.js";
 import {
   BROWSER_NEW_TAB_REQUEST_EVENT,
@@ -965,6 +966,7 @@ async function bootstrap(): Promise<void> {
   const openExternalUrl = createExternalUrlOpener({ open: shell.openExternal });
   ipcMain.handle("paseo:opener:openUrl", (_event, value: unknown) => openExternalUrl(value));
   registerEditorTargetHandlers();
+  registerFindInPageHandlers();
   registerBrowserAutomationIpc();
 
   // In-app "Open in new window": opens a window that lands on the given project

@@ -107,6 +107,12 @@ contextBridge.exposeInMainWorld("paseoDesktop", {
   webUtils: {
     getPathForFile: (file: File) => webUtils.getPathForFile(file),
   },
+  find: {
+    start: (input: { query: string; forward?: boolean; findNext?: boolean }) =>
+      ipcRenderer.invoke("paseo:find:start", input),
+    stop: (action?: "clearSelection" | "keepSelection" | "activateSelection") =>
+      ipcRenderer.invoke("paseo:find:stop", action ?? "clearSelection"),
+  },
   menu: {
     showContextMenu: (input?: Record<string, unknown>) =>
       ipcRenderer.invoke("paseo:menu:showContextMenu", input),

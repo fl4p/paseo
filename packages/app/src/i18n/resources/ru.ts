@@ -1293,6 +1293,14 @@ export const ru: TranslationResources = {
       restore: "Восстановить окно",
       close: "Закрыть окно",
     },
+    find: {
+      placeholder: "Поиск",
+      matches: "{{current}} из {{total}}",
+      noMatches: "Ничего не найдено",
+      previous: "Предыдущее совпадение",
+      next: "Следующее совпадение",
+      close: "Закрыть панель поиска",
+    },
     quitting: {
       title: "Завершение работы Paseo...",
       detail: "Остановка локального демона.",

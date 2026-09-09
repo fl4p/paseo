@@ -10,6 +10,8 @@ describe("browser keyboard policy", () => {
   test("classifies shell-owned browser shortcuts for the current platform modifier", () => {
     const macInputs = [
       { type: "keyDown", key: "t", meta: true, control: false, alt: false, shift: false },
+      { type: "keyDown", key: "f", meta: true, control: false, alt: false, shift: false },
+      { type: "keyDown", key: "f", meta: true, control: false, alt: false, shift: true },
       { type: "keyDown", key: "l", meta: true, control: false, alt: false, shift: false },
       { type: "keyDown", key: "r", meta: true, control: false, alt: false, shift: false },
       { type: "keyDown", key: "r", meta: true, control: false, alt: false, shift: true },
@@ -22,10 +24,10 @@ describe("browser keyboard policy", () => {
 
     expect(
       macInputs.map((input) => classifyBrowserReservedShortcut(input, { isMac: true })),
-    ).toEqual([null, "focus-url", "reload", "force-reload"]);
+    ).toEqual([null, "find", null, "focus-url", "reload", "force-reload"]);
     expect(
       nonMacInputs.map((input) => classifyBrowserReservedShortcut(input, { isMac: false })),
-    ).toEqual([null, "focus-url", "reload", "force-reload"]);
+    ).toEqual([null, "find", null, "focus-url", "reload", "force-reload"]);
   });
 
   test("rejects the wrong or ambiguous command modifier for reserved shortcuts", () => {

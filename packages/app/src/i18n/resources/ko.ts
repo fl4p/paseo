@@ -1283,6 +1283,14 @@ export const ko: TranslationResources = {
       restore: "창 복원",
       close: "창 닫기",
     },
+    find: {
+      placeholder: "찾기",
+      matches: "{{total}}개 중 {{current}}번째",
+      noMatches: "결과 없음",
+      previous: "이전 일치 항목",
+      next: "다음 일치 항목",
+      close: "찾기 바 닫기",
+    },
     quitting: {
       title: "Paseo 종료 중...",
       detail: "로컬 데몬을 중지하는 중입니다.",

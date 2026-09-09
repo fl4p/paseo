@@ -1310,6 +1310,14 @@ export const es: TranslationResources = {
       restore: "Restaurar ventana",
       close: "Cerrar ventana",
     },
+    find: {
+      placeholder: "Buscar",
+      matches: "{{current}} de {{total}}",
+      noMatches: "Sin resultados",
+      previous: "Coincidencia anterior",
+      next: "Coincidencia siguiente",
+      close: "Cerrar la barra de búsqueda",
+    },
     quitting: {
       title: "Saliendo dePaseo...",
       detail: "Deteniendo el demonio local.",

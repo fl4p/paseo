@@ -1288,6 +1288,14 @@ export const ja: TranslationResources = {
       restore: "ウィンドウを元に戻す",
       close: "ウィンドウを閉じる",
     },
+    find: {
+      placeholder: "検索",
+      matches: "{{total}} 件中 {{current}} 件目",
+      noMatches: "結果なし",
+      previous: "前の一致",
+      next: "次の一致",
+      close: "検索バーを閉じる",
+    },
     quitting: {
       title: "Paseoを終了中...",
       detail: "ローカルデーモンを停止中。",
