@@ -2804,12 +2804,17 @@ class ClaudeAgentSession implements AgentSession {
    */
   async forkProviderSession(input: {
     boundaryMessageId?: string | null;
+    atCompletedTurn?: boolean;
   }): Promise<{ providerHandleId: string }> {
     const sessionId = this.claudeSessionId;
     const fork = await forkClaudeSession({
       sdk: realClaudeRewindSdk,
       sessionId,
       boundaryMessageId: input.boundaryMessageId,
+      // While a turn is running the transcript is a moving target: cut at the
+      // last completed turn so the fork can never carry a partially written
+      // one, nor a tool_use whose result has not been appended yet.
+      atCompletedTurn: input.atCompletedTurn,
       readTranscript: () => this.readSessionTranscript(sessionId),
       // The forked file needs a post-pass: `forkSession` remaps top-level uuids
       // but not the ones embedded in a compact boundary, which would make the

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { providerSupportsNativeFork, resolveForkMode, resolveForkTargetCwd } from "./fork-mode";
+import {
+  forkModeDescriptionKey,
+  providerSupportsNativeFork,
+  resolveForkMode,
+  resolveForkTargetCwd,
+} from "./fork-mode";
 
 const CWD = "/Users/dev/project";
 
@@ -88,5 +93,30 @@ describe("providerSupportsNativeFork", () => {
     expect(providerSupportsNativeFork("claude")).toBe(true);
     expect(providerSupportsNativeFork("codex")).toBe(false);
     expect(providerSupportsNativeFork(undefined)).toBe(false);
+  });
+});
+
+describe("forkModeDescriptionKey", () => {
+  it("promises the full context only when nothing is streaming", () => {
+    expect(forkModeDescriptionKey({ mode: "native", inFlight: false })).toBe(
+      "message.actions.forkKeepsContext",
+    );
+  });
+
+  it("says a native fork stops at the last completed reply during a turn", () => {
+    // The provider transcript does not contain the running turn yet, so the
+    // daemon cuts at the last completed one. The menu must not promise more.
+    expect(forkModeDescriptionKey({ mode: "native", inFlight: true })).toBe(
+      "message.actions.forkKeepsContextFromLastTurn",
+    );
+  });
+
+  it("keeps the attachment description, which does include the streaming turn", () => {
+    expect(forkModeDescriptionKey({ mode: "attachment", inFlight: true })).toBe(
+      "message.actions.forkCopiesSummary",
+    );
+    expect(forkModeDescriptionKey({ mode: "attachment", inFlight: false })).toBe(
+      "message.actions.forkCopiesSummary",
+    );
   });
 });

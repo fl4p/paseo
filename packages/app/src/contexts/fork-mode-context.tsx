@@ -15,18 +15,33 @@ import type { ForkMode } from "@/hooks/fork-mode";
 export interface ForkModeByTarget {
   tab: ForkMode;
   workspace: ForkMode;
+  /**
+   * A turn is running right now. A native fork then branches the provider
+   * transcript at the last COMPLETED turn — the streaming one is not in the
+   * file yet, and its tool calls have no results — so the menu has to say so
+   * rather than promise the reply on screen.
+   */
+  inFlight: boolean;
 }
 
-const DEFAULT_FORK_MODES: ForkModeByTarget = { tab: "attachment", workspace: "attachment" };
+const DEFAULT_FORK_MODES: ForkModeByTarget = {
+  tab: "attachment",
+  workspace: "attachment",
+  inFlight: false,
+};
 
 const ForkModeContext = createContext<ForkModeByTarget>(DEFAULT_FORK_MODES);
 
 export function ForkModeProvider({
   tab,
   workspace,
+  inFlight,
   children,
 }: ForkModeByTarget & { children: ReactNode }) {
-  const value = useMemo<ForkModeByTarget>(() => ({ tab, workspace }), [tab, workspace]);
+  const value = useMemo<ForkModeByTarget>(
+    () => ({ tab, workspace, inFlight }),
+    [tab, workspace, inFlight],
+  );
   return <ForkModeContext.Provider value={value}>{children}</ForkModeContext.Provider>;
 }
 

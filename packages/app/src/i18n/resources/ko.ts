@@ -302,6 +302,8 @@ export const ko: TranslationResources = {
       forkInNewTab: "새 탭으로 분기",
       forkInNewWorkspace: "새 워크스페이스로 분기",
       forkKeepsContext: "전체 컨텍스트와 프롬프트 캐시를 유지합니다",
+      forkKeepsContextFromLastTurn:
+        "완료된 마지막 응답까지 전체 컨텍스트와 프롬프트 캐시를 유지합니다",
       forkCopiesSummary: "이 대화의 텍스트 요약을 복사합니다",
       forkUnavailable: "이를 사용하려면 호스트를 업데이트하세요.",
       forkMissingWorkspace: "이 에이전트는 워크스페이스에 속해 있지 않습니다.",

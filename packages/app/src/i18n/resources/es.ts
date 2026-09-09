@@ -304,6 +304,8 @@ export const es: TranslationResources = {
       forkInNewTab: "Bifurcar en una pestaña nueva",
       forkInNewWorkspace: "Bifurcar en un espacio de trabajo nuevo",
       forkKeepsContext: "Conserva el contexto completo y la caché de prompts",
+      forkKeepsContextFromLastTurn:
+        "Conserva el contexto completo y la caché de prompts, hasta la última respuesta completada",
       forkCopiesSummary: "Copia un resumen de texto de este chat",
       forkUnavailable: "Actualiza el host para usar esto.",
       forkMissingWorkspace: "Este agente no está en un espacio de trabajo.",

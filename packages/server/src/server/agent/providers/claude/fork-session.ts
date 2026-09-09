@@ -42,7 +42,9 @@ import type { ClaudeRewindSdk } from "./rewind.js";
 
 export interface ClaudeForkBoundaryEntry {
   uuid?: unknown;
-  message?: { id?: unknown } | null;
+  type?: unknown;
+  isSidechain?: unknown;
+  message?: { id?: unknown; content?: unknown } | null;
 }
 
 function readString(value: unknown): string | null {
@@ -104,6 +106,85 @@ export function resolveForkBoundaryUuid(
     }
   }
   return apiMatch;
+}
+
+/** Tool ids opened and closed by one transcript entry. */
+function readToolBlockIds(entry: ClaudeForkBoundaryEntry): {
+  opened: string[];
+  closed: string[];
+} {
+  const opened: string[] = [];
+  const closed: string[] = [];
+  const content = entry.message?.content;
+  if (!Array.isArray(content)) {
+    return { opened, closed };
+  }
+  for (const value of content) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const block = value as { type?: unknown; id?: unknown; tool_use_id?: unknown };
+    if (block.type === "tool_use") {
+      const id = readString(block.id);
+      if (id) opened.push(id);
+    } else if (block.type === "tool_result") {
+      const id = readString(block.tool_use_id);
+      if (id) closed.push(id);
+    }
+  }
+  return { opened, closed };
+}
+
+/**
+ * The last transcript position a fork may safely cut at.
+ *
+ * Both the branch reader and the SDK take a *snapshot* of a file a live session
+ * is still appending to, so the tail of that snapshot can be an assistant entry
+ * whose `tool_use` blocks have no `tool_result` yet — a transcript the forked
+ * session cannot resume, because the API rejects a `tool_use` with no matching
+ * result. Cutting where no tool call is still open also makes the snapshot race
+ * harmless: everything written after the cut is excluded by construction, so a
+ * partially flushed trailing line can never reach the fork.
+ *
+ * `requireTurnEnd` additionally demands that the cut land on the END of an
+ * assistant turn (an assistant entry that opens no tool call). That is what the
+ * caller asks for when a run is in flight and no explicit boundary was picked:
+ * the fork then reproduces the last COMPLETED turn rather than half of the one
+ * still streaming. With an explicit boundary the user has chosen the position,
+ * so only the tool-pairing invariant is enforced.
+ *
+ * Returns `null` when no position qualifies (nothing has completed yet).
+ */
+export function resolveSafeForkUuid(
+  entries: readonly ClaudeForkBoundaryEntry[],
+  options: { untilUuid?: string | null; requireTurnEnd?: boolean } = {},
+): string | null {
+  const until = options.untilUuid?.trim() || null;
+  const open = new Set<string>();
+  let safe: string | null = null;
+  for (const entry of entries) {
+    // Subagent transcripts carry their own tool pairs; they neither open nor
+    // close anything in the main conversation.
+    if (entry.isSidechain === true) {
+      continue;
+    }
+    const uuid = readString(entry.uuid);
+    const { opened, closed } = readToolBlockIds(entry);
+    for (const id of closed) {
+      open.delete(id);
+    }
+    for (const id of opened) {
+      open.add(id);
+    }
+    const endsATurn = entry.type === "assistant" && opened.length === 0;
+    if (uuid && open.size === 0 && (!options.requireTurnEnd || endsATurn)) {
+      safe = uuid;
+    }
+    if (until && uuid === until) {
+      break;
+    }
+  }
+  return safe;
 }
 
 export class ClaudeForkBoundaryError extends Error {
@@ -391,6 +472,11 @@ export async function forkClaudeSession(input: {
   sdk: ClaudeRewindSdk;
   sessionId: string | null;
   boundaryMessageId?: string | null;
+  /**
+   * A turn is in flight, so the transcript is being appended to while we read
+   * it. Cut at the last COMPLETED turn instead of at the end of the file.
+   */
+  atCompletedTurn?: boolean;
   readTranscript: () => Promise<string | null> | string | null;
   forkTranscript?: ClaudeForkTranscriptStore | null;
   logger?: Logger | null;
@@ -435,23 +521,65 @@ export async function deleteForkedClaudeSession(input: {
   await input.sdk.deleteSession(forkSessionId);
 }
 
+export class ClaudeForkInFlightError extends Error {
+  constructor(reason: string) {
+    super(`Cannot fork while a turn is in flight: ${reason}`);
+    this.name = "ClaudeForkInFlightError";
+  }
+}
+
 async function forkAtBoundary(input: {
   sdk: ClaudeRewindSdk;
   sessionId: string;
   boundaryMessageId?: string | null;
+  atCompletedTurn?: boolean;
   readTranscript: () => Promise<string | null> | string | null;
+  logger?: Logger | null;
 }): Promise<{ sessionId: string }> {
   const boundary = input.boundaryMessageId?.trim() || null;
-  if (!boundary) {
-    return await input.sdk.forkSession(input.sessionId, {});
-  }
   const content = await input.readTranscript();
   if (!content) {
+    if (boundary) {
+      throw new ClaudeForkBoundaryError(boundary);
+    }
+    if (input.atCompletedTurn) {
+      // Without the transcript there is no way to tell where the completed
+      // turns end, and forking the whole file would clone the half-written one.
+      throw new ClaudeForkInFlightError("the source transcript could not be read");
+    }
+    // Nothing in flight and no boundary: the whole session is the fork, and the
+    // SDK reads the file itself.
+    return await input.sdk.forkSession(input.sessionId, {});
+  }
+  const entries = parseTranscriptBoundaryEntries(content);
+  const requested = boundary ? resolveForkBoundaryUuid(entries, boundary) : null;
+  if (boundary && !requested) {
     throw new ClaudeForkBoundaryError(boundary);
   }
-  const uuid = resolveForkBoundaryUuid(parseTranscriptBoundaryEntries(content), boundary);
+  // Never cut where a `tool_use` is still open: the forked transcript would
+  // carry a tool call whose result never arrived, which the API rejects.
+  const uuid = resolveSafeForkUuid(entries, {
+    untilUuid: requested,
+    // An explicit boundary is the user's choice of position; only the
+    // tool-pairing invariant applies to it.
+    ...(input.atCompletedTurn && !requested ? { requireTurnEnd: true } : {}),
+  });
   if (!uuid) {
-    throw new ClaudeForkBoundaryError(boundary);
+    if (boundary) {
+      throw new ClaudeForkBoundaryError(boundary);
+    }
+    throw new ClaudeForkInFlightError("no turn has completed yet");
+  }
+  if (uuid !== requested) {
+    input.logger?.info(
+      {
+        sessionId: input.sessionId,
+        requestedUuid: requested,
+        forkUuid: uuid,
+        atCompletedTurn: input.atCompletedTurn === true,
+      },
+      "claude.fork.trimmed_to_complete_position",
+    );
   }
   return await input.sdk.forkSession(input.sessionId, { upToMessageId: uuid });
 }

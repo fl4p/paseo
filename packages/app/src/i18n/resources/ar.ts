@@ -301,6 +301,8 @@ export const ar: TranslationResources = {
       forkInNewTab: "تفريع في تبويب جديد",
       forkInNewWorkspace: "تفريع في مساحة عمل جديدة",
       forkKeepsContext: "يحتفظ بالسياق الكامل وذاكرة التخزين المؤقت للمطالبات",
+      forkKeepsContextFromLastTurn:
+        "يحتفظ بالسياق الكامل وذاكرة التخزين المؤقت للمطالبات حتى آخر رد مكتمل",
       forkCopiesSummary: "ينسخ ملخصًا نصيًا لهذه المحادثة",
       forkUnavailable: "حدّث المضيف لاستخدام هذا.",
       forkMissingWorkspace: "هذا الوكيل ليس في مساحة عمل.",

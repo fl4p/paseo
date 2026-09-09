@@ -43,9 +43,17 @@ export type ForkAgentSource = Pick<
 
 /**
  * Boundary marking where the forked context should stop. Omit it entirely to
- * fork the whole timeline *up to now* — including a partially streamed
- * in-flight turn. `selectForkContextRows` projects the full timeline when
- * neither field is present, which is what makes mid-run forking work.
+ * fork *up to now*.
+ *
+ * What "now" means depends on the fork mode, and the menu says which:
+ *
+ * - `attachment` — the daemon renders the live timeline, so a partially
+ *   streamed in-flight turn IS included (`selectForkContextRows` projects the
+ *   full timeline when neither field is present);
+ * - `native` — the daemon branches the provider's own transcript, which does
+ *   not contain the running turn yet, so it cuts at the last COMPLETED turn.
+ *   Forking the visible tail instead would clone a half-written turn, or a
+ *   `tool_use` whose `tool_result` never arrived.
  */
 export type ForkAgentBoundary = Pick<
   AgentForkContextOptions,
@@ -153,8 +161,9 @@ async function runNativeFork(input: {
 /**
  * Shared fork driver behind both turn-footer fork affordances: the completed
  * turn's footer (which supplies a boundary pinned to that turn) and the
- * in-flight turn's footer next to the progress loader (which omits the boundary
- * so the fork captures the still-streaming response).
+ * in-flight turn's footer next to the progress loader (which omits the
+ * boundary, so the fork runs up to "now" — see `ForkAgentBoundary` for what
+ * each mode can actually deliver there).
  */
 export function useForkAgent(
   input: UseForkAgentInput,

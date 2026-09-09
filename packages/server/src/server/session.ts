@@ -7600,6 +7600,7 @@ export class Session {
           ...(input.workspaceId ? { requestedWorkspaceId: input.workspaceId } : {}),
         });
       },
+      hasInFlightRun: (agentId) => this.agentManager.hasInFlightRun(agentId),
       forkProviderSession: (agentId, input) =>
         this.agentManager.forkProviderSession(agentId, input),
       deleteForkedProviderSession: (agentId, input) =>

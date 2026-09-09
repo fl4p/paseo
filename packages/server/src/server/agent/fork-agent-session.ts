@@ -25,6 +25,12 @@ export interface ForkAgentSessionDeps {
   /** Read the source agent's timeline, used only to resolve a boundary. */
   fetchTimeline(agentId: string): { epoch: string; rows: readonly AgentTimelineRow[] };
   /**
+   * Is a turn running on the source agent right now? A fork taken then reads a
+   * transcript that is still being appended to, so it must be cut at the last
+   * completed turn rather than at the end of the file.
+   */
+  hasInFlightRun(agentId: string): boolean;
+  /**
    * Everything that can be checked BEFORE the irreversible provider fork:
    * the directory still exists, and the requested workspace (and its project)
    * is present, unarchived and points at that directory. Throwing here means
@@ -34,7 +40,7 @@ export interface ForkAgentSessionDeps {
   /** Branch the provider session; returns the new provider-level handle. */
   forkProviderSession(
     agentId: string,
-    input: { boundaryMessageId: string | null },
+    input: { boundaryMessageId: string | null; atCompletedTurn: boolean },
   ): Promise<{ providerHandleId: string; provider: AgentProvider; cwd: string }>;
   /** Register the branched provider session as a new paseo agent. */
   importProviderSession(input: {
@@ -108,7 +114,17 @@ export async function forkAgentSessionNatively(
   // has to be rolled back by hand.
   await deps.validateForkTarget({ cwd, workspaceId });
 
-  const fork = await deps.forkProviderSession(request.agentId, { boundaryMessageId });
+  // A fork requested mid-turn cannot include the turn that is still streaming:
+  // both this reader and the SDK take a snapshot of a file the provider is
+  // appending to, so the visible tail may be half-written and its tool calls
+  // may have no results yet. Cutting at the last completed turn is also what
+  // serializes the fork against the writer -- everything appended after the cut
+  // is excluded by construction, so no lock is needed and none is taken.
+  const atCompletedTurn = !boundaryMessageId && deps.hasInFlightRun(request.agentId);
+  const fork = await deps.forkProviderSession(request.agentId, {
+    boundaryMessageId,
+    atCompletedTurn,
+  });
   const imported = await withForkRollback(request.agentId, fork.providerHandleId, deps, () =>
     importForkedSession({ deps, fork, cwd, workspaceId, request, config: source.config }),
   );
@@ -118,6 +134,7 @@ export async function forkAgentSessionNatively(
       forkedAgentId: imported.agentId,
       providerHandleId: fork.providerHandleId,
       boundaryMessageId,
+      atCompletedTurn,
       timelineSize: imported.timelineSize,
     },
     "agent.fork_session.complete",

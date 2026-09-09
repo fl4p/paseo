@@ -12,6 +12,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
 import { useForkModes } from "@/contexts/fork-mode-context";
+import { forkModeDescriptionKey, type ForkMode } from "@/hooks/fork-mode";
 
 export type AssistantForkTarget = "tab" | "workspace";
 
@@ -32,11 +33,8 @@ export const AssistantForkMenu = memo(function AssistantForkMenu({
   const { t } = useTranslation();
   const forkModes = useForkModes();
   const describeMode = useCallback(
-    (mode: "native" | "attachment") =>
-      mode === "native"
-        ? t("message.actions.forkKeepsContext")
-        : t("message.actions.forkCopiesSummary"),
-    [t],
+    (mode: ForkMode) => t(forkModeDescriptionKey({ mode, inFlight: forkModes.inFlight })),
+    [forkModes.inFlight, t],
   );
   const [isOpen, setIsOpen] = useState(false);
   const [pendingTarget, setPendingTarget] = useState<AssistantForkTarget | null>(null);

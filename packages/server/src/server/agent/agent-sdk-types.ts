@@ -711,6 +711,12 @@ export interface AgentSession {
    */
   forkProviderSession?(input: {
     boundaryMessageId?: string | null;
+    /**
+     * A turn is in flight on this session, so its transcript is being appended
+     * to. Implementations must branch at the last COMPLETED turn rather than at
+     * the end of the file, so the fork never carries half of a streaming turn.
+     */
+    atCompletedTurn?: boolean;
   }): Promise<{ providerHandleId: string }>;
   /**
    * Delete a provider session this session previously forked, undoing an

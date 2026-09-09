@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   ClaudeForkBoundaryError,
+  ClaudeForkInFlightError,
   deleteForkedClaudeSession,
   forkClaudeSession,
   parseTranscriptBoundaryEntries,
   resolveForkBoundaryUuid,
+  resolveSafeForkUuid,
 } from "./fork-session.js";
 import { FakeClaudeSdk } from "./test-rewind-claude-sdk.js";
 
@@ -49,18 +51,117 @@ describe("resolveForkBoundaryUuid", () => {
   });
 });
 
+/**
+ * A transcript captured mid-turn: the assistant has emitted a `tool_use` whose
+ * `tool_result` has not been written yet. This is exactly what a fork taken
+ * while a run is in flight sees.
+ */
+const IN_FLIGHT_TRANSCRIPT = [
+  JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+  JSON.stringify({
+    type: "assistant",
+    uuid: "a1",
+    message: { id: "msg_1", content: [{ type: "text", text: "done" }] },
+  }),
+  JSON.stringify({ type: "user", uuid: "u2", message: { content: "next" } }),
+  JSON.stringify({
+    type: "assistant",
+    uuid: "a2",
+    message: { id: "msg_2", content: [{ type: "tool_use", id: "tool_1", name: "Read" }] },
+  }),
+].join("\n");
+
+describe("resolveSafeForkUuid", () => {
+  const inFlight = parseTranscriptBoundaryEntries(IN_FLIGHT_TRANSCRIPT);
+
+  it("never cuts where a tool_use is still open", () => {
+    // Cutting at "a2" would clone a tool call whose result never arrived; the
+    // API rejects such a transcript, so the fork would be unusable.
+    expect(resolveSafeForkUuid(inFlight)).toBe("u2");
+  });
+
+  it("cuts at the last completed turn when asked for one", () => {
+    expect(resolveSafeForkUuid(inFlight, { requireTurnEnd: true })).toBe("a1");
+  });
+
+  it("resumes cutting once the tool result arrives", () => {
+    const settled = parseTranscriptBoundaryEntries(
+      `${IN_FLIGHT_TRANSCRIPT}\n${JSON.stringify({
+        type: "user",
+        uuid: "u3",
+        message: { content: [{ type: "tool_result", tool_use_id: "tool_1" }] },
+      })}\n${JSON.stringify({
+        type: "assistant",
+        uuid: "a3",
+        message: { id: "msg_3", content: [{ type: "text", text: "ok" }] },
+      })}`,
+    );
+    expect(resolveSafeForkUuid(settled)).toBe("a3");
+    expect(resolveSafeForkUuid(settled, { requireTurnEnd: true })).toBe("a3");
+  });
+
+  it("ignores a subagent sidechain's own tool pairs", () => {
+    const withSidechain = parseTranscriptBoundaryEntries(
+      [
+        JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "s1",
+          isSidechain: true,
+          message: { content: [{ type: "tool_use", id: "sub_1", name: "Grep" }] },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "a1",
+          message: { id: "msg_1", content: [{ type: "text", text: "done" }] },
+        }),
+      ].join("\n"),
+    );
+    expect(resolveSafeForkUuid(withSidechain, { requireTurnEnd: true })).toBe("a1");
+  });
+
+  it("stops at the requested boundary", () => {
+    expect(resolveSafeForkUuid(inFlight, { untilUuid: "u2" })).toBe("u2");
+    expect(resolveSafeForkUuid(inFlight, { untilUuid: "a1" })).toBe("a1");
+  });
+
+  it("has no safe position before the first completed turn", () => {
+    const nothingDone = parseTranscriptBoundaryEntries(
+      [
+        JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "a1",
+          message: { content: [{ type: "tool_use", id: "tool_1", name: "Read" }] },
+        }),
+      ].join("\n"),
+    );
+    expect(resolveSafeForkUuid(nothingDone, { requireTurnEnd: true })).toBeNull();
+  });
+});
+
 describe("forkClaudeSession", () => {
-  it("forks the whole session when no boundary is given", async () => {
+  it("cuts an unbounded fork at the last complete position, not at end of file", async () => {
     const sdk = new FakeClaudeSdk();
     sdk.setNextSessionId("forked-whole");
     const result = await forkClaudeSession({
       sdk,
       sessionId: "source-session",
-      readTranscript: () => {
-        throw new Error("transcript must not be read without a boundary");
-      },
+      readTranscript: () => TRANSCRIPT,
     });
     expect(result).toEqual({ sessionId: "forked-whole" });
+    // The whole transcript is complete here, so the cut is the last entry --
+    // but it is now an EXPLICIT cut, which is what keeps a line appended
+    // between our read and the SDK's out of the fork.
+    expect(sdk.recordedForkCalls).toEqual([
+      { sessionId: "source-session", upToMessageId: "uuid-assistant-2" },
+    ]);
+  });
+
+  it("falls back to a whole-session fork when the transcript cannot be read", async () => {
+    const sdk = new FakeClaudeSdk();
+    sdk.setNextSessionId("forked-whole");
+    await forkClaudeSession({ sdk, sessionId: "source-session", readTranscript: () => null });
     expect(sdk.recordedForkCalls).toEqual([
       { sessionId: "source-session", upToMessageId: undefined },
     ]);
@@ -104,6 +205,64 @@ describe("forkClaudeSession", () => {
         readTranscript: () => null,
       }),
     ).rejects.toBeInstanceOf(ClaudeForkBoundaryError);
+    expect(sdk.recordedForkCalls).toEqual([]);
+  });
+
+  it("forks the last completed turn while a turn is in flight", async () => {
+    const sdk = new FakeClaudeSdk();
+    sdk.setNextSessionId("forked-in-flight");
+    await forkClaudeSession({
+      sdk,
+      sessionId: "source-session",
+      atCompletedTurn: true,
+      readTranscript: () => IN_FLIGHT_TRANSCRIPT,
+    });
+    expect(sdk.recordedForkCalls).toEqual([{ sessionId: "source-session", upToMessageId: "a1" }]);
+  });
+
+  it("never clones a tool_use whose result has not arrived", async () => {
+    // Even without an in-flight run the transcript is a snapshot of a file the
+    // provider may still be appending to, so the invariant is unconditional.
+    const sdk = new FakeClaudeSdk();
+    await forkClaudeSession({
+      sdk,
+      sessionId: "source-session",
+      readTranscript: () => IN_FLIGHT_TRANSCRIPT,
+    });
+    expect(sdk.recordedForkCalls).toEqual([{ sessionId: "source-session", upToMessageId: "u2" }]);
+  });
+
+  it("refuses an in-flight fork when the transcript cannot be read", async () => {
+    const sdk = new FakeClaudeSdk();
+    await expect(
+      forkClaudeSession({
+        sdk,
+        sessionId: "source-session",
+        atCompletedTurn: true,
+        readTranscript: () => null,
+      }),
+    ).rejects.toBeInstanceOf(ClaudeForkInFlightError);
+    expect(sdk.recordedForkCalls).toEqual([]);
+  });
+
+  it("refuses an in-flight fork before any turn has completed", async () => {
+    const sdk = new FakeClaudeSdk();
+    await expect(
+      forkClaudeSession({
+        sdk,
+        sessionId: "source-session",
+        atCompletedTurn: true,
+        readTranscript: () =>
+          [
+            JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+            JSON.stringify({
+              type: "assistant",
+              uuid: "a1",
+              message: { content: [{ type: "tool_use", id: "tool_1", name: "Read" }] },
+            }),
+          ].join("\n"),
+      }),
+    ).rejects.toThrow(/no turn has completed yet/);
     expect(sdk.recordedForkCalls).toEqual([]);
   });
 

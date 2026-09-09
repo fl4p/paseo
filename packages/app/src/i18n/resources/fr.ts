@@ -305,6 +305,8 @@ export const fr: TranslationResources = {
       forkInNewTab: "Dupliquer dans un nouvel onglet",
       forkInNewWorkspace: "Dupliquer dans un nouvel espace de travail",
       forkKeepsContext: "Conserve le contexte complet et le cache de prompts",
+      forkKeepsContextFromLastTurn:
+        "Conserve le contexte complet et le cache de prompts, jusqu’à la dernière réponse terminée",
       forkCopiesSummary: "Copie un résumé textuel de cette discussion",
       forkUnavailable: "Mettez l'hôte à jour pour utiliser ceci.",
       forkMissingWorkspace: "Cet agent n'est pas dans un espace de travail.",

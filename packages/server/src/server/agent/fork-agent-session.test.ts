@@ -162,11 +162,13 @@ describe("forkAgentSessionNatively", () => {
         config: SOURCE_CONFIG,
       })),
       fetchTimeline: vi.fn(() => ({ epoch: "epoch-1", rows: SOURCE_ROWS })),
+      hasInFlightRun: vi.fn(() => false),
       forkProviderSession: async (_agentId, input) => {
         const fork = await forkClaudeSession({
           sdk,
           sessionId: "source-session",
           boundaryMessageId: input.boundaryMessageId,
+          atCompletedTurn: input.atCompletedTurn,
           readTranscript: () => readFileSync(join(dir, "source-session.jsonl"), "utf8"),
         });
         return { providerHandleId: fork.sessionId, provider: "claude", cwd: "/workspace" };
@@ -208,9 +210,7 @@ describe("forkAgentSessionNatively", () => {
     // The compaction marker survives the copy, which is what lets the resumed
     // fork rebuild the compacted context instead of the raw history.
     expect(timeline.some((item) => item.type === "compaction")).toBe(true);
-    expect(sdk.recordedForkCalls).toEqual([
-      { sessionId: "source-session", upToMessageId: undefined },
-    ]);
+    expect(sdk.recordedForkCalls).toEqual([{ sessionId: "source-session", upToMessageId: "a3" }]);
   });
 
   it("maps a paseo assistant message id to the provider uuid before slicing", async () => {
@@ -413,6 +413,51 @@ describe("forkAgentSessionNatively", () => {
       forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-rollback-3" }, deps),
     ).rejects.toThrow("hydration failed");
     expect(deps.deleteForkedProviderSession).toHaveBeenCalled();
+  });
+
+  it("forks the last completed turn when a run is in flight", async () => {
+    // The user asked to fork "now", with a reply still streaming. The tail of
+    // the transcript is a tool_use whose result has not been written yet, so
+    // forking it would clone a call that can never be answered.
+    writeFileSync(
+      join(dir, "source-session.jsonl"),
+      toJsonl([
+        ...SOURCE_ENTRIES,
+        { type: "user", uuid: "u4", message: { role: "user", content: "fourth task" } },
+        {
+          type: "assistant",
+          uuid: "a4",
+          message: {
+            id: "msg_4",
+            role: "assistant",
+            content: [{ type: "tool_use", id: "tool_1", name: "Read", input: {} }],
+          },
+        },
+      ]),
+      "utf8",
+    );
+    deps.hasInFlightRun = vi.fn(() => true);
+
+    await forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-in-flight" }, deps);
+
+    expect(sdk.recordedForkCalls).toEqual([{ sessionId: "source-session", upToMessageId: "a3" }]);
+    const timeline = importedTimelines[0] ?? [];
+    // The fork stops at the last completed reply: the in-flight user prompt and
+    // its unanswered tool call are not in it.
+    expect(
+      timeline.filter((item) => item.type === "user_message").map((item) => item.text),
+    ).toEqual(["first task", "second task", "third task"]);
+  });
+
+  it("keeps the user's boundary when one was picked mid-run", async () => {
+    // An explicit boundary is a position the user chose; a running turn behind
+    // it does not move it.
+    deps.hasInFlightRun = vi.fn(() => true);
+    await forkAgentSessionNatively(
+      { agentId: "agent-source", requestId: "req-in-flight-2", boundaryMessageId: "msg_2" },
+      deps,
+    );
+    expect(sdk.recordedForkCalls).toEqual([{ sessionId: "source-session", upToMessageId: "a2" }]);
   });
 
   it("registers a workspace the import had to create", async () => {

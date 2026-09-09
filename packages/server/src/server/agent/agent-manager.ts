@@ -3010,7 +3010,7 @@ export class AgentManager {
    */
   async forkProviderSession(
     agentId: string,
-    input: { boundaryMessageId?: string | null },
+    input: { boundaryMessageId?: string | null; atCompletedTurn?: boolean },
   ): Promise<{ providerHandleId: string; provider: AgentProvider; cwd: string }> {
     const agent = this.requireSessionAgent(agentId);
     const fork = agent.session.forkProviderSession;
@@ -3019,6 +3019,7 @@ export class AgentManager {
     }
     const result = await fork.call(agent.session, {
       boundaryMessageId: input.boundaryMessageId ?? null,
+      atCompletedTurn: input.atCompletedTurn === true,
     });
     this.logger.info(
       {
@@ -3026,6 +3027,7 @@ export class AgentManager {
         provider: agent.provider,
         providerHandleId: result.providerHandleId,
         boundaryMessageId: input.boundaryMessageId ?? null,
+        atCompletedTurn: input.atCompletedTurn === true,
       },
       "agent.fork_session.provider_fork",
     );

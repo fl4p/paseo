@@ -108,3 +108,25 @@ export function resolveForkTargetCwd(input: {
 }): string | null {
   return input.target === "tab" ? input.sourceCwd?.trim() || null : null;
 }
+
+/**
+ * The i18n key describing what a fork of `mode` will actually carry.
+ *
+ * Kept next to `resolveForkMode` (and out of the menu component) so the promise
+ * the UI makes is unit-testable against the same rules the fork follows:
+ *
+ * - an attachment fork renders the LIVE timeline, so it does include a turn
+ *   that is still streaming;
+ * - a native fork branches the provider's transcript. While a turn is in
+ *   flight, that file does not contain it yet — and its `tool_use` blocks have
+ *   no results — so the daemon cuts at the last COMPLETED turn and the menu
+ *   says so instead of promising the reply on screen.
+ */
+export function forkModeDescriptionKey(input: { mode: ForkMode; inFlight: boolean }): string {
+  if (input.mode !== "native") {
+    return "message.actions.forkCopiesSummary";
+  }
+  return input.inFlight
+    ? "message.actions.forkKeepsContextFromLastTurn"
+    : "message.actions.forkKeepsContext";
+}

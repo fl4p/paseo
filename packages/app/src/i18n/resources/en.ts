@@ -299,6 +299,8 @@ export const en = {
       forkInNewTab: "Fork in a new tab",
       forkInNewWorkspace: "Fork in a new workspace",
       forkKeepsContext: "Keeps the full context and prompt cache",
+      forkKeepsContextFromLastTurn:
+        "Keeps the full context and prompt cache, up to the last completed reply",
       forkCopiesSummary: "Copies a text summary of this chat",
       forkUnavailable: "Update the host to use this.",
       forkMissingWorkspace: "This agent is not in a workspace.",

@@ -304,6 +304,8 @@ export const ja: TranslationResources = {
       forkInNewTab: "新しいタブにフォーク",
       forkInNewWorkspace: "新しいワークスペースにフォーク",
       forkKeepsContext: "完全なコンテキストとプロンプトキャッシュを維持します",
+      forkKeepsContextFromLastTurn:
+        "完全なコンテキストとプロンプトキャッシュを、完了した最後の応答まで維持します",
       forkCopiesSummary: "このチャットのテキスト要約をコピーします",
       forkUnavailable: "これを使用するにはホストを更新してください。",
       forkMissingWorkspace: "このエージェントはワークスペース内にありません。",

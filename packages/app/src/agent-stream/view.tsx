@@ -1107,7 +1107,11 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
     return (
       <ToolCallSheetProvider>
-        <ForkModeProvider tab={forkModes.tab} workspace={forkModes.workspace}>
+        <ForkModeProvider
+          tab={forkModes.tab}
+          workspace={forkModes.workspace}
+          inFlight={isTurnActive}
+        >
           <AssistantSelectionCopySurface style={stylesheet.container}>
             <MessageOuterSpacingProvider disableOuterSpacing>
               {streamRenderStrategy.render({
