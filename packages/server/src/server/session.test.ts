@@ -3,6 +3,7 @@ import { execSync } from "child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve as resolvePath } from "path";
+import { fileURLToPath } from "node:url";
 import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -773,8 +774,10 @@ describe("session authorization permissions", () => {
   const FORK_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 
   // A real directory, because the fork now refuses before it branches anything
-  // when the source directory has gone away.
-  const FORK_CWD = process.cwd();
+  // when the source directory has gone away. This file's own directory rather
+  // than `process.cwd()`: sibling suites chdir into worktrees and then archive
+  // them, which would delete the cwd out from under this test.
+  const FORK_CWD = resolvePath(fileURLToPath(import.meta.url), "..");
 
   function createForkSessionForTest(
     permissions: readonly DaemonPermission[],
@@ -809,6 +812,9 @@ describe("session authorization permissions", () => {
           config: { provider: "claude", cwd: FORK_CWD },
         })),
         fetchTimeline: vi.fn(() => ({ epoch: "epoch-1", rows: [] })),
+        // Idle: an in-flight run makes the fork cut at the last completed turn
+        // instead, which these authorization cases are not about.
+        hasInFlightRun: vi.fn(() => false),
         forkProviderSession,
       },
     });
