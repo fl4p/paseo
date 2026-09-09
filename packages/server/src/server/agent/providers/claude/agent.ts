@@ -78,6 +78,7 @@ import {
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
 import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
+import { forkClaudeSession } from "./fork-session.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
@@ -2790,6 +2791,43 @@ class ClaudeAgentSession implements AgentSession {
   async revertBoth(input: { messageId: string }): Promise<void> {
     await this.revertFiles(input);
     await this.revertConversation(input);
+  }
+
+  /**
+   * Branch this session's transcript into a new Claude session file and hand
+   * back its id. The live session is untouched — the caller imports the
+   * returned handle as a separate paseo agent.
+   */
+  async forkProviderSession(input: {
+    boundaryMessageId?: string | null;
+  }): Promise<{ providerHandleId: string }> {
+    const sessionId = this.claudeSessionId;
+    const fork = await forkClaudeSession({
+      sdk: realClaudeRewindSdk,
+      sessionId,
+      boundaryMessageId: input.boundaryMessageId,
+      readTranscript: () => this.readSessionTranscript(sessionId),
+    });
+    return { providerHandleId: fork.sessionId };
+  }
+
+  private readSessionTranscript(sessionId: string | null): string | null {
+    if (!sessionId) {
+      return null;
+    }
+    try {
+      const historyPath = this.resolveHistoryPath(sessionId);
+      if (!historyPath || !fs.existsSync(historyPath)) {
+        return null;
+      }
+      return fs.readFileSync(historyPath, "utf8");
+    } catch (error) {
+      this.logger.warn(
+        { err: error, sessionId },
+        "Failed to read Claude transcript for fork boundary resolution",
+      );
+      return null;
+    }
   }
 
   private resolveSlashCommandInvocation(prompt: AgentPromptInput): SlashCommandInvocation | null {

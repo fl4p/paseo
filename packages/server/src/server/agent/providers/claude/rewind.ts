@@ -1,9 +1,15 @@
 import { forkSession as claudeForkSession, type Query } from "@anthropic-ai/claude-agent-sdk";
 
+/**
+ * Seam over the Claude Agent SDK's session mutation surface. Both rewind and
+ * provider-native fork go through it so tests can drive them with
+ * `FakeClaudeSdk` instead of a live CLI. `upToMessageId` is optional: rewind
+ * always supplies one, a whole-session fork does not.
+ */
 export interface ClaudeRewindSdk {
   forkSession(
     sessionId: string,
-    options: { upToMessageId: string },
+    options?: { upToMessageId?: string },
   ): Promise<{ sessionId: string }>;
 }
 

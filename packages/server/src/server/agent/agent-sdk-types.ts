@@ -700,6 +700,19 @@ export interface AgentSession {
   revertFiles?(input: { messageId: string }): Promise<void>;
   revertBoth?(input: { messageId: string }): Promise<void>;
   /**
+   * Provider-native fork: copy this session's own transcript into a fresh
+   * provider session and return its handle, without touching this session.
+   * The caller then imports that handle as a new paseo agent, which is what
+   * makes the fork inherit the source message prefix (warm prompt cache) and
+   * any compaction the provider already performed.
+   *
+   * Implemented only by providers whose session store supports branching;
+   * callers must feature-detect and fall back to a text-attachment fork.
+   */
+  forkProviderSession?(input: {
+    boundaryMessageId?: string | null;
+  }): Promise<{ providerHandleId: string }>;
+  /**
    * Out-of-band prompt handler. When non-null, the manager runs the returned
    * handler instead of allocating a turn. The handler emits stream events
    * directly via the provided `emit` callback, which routes through the

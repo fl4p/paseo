@@ -76,6 +76,7 @@ import {
   type PendingForegroundRun,
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
+import { ProviderForkUnsupportedError } from "./provider-fork.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
@@ -2990,6 +2991,41 @@ export class AgentManager {
   ): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
+  }
+
+  /**
+   * Branch an agent's provider session, returning the new provider handle.
+   *
+   * The source agent is left running and untouched; the handle is meant to be
+   * handed to `importProviderSession` so the fork becomes its own agent that
+   * replays the source transcript (warm prompt cache, inherited compaction).
+   */
+  async forkProviderSession(
+    agentId: string,
+    input: { boundaryMessageId?: string | null },
+  ): Promise<{ providerHandleId: string; provider: AgentProvider; cwd: string }> {
+    const agent = this.requireSessionAgent(agentId);
+    const fork = agent.session.forkProviderSession;
+    if (!fork) {
+      throw new ProviderForkUnsupportedError(agent.provider);
+    }
+    const result = await fork.call(agent.session, {
+      boundaryMessageId: input.boundaryMessageId ?? null,
+    });
+    this.logger.info(
+      {
+        agentId,
+        provider: agent.provider,
+        providerHandleId: result.providerHandleId,
+        boundaryMessageId: input.boundaryMessageId ?? null,
+      },
+      "agent.fork_session.provider_fork",
+    );
+    return {
+      providerHandleId: result.providerHandleId,
+      provider: agent.provider,
+      cwd: agent.config.cwd,
+    };
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {

@@ -123,6 +123,7 @@ import {
   type TimelineProjectionMode,
 } from "./agent/timeline-projection.js";
 import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
+import { forkAgentSessionNatively, type ForkAgentSessionDeps } from "./agent/fork-agent-session.js";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
 import {
@@ -2366,6 +2367,8 @@ export class Session {
       }
       case "agent.fork_context.request":
         return this.handleAgentForkContextRequest(msg);
+      case "agent.fork_session.request":
+        return this.handleAgentForkSessionRequest(msg);
       default:
         return undefined;
     }
@@ -7504,6 +7507,92 @@ export class Session {
         },
       });
     }
+  }
+
+  /**
+   * Provider-native fork.
+   *
+   * Unlike the text-attachment fork, this branches the provider's own session
+   * file and imports the branch as a new agent, so the fork keeps the source
+   * message prefix (the prompt cache is a prefix match, so it stays warm) and
+   * inherits any compaction the provider already performed instead of
+   * re-inflating the pre-compaction history.
+   */
+  private async handleAgentForkSessionRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.fork_session.request" }>,
+  ): Promise<void> {
+    try {
+      const forked = await forkAgentSessionNatively(msg, this.buildForkAgentSessionDeps());
+      this.emit({
+        type: "agent.fork_session.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          forkedAgentId: forked.agentId,
+          providerHandleId: forked.providerHandleId,
+          timelineSize: forked.timelineSize,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId: msg.agentId },
+        "Failed to handle agent.fork_session.request",
+      );
+      this.emit({
+        type: "agent.fork_session.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          forkedAgentId: null,
+          providerHandleId: null,
+          timelineSize: null,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
+  private buildForkAgentSessionDeps(): ForkAgentSessionDeps {
+    return {
+      loadAgent: async (agentId) => {
+        const snapshot = await ensureAgentLoaded(agentId, {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        });
+        return { cwd: snapshot.cwd, workspaceId: snapshot.workspaceId };
+      },
+      fetchTimeline: (agentId) =>
+        this.agentManager.fetchTimeline(agentId, {
+          direction: "tail",
+          limit: 0,
+        }),
+      forkProviderSession: (agentId, input) =>
+        this.agentManager.forkProviderSession(agentId, input),
+      importProviderSession: async (input) => {
+        const imported = await importProviderSession({
+          request: {
+            provider: input.provider,
+            providerHandleId: input.providerHandleId,
+            cwd: input.cwd,
+            workspaceId: input.workspaceId,
+            requestId: input.requestId,
+          },
+          workspaceProvisioning: this.workspaceProvisioning,
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        });
+        return {
+          agentId: imported.snapshot.id,
+          timelineSize: imported.timelineSize,
+          createdWorkspace: imported.createdWorkspace,
+        };
+      },
+      registerCreatedWorkspace: (workspace) => this.registerWorkspaceForImportedAgent(workspace),
+      logger: this.sessionLogger,
+    };
   }
 
   private async handleSendAgentMessageRequest(
