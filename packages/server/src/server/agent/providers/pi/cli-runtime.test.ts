@@ -506,4 +506,25 @@ describe("PiCliRuntime", () => {
     // Neither RPC returned usable data — should resolve with empty object
     expect(stats).toEqual({});
   });
+
+  test("forwards streamingBehavior on prompt only when the caller asks for it", async () => {
+    const child = createPiChild();
+    const sent: Array<Record<string, unknown>> = [];
+    replyToCommands(child, (command) => {
+      sent.push(command);
+      return {};
+    });
+    const session = await createRuntime(child).startSession({ cwd: "/workspace/project" });
+
+    await session.prompt("queued while streaming", undefined, {
+      streamingBehavior: "followUp",
+    });
+    await session.prompt("plain prompt");
+
+    const prompts = sent.filter((command) => command.type === "prompt");
+    expect(prompts).toHaveLength(2);
+    // Without it pi rejects a prompt sent mid-turn: "Agent is already processing."
+    expect(prompts[0]?.streamingBehavior).toBe("followUp");
+    expect(prompts[1]).not.toHaveProperty("streamingBehavior");
+  });
 });
