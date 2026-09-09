@@ -497,7 +497,12 @@ function mergeRetainedLifecycleItem(tail: StreamItem[], retained: StreamItem): S
     if (tailIndex < 0 || !existing || existing.kind !== "compaction") {
       return null;
     }
-    const next = [...tail];
+    // Same straggler rule as the reducer: a cache written before the dedupe landed can hold
+    // several loading markers, and only this one is about to be terminalized.
+    const next = [...tail].filter(
+      (item, index) =>
+        index === tailIndex || item.kind !== "compaction" || item.status !== "loading",
+    );
     next[tailIndex] = {
       ...existing,
       timelineCursor: retained.timelineCursor,

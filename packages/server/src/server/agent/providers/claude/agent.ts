@@ -2098,6 +2098,8 @@ class ClaudeAgentSession implements AgentSession {
   private compacting = false;
   /** A `compaction`/`loading` marker has been emitted and not yet terminalized. */
   private compactionMarkerOpen = false;
+  /** The open marker was terminalized by something other than a `compact_boundary`. */
+  private compactionMarkerClosedWithoutBoundary = false;
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
   private pendingInterruptAbort = false;
@@ -2953,6 +2955,8 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private rebindConversationSession(sessionId: string): void {
+    // The new session cannot inherit the old one's in-flight compaction.
+    this.notifyCompactionMarkerClosed();
     const oldSessionId = this.claudeSessionId;
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = null;
@@ -3563,12 +3567,38 @@ class ClaudeAgentSession implements AgentSession {
     return message.toLowerCase().includes("request was aborted");
   }
 
+  /**
+   * Terminalize an open compaction marker. A marker that outlives its compaction spins forever,
+   * and — worse — a flag left set makes the NEXT real compaction emit no marker at all, so every
+   * path that ends a turn has to come through here.
+   */
+  private closeCompactionMarker(): Extract<AgentStreamEvent, { type: "timeline" }> | null {
+    if (!this.compactionMarkerOpen) {
+      return null;
+    }
+    this.compactionMarkerOpen = false;
+    this.compactionMarkerClosedWithoutBoundary = true;
+    return {
+      type: "timeline",
+      provider: "claude",
+      item: { type: "compaction", status: "completed" },
+    };
+  }
+
+  private notifyCompactionMarkerClosed(): void {
+    const closed = this.closeCompactionMarker();
+    if (closed) {
+      this.notifySubscribers(closed);
+    }
+  }
+
   private finishForegroundTurn(
     event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
   ): void {
     if (event.type === "turn_failed" || event.type === "turn_canceled") {
       this.flushPendingToolCalls();
     }
+    this.notifyCompactionMarkerClosed();
     this.notifySubscribers(event);
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
@@ -3581,6 +3611,9 @@ class ClaudeAgentSession implements AgentSession {
   private dispatchEvents(events: AgentStreamEvent[]): void {
     let terminalSeen = false;
     for (const event of events) {
+      if (this.isTerminalTurnEvent(event)) {
+        this.notifyCompactionMarkerClosed();
+      }
       this.notifySubscribers(event);
       terminalSeen ||= this.isTerminalTurnEvent(event);
     }
@@ -3622,6 +3655,7 @@ class ClaudeAgentSession implements AgentSession {
     if (!this.autonomousTurn) {
       return;
     }
+    this.notifyCompactionMarkerClosed();
     this.notifySubscribers({ type: "turn_completed", provider: "claude" });
     this.autonomousTurn = null;
     this.activeForegroundQuery = null;
@@ -4237,6 +4271,49 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private appendStatusMessageEvents(
+    message: Extract<SDKMessage, { type: "system" }>,
+    events: AgentStreamEvent[],
+  ): void {
+    const record = toObjectRecord(message);
+    if (record?.status === "compacting") {
+      this.compacting = true;
+      // The CLI repeats the `compacting` status while a compaction runs. Emit one marker per
+      // compaction: only one of them is ever terminalized by `compact_boundary`, so the extra
+      // ones would spin forever.
+      if (!this.compactionMarkerOpen) {
+        this.compactionMarkerOpen = true;
+        this.compactionMarkerClosedWithoutBoundary = false;
+        events.push({
+          type: "timeline",
+          item: { type: "compaction", status: "loading" },
+          provider: "claude",
+        });
+      }
+    }
+    // The compaction's own outcome, reported on a later status message. A failed compaction must
+    // not be reported as a successful one, so the marker closes and the error is stated.
+    const compactResult = record?.compact_result;
+    if (compactResult !== "success" && compactResult !== "failed") {
+      return;
+    }
+    const closed = this.closeCompactionMarker();
+    if (closed) {
+      events.push(closed);
+    }
+    if (compactResult === "failed") {
+      const detail = typeof record?.compact_error === "string" ? record.compact_error : null;
+      events.push({
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "error",
+          message: detail ? `Compaction failed: ${detail}` : "Compaction failed.",
+        },
+      });
+    }
+  }
+
   private appendSystemMessageEvents(
     message: Extract<SDKMessage, { type: "system" }>,
     events: AgentStreamEvent[],
@@ -4260,36 +4337,29 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     if (message.subtype === "status") {
-      const status = toObjectRecord(message)?.status;
-      if (status === "compacting") {
-        this.compacting = true;
-        // The CLI repeats the `compacting` status while a compaction runs. Emit one marker per
-        // compaction: only one of them is ever terminalized by `compact_boundary`, so the extra
-        // ones would spin forever.
-        if (!this.compactionMarkerOpen) {
-          this.compactionMarkerOpen = true;
-          events.push({
-            type: "timeline",
-            item: { type: "compaction", status: "loading" },
-            provider: "claude",
-          });
-        }
-      }
+      this.appendStatusMessageEvents(message, events);
       return;
     }
     if (message.subtype === "compact_boundary") {
+      const alreadyClosed = this.compactionMarkerClosedWithoutBoundary;
       this.compactionMarkerOpen = false;
+      this.compactionMarkerClosedWithoutBoundary = false;
       const compactMetadata = readCompactionMetadata(message);
-      events.push({
-        type: "timeline",
-        item: {
-          type: "compaction",
-          status: "completed",
-          trigger: compactMetadata?.trigger === "manual" ? "manual" : "auto",
-          preTokens: compactMetadata?.preTokens,
-        },
-        provider: "claude",
-      });
+      // A marker already terminalized without a boundary owns this compaction's separator.
+      // Emitting a second completed item here would render two separators, since a completed
+      // compaction with no marker open appends rather than resolves.
+      if (!alreadyClosed) {
+        events.push({
+          type: "timeline",
+          item: {
+            type: "compaction",
+            status: "completed",
+            trigger: compactMetadata?.trigger === "manual" ? "manual" : "auto",
+            preTokens: compactMetadata?.preTokens,
+          },
+          provider: "claude",
+        });
+      }
       events.push(this.contextUsage.buildCompactionUsageEvent(compactMetadata?.postTokens));
       return;
     }
@@ -4468,13 +4538,9 @@ class ClaudeAgentSession implements AgentSession {
     const usage = this.convertUsage(message, message.modelUsage);
     // A compaction that ends without a `compact_boundary` (failed, interrupted, or a no-op
     // /compact) would otherwise leave the spinner running until something else redraws it.
-    if (this.compactionMarkerOpen) {
-      this.compactionMarkerOpen = false;
-      events.push({
-        type: "timeline",
-        item: { type: "compaction", status: "completed" },
-        provider: "claude",
-      });
+    const closedCompaction = this.closeCompactionMarker();
+    if (closedCompaction) {
+      events.push(closedCompaction);
     }
     if (message.subtype === "success") {
       events.push(...this.sidechainTracker.finishAll("completed"));

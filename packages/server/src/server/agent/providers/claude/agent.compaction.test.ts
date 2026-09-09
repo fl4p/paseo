@@ -117,3 +117,71 @@ describe("claude compaction markers", () => {
     }
   });
 });
+
+const compactionFailedStatus = {
+  type: "system",
+  subtype: "status",
+  status: null,
+  compact_result: "failed",
+  compact_error: "context too large to summarize",
+} as unknown as SDKMessage;
+
+const compactionSucceededStatus = {
+  type: "system",
+  subtype: "status",
+  status: null,
+  compact_result: "success",
+} as unknown as SDKMessage;
+
+function timelineItems(events: AgentStreamEvent[]): AgentTimelineItem[] {
+  return events.flatMap((event) => (event.type === "timeline" ? [event.item] : []));
+}
+
+describe("claude compaction outcomes", () => {
+  test("reports a failed compaction as failed instead of as a successful one", async () => {
+    const session = await createSessionForTest();
+    try {
+      session.translateMessageToEvents(compactingStatus);
+      const items = timelineItems(session.translateMessageToEvents(compactionFailedStatus));
+
+      expect(items).toEqual([
+        { type: "compaction", status: "completed" },
+        { type: "error", message: "Compaction failed: context too large to summarize" },
+      ]);
+
+      // The marker is closed, so the next compaction is visible again.
+      expect(compactionItems(session.translateMessageToEvents(compactingStatus))).toEqual([
+        { type: "compaction", status: "loading" },
+      ]);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("closes the marker on a successful compact_result without claiming an error", async () => {
+    const session = await createSessionForTest();
+    try {
+      session.translateMessageToEvents(compactingStatus);
+      const items = timelineItems(session.translateMessageToEvents(compactionSucceededStatus));
+
+      expect(items).toEqual([{ type: "compaction", status: "completed" }]);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("shows one separator when the result precedes the compact boundary", async () => {
+    const session = await createSessionForTest();
+    try {
+      session.translateMessageToEvents(compactingStatus);
+      expect(compactionItems(session.translateMessageToEvents(successResult))).toEqual([
+        { type: "compaction", status: "completed" },
+      ]);
+      // The boundary owns no marker of its own here; a second completed item would render a
+      // second "Context compacted" separator.
+      expect(compactionItems(session.translateMessageToEvents(compactBoundary))).toEqual([]);
+    } finally {
+      await session.close();
+    }
+  });
+});
