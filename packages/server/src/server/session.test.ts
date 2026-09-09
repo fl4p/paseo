@@ -770,6 +770,80 @@ describe("session authorization permissions", () => {
     });
   });
 
+  const FORK_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+
+  function createForkSessionForTest(permissions: readonly DaemonPermission[]) {
+    const messages: SessionOutboundMessage[] = [];
+    const forkProviderSession = vi.fn(async () => ({
+      providerHandleId: "fork-handle",
+      provider: "claude" as const,
+      cwd: "/workspace",
+    }));
+    const session = createSessionForTest({
+      permissions,
+      messages,
+      agentManager: {
+        waitForAgentClose: vi.fn(async () => {}),
+        getAgent: vi.fn(() => ({
+          id: FORK_AGENT_ID,
+          provider: "claude",
+          cwd: "/workspace",
+          workspaceId: "ws-1",
+          config: { provider: "claude", cwd: "/workspace" },
+        })),
+        fetchTimeline: vi.fn(() => ({ epoch: "epoch-1", rows: [] })),
+        forkProviderSession,
+      },
+    });
+    return { session, messages, forkProviderSession };
+  }
+
+  test("refuses a native fork from a principal that may write but not read", async () => {
+    // Requirement lists are OR-ed, so the permission table alone cannot demand
+    // read AND write. Without the handler check a write-only principal could
+    // clone a transcript it is not allowed to export.
+    const { session, messages, forkProviderSession } = createForkSessionForTest([
+      "workspace.write",
+    ]);
+
+    await session.handleMessage({
+      type: "agent.fork_session.request",
+      requestId: "fork-denied",
+      agentId: FORK_AGENT_ID,
+    });
+
+    expect(forkProviderSession).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "fork-denied",
+          requestType: "agent.fork_session.request",
+          error: "Session is not authorized for agent.fork_session.request",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
+  test("lets a native fork through once the principal may read as well as write", async () => {
+    const { session, messages, forkProviderSession } = createForkSessionForTest([
+      "workspace.read",
+      "workspace.write",
+    ]);
+
+    await session.handleMessage({
+      type: "agent.fork_session.request",
+      requestId: "fork-allowed",
+      agentId: FORK_AGENT_ID,
+    });
+
+    expect(forkProviderSession).toHaveBeenCalled();
+    expect(messages).not.toContainEqual(
+      expect.objectContaining({ payload: expect.objectContaining({ code: "access_denied" }) }),
+    );
+  });
+
   test("rejects an operation without its semantic permission", async () => {
     const messages: SessionOutboundMessage[] = [];
     const session = createSessionForTest({

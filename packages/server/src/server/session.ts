@@ -7521,6 +7521,24 @@ export class Session {
   private async handleAgentForkSessionRequest(
     msg: Extract<SessionInboundMessage, { type: "agent.fork_session.request" }>,
   ): Promise<void> {
+    // Forking clones a transcript, so it demands at least the read authority
+    // `agent.fork_context.request` demands — otherwise a write-but-not-read
+    // principal could clone a transcript it may not export and then prompt the
+    // clone to reveal it. The permission table cannot express the AND (its
+    // requirement lists are OR-ed), so the read half is checked here while the
+    // table keeps enforcing the write half.
+    if (!this.authorization.allowsPermission("workspace.read")) {
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: `Session is not authorized for ${msg.type}`,
+          code: "access_denied",
+        },
+      });
+      return;
+    }
     try {
       const forked = await forkAgentSessionNatively(msg, this.buildForkAgentSessionDeps());
       this.emit({
