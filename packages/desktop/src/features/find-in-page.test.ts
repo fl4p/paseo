@@ -11,13 +11,15 @@ import {
 interface FindCall {
   text: string;
   forward: boolean;
-  findNext: boolean;
+  /** Electron's `findNext`: true begins a new finding session. */
+  newSession: boolean;
 }
 
 class FakeContents implements FindInPageContents {
   public readonly findCalls: FindCall[] = [];
   public readonly stopCalls: string[] = [];
   public readonly listeners = new Set<(event: unknown, result: FoundInPageResult) => void>();
+  public readonly destroyListeners: Array<() => void> = [];
   private destroyed = false;
 
   public constructor(public readonly id: number) {}
@@ -28,6 +30,9 @@ class FakeContents implements FindInPageContents {
 
   public destroy(): void {
     this.destroyed = true;
+    for (const listener of this.destroyListeners.splice(0)) {
+      listener();
+    }
   }
 
   public findInPage(
@@ -37,7 +42,7 @@ class FakeContents implements FindInPageContents {
     this.findCalls.push({
       text,
       forward: options?.forward !== false,
-      findNext: options?.findNext === true,
+      newSession: options?.findNext === true,
     });
     return this.findCalls.length;
   }
@@ -54,10 +59,22 @@ class FakeContents implements FindInPageContents {
     return this;
   }
 
+  public once(_event: "destroyed", listener: () => void) {
+    this.destroyListeners.push(listener);
+    return this;
+  }
+
   public removeListener(
-    _event: "found-in-page",
-    listener: (event: unknown, result: FoundInPageResult) => void,
+    event: "found-in-page" | "destroyed",
+    listener: ((event: unknown, result: FoundInPageResult) => void) & (() => void),
   ) {
+    if (event === "destroyed") {
+      const index = this.destroyListeners.indexOf(listener);
+      if (index >= 0) {
+        this.destroyListeners.splice(index, 1);
+      }
+      return this;
+    }
     this.listeners.delete(listener);
     return this;
   }
@@ -89,7 +106,7 @@ describe("FindInPageController", () => {
 
     controller.start(host, { query: "needle" });
 
-    expect(host.findCalls).toEqual([{ text: "needle", forward: true, findNext: false }]);
+    expect(host.findCalls).toEqual([{ text: "needle", forward: true, newSession: true }]);
   });
 
   it("searches the active browser pane instead of the window", () => {
@@ -102,14 +119,15 @@ describe("FindInPageController", () => {
     expect(host.findCalls).toHaveLength(0);
   });
 
-  it("advances only when the query Chromium is holding is the one being advanced", () => {
+  it("opens a new Chromium session unless it is advancing the query Chromium holds", () => {
     const { controller, host } = setup();
 
     controller.start(host, { query: "needle" });
     controller.start(host, { query: "needle", findNext: true });
     controller.start(host, { query: "haystack", findNext: true });
 
-    expect(host.findCalls.map((call) => call.findNext)).toEqual([false, true, false]);
+    // Electron's `findNext` is "begin a new session": true first, false to continue.
+    expect(host.findCalls.map((call) => call.newSession)).toEqual([true, false, true]);
   });
 
   it("searches backwards when asked", () => {
@@ -118,7 +136,7 @@ describe("FindInPageController", () => {
     controller.start(host, { query: "needle" });
     controller.start(host, { query: "needle", findNext: true, forward: false });
 
-    expect(host.findCalls[1]).toEqual({ text: "needle", forward: false, findNext: true });
+    expect(host.findCalls[1]).toEqual({ text: "needle", forward: false, newSession: false });
   });
 
   it("forwards match counts to the window that owns the find bar", () => {
@@ -173,7 +191,41 @@ describe("FindInPageController", () => {
 
     expect(host.listeners.size).toBe(0);
     // The new target has not run this query yet, so it starts from the top.
-    expect(browser.findCalls).toEqual([{ text: "needle", forward: true, findNext: false }]);
+    expect(browser.findCalls).toEqual([{ text: "needle", forward: true, newSession: true }]);
+    // ...and the pane being left does not keep its highlight.
+    expect(host.stopCalls).toEqual(["clearSelection"]);
+  });
+
+  it("invalidates the session and zeroes the count when the target is destroyed", () => {
+    const browser = new FakeContents(42);
+    const { controller, host } = setup(browser);
+
+    controller.start(host, { query: "needle" });
+    host.sent.length = 0;
+    browser.destroy();
+
+    expect(host.sent).toEqual([
+      {
+        channel: FIND_RESULT_CHANNEL,
+        payload: { activeMatchOrdinal: 0, matches: 0, finalUpdate: true },
+      },
+    ]);
+
+    // A destroyed target must not be stopped or searched afterwards.
+    controller.stop(host, "clearSelection");
+    expect(browser.stopCalls).toEqual([]);
+  });
+
+  it("clears a guest pane that outlives the window searching it", () => {
+    const browser = new FakeContents(42);
+    const { controller, host } = setup(browser);
+
+    controller.start(host, { query: "needle" });
+    controller.releaseHost(host.id);
+
+    expect(browser.stopCalls).toEqual(["clearSelection"]);
+    expect(browser.listeners.size).toBe(0);
+    expect(browser.destroyListeners).toHaveLength(0);
   });
 
   it("reports no matches when the target is gone", () => {
