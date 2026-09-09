@@ -126,8 +126,20 @@ export interface PiRpcSlashCommand {
   input?: { hint?: string };
 }
 
+// How pi should handle a prompt that arrives while a turn is still streaming.
+// Omitting it makes pi reject the prompt ("Agent is already processing.") rather
+// than guess between redirecting the live turn and queueing after it. Ignored by
+// pi builds that predate the option, which reject the prompt as they always did.
+export type PiStreamingBehavior = "steer" | "followUp";
+
 export type PiRpcCommand =
-  | { id?: string; type: "prompt"; message: string; images?: PiImageContent[] }
+  | {
+      id?: string;
+      type: "prompt";
+      message: string;
+      images?: PiImageContent[];
+      streamingBehavior?: PiStreamingBehavior;
+    }
   | { id?: string; type: "steer"; message: string; images?: PiImageContent[] }
   | { id?: string; type: "clear_queue" }
   | { id?: string; type: "compact"; customInstructions?: string }

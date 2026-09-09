@@ -1341,7 +1341,13 @@ export class PiRpcAgentSession implements AgentSession {
 
     void (async () => {
       try {
-        const ack = await this.runtimeSession.prompt(payload.text, payload.images);
+        // Paseo's own guard above only knows about turns Paseo started; pi can still
+        // be streaming one Paseo thinks has ended (an in-flight extension command, a
+        // just-aborted turn). Queue in that case instead of surfacing pi's
+        // "Agent is already processing" as a turn_failed system error.
+        const ack = await this.runtimeSession.prompt(payload.text, payload.images, {
+          streamingBehavior: "followUp",
+        });
         this.activePromptRequestId = ack.requestId ?? null;
         const correlatedResult = ack.requestId
           ? this.pendingPromptResults.get(ack.requestId)
@@ -1633,7 +1639,12 @@ export class PiRpcAgentSession implements AgentSession {
     const requestId = randomUUID();
     const resultPromise = this.waitForExtensionResult(requestId);
     const payload = Buffer.from(JSON.stringify({ targetId, requestId })).toString("base64url");
-    await this.runtimeSession.prompt(`/${PASEO_PI_TREE_EXTENSION_COMMAND} ${payload}`);
+    // Control-plane traffic, not user input: queue it behind any live turn rather
+    // than steering the model with a base64 slash command — and never fail with
+    // "Agent is already processing" just because a turn happened to be streaming.
+    await this.runtimeSession.prompt(`/${PASEO_PI_TREE_EXTENSION_COMMAND} ${payload}`, undefined, {
+      streamingBehavior: "followUp",
+    });
     return await resultPromise;
   }
 
@@ -1929,7 +1940,12 @@ export class PiRpcAgentSession implements AgentSession {
     const requestId = randomUUID();
     const resultPromise = this.waitForExtensionResult(requestId);
     const payload = Buffer.from(JSON.stringify({ requestId, reason })).toString("base64url");
-    await this.runtimeSession.prompt(`/${PASEO_PI_CAPTURE_EXTENSION_COMMAND} ${payload}`);
+    // Control-plane traffic — see runPiTreeExtensionCommand.
+    await this.runtimeSession.prompt(
+      `/${PASEO_PI_CAPTURE_EXTENSION_COMMAND} ${payload}`,
+      undefined,
+      { streamingBehavior: "followUp" },
+    );
     await resultPromise;
   }
 
