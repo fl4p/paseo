@@ -3,6 +3,7 @@ import type { Logger } from "pino";
 import type { AgentProvider, AgentSessionConfig } from "./agent-sdk-types.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import { resolveForkBoundaryMessageId } from "./activity-curator.js";
+import { createRealpathAwarePathMatcher } from "../../utils/path.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
 export interface ForkAgentSessionRequest {
@@ -76,13 +77,18 @@ export async function forkAgentSessionNatively(
   deps: ForkAgentSessionDeps,
 ): Promise<ForkAgentSessionResult> {
   const source = await deps.loadAgent(request.agentId);
-  const cwd = request.cwd?.trim() || source.cwd;
-  if (cwd !== source.cwd) {
+  const requestedCwd = request.cwd?.trim();
+  if (requestedCwd && !isSameDirectory(source.cwd, requestedCwd)) {
     // A provider transcript is keyed by its project directory. Resuming the
     // branch somewhere else would look for it in a store that does not have it,
     // so refuse rather than silently produce an empty agent.
     throw new Error("Native fork requires the same working directory as the source agent");
   }
+  // Always import under the source agent's own spelling of the directory: the
+  // request may name the same directory through a symlink, a trailing
+  // separator or a different case, and the provider store is keyed by the
+  // canonical one.
+  const cwd = source.cwd;
 
   const boundaryMessageId = resolveBoundary(request, deps);
   const fork = await deps.forkProviderSession(request.agentId, { boundaryMessageId });
@@ -157,6 +163,24 @@ export function inheritedForkConfig(config: AgentSessionConfig): Partial<AgentSe
   copy("mcpServers");
   copy("featureValues");
   return inherited;
+}
+
+/**
+ * Do two cwd strings name the same directory?
+ *
+ * String equality is the wrong test: `/repo/`, `/repo/./`, a symlinked path and
+ * a differently cased path on a case-insensitive filesystem all name the same
+ * directory, and rejecting them would force a needless attachment fork with a
+ * cold prompt cache. `createRealpathAwarePathMatcher` compares realpath
+ * variants as well as the literal strings, so distinct git worktrees — whose
+ * real paths genuinely differ — still fall back.
+ *
+ * This is the authoritative check. The client's `resolveForkMode` runs a
+ * cheap lexical version of it as a hint, because the app may be on a different
+ * machine and cannot realpath the daemon's filesystem.
+ */
+function isSameDirectory(left: string, right: string): boolean {
+  return createRealpathAwarePathMatcher(left)(right);
 }
 
 function resolveBoundary(

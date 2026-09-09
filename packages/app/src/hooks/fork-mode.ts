@@ -35,10 +35,52 @@ export interface ResolveForkModeInput {
 }
 
 /**
+ * Lexically normalize a directory for the client-side hint.
+ *
+ * Collapses `.` segments, resolves `..`, drops repeated and trailing
+ * separators and case-folds. It deliberately does NOT resolve symlinks: the
+ * app may be running on a different machine from the daemon and has no access
+ * to the daemon's filesystem, so it cannot realpath anything.
+ *
+ * Case-folding makes the hint slightly *optimistic* (two paths that differ only
+ * in case are treated as the same directory, which is true on macOS and Windows
+ * but not on a case-sensitive Linux filesystem). That direction is the safe
+ * one: the daemon re-checks directory identity with realpath before it forks
+ * and falls back with an explicit error if the directories really differ, so an
+ * over-eager hint costs at most one refused request, while an under-eager hint
+ * would silently downgrade the user to a cold-cache attachment fork with no way
+ * to notice.
+ */
+function normalizeCwdHint(value: string | null | undefined): string | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const isAbsolute = trimmed.startsWith("/");
+  const segments: string[] = [];
+  for (const segment of trimmed.split(/[\\/]+/u)) {
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+    if (segment === ".." && segments.length > 0 && segments.at(-1) !== "..") {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  const joined = segments.join("/").toLowerCase();
+  return isAbsolute ? `/${joined}` : joined || null;
+}
+
+/**
  * A provider transcript is keyed by its project directory, so a fork that lands
  * in a different cwd could not resume the branched session even if the provider
  * supports branching. Same provider + same directory is therefore the exact
  * condition for the native path.
+ *
+ * The directory half of that test is only a HINT here — see
+ * `normalizeCwdHint`. The daemon owns the real decision (`isSameDirectory` in
+ * `fork-agent-session.ts`) because only it can realpath the paths.
  */
 export function resolveForkMode(input: ResolveForkModeInput): ForkMode {
   if (!input.hostSupportsNativeFork) {
@@ -47,8 +89,8 @@ export function resolveForkMode(input: ResolveForkModeInput): ForkMode {
   if (!providerSupportsNativeFork(input.provider)) {
     return "attachment";
   }
-  const source = input.sourceCwd?.trim();
-  const target = input.targetCwd?.trim();
+  const source = normalizeCwdHint(input.sourceCwd);
+  const target = normalizeCwdHint(input.targetCwd);
   if (!source || !target || source !== target) {
     return "attachment";
   }

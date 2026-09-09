@@ -1,4 +1,12 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -251,6 +259,74 @@ describe("forkAgentSessionNatively", () => {
       ),
     ).rejects.toThrow(/same working directory/);
     expect(sdk.recordedForkCalls).toEqual([]);
+  });
+
+  /**
+   * Point the source agent at a REAL directory and record the cwd the import
+   * lands on. The whole point of these cases is that the comparison resolves
+   * directory identity rather than comparing strings, so the paths have to
+   * exist.
+   */
+  function useRealSourceDirectory(): { realCwd: string; importedCwds: string[] } {
+    const realCwd = join(dir, "project");
+    mkdirSync(realCwd, { recursive: true });
+    const importedCwds: string[] = [];
+    const source = { cwd: realCwd, workspaceId: "ws-1", config: SOURCE_CONFIG };
+    deps.loadAgent = vi.fn(() => Promise.resolve(source));
+    const importProviderSession = deps.importProviderSession;
+    deps.importProviderSession = (input) => {
+      importedCwds.push(input.cwd);
+      return importProviderSession(input);
+    };
+    return { realCwd, importedCwds };
+  }
+
+  function forkWithCwd(cwd: string, requestId: string) {
+    return forkAgentSessionNatively({ agentId: "agent-source", requestId, cwd }, deps);
+  }
+
+  it("accepts a trailing separator as the same directory", async () => {
+    const { realCwd } = useRealSourceDirectory();
+    await expect(forkWithCwd(`${realCwd}/`, "req-slash")).resolves.toBeTruthy();
+  });
+
+  it("accepts dot segments as the same directory", async () => {
+    const { realCwd } = useRealSourceDirectory();
+    await expect(forkWithCwd(`${realCwd}/./`, "req-dot")).resolves.toBeTruthy();
+    await expect(forkWithCwd(join(realCwd, "..", "project"), "req-dotdot")).resolves.toBeTruthy();
+  });
+
+  it("accepts the same directory reached through a symlink", async () => {
+    const { realCwd } = useRealSourceDirectory();
+    const link = join(dir, "link-to-project");
+    symlinkSync(realCwd, link, "dir");
+    await expect(forkWithCwd(link, "req-symlink")).resolves.toBeTruthy();
+  });
+
+  it("accepts a case difference on a case-insensitive filesystem", async () => {
+    useRealSourceDirectory();
+    const swapped = join(dir, "PROJECT");
+    // Only meaningful where the filesystem itself folds case; on a
+    // case-sensitive one this really is a different (missing) directory.
+    if (!existsSync(swapped)) {
+      expect(existsSync(swapped)).toBe(false);
+      return;
+    }
+    await expect(forkWithCwd(swapped, "req-case")).resolves.toBeTruthy();
+  });
+
+  it("still refuses a genuine worktree, whose real path differs", async () => {
+    useRealSourceDirectory();
+    const worktree = join(dir, "project-worktree");
+    mkdirSync(worktree, { recursive: true });
+    await expect(forkWithCwd(worktree, "req-worktree")).rejects.toThrow(/same working directory/);
+    expect(sdk.recordedForkCalls).toEqual([]);
+  });
+
+  it("imports under the source agent's own spelling of the directory", async () => {
+    const { realCwd, importedCwds } = useRealSourceDirectory();
+    await forkWithCwd(`${realCwd}/`, "req-spelling");
+    expect(importedCwds).toEqual([realCwd]);
   });
 
   it("starts the fork on the source agent's model, mode and tools, not the daemon defaults", async () => {

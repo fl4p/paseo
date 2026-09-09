@@ -32,6 +32,25 @@ describe("resolveForkMode", () => {
     expect(resolve({ targetCwd: "/Users/dev/project-worktree" })).toBe("attachment");
   });
 
+  it("treats a trailing separator, a dot segment and a case difference as the same directory", () => {
+    // The daemon compares directory IDENTITY (realpath), so a hint that said
+    // "attachment" here would downgrade a perfectly forkable session to a
+    // cold-cache attachment fork for a purely cosmetic path difference.
+    expect(resolve({ targetCwd: `${CWD}/` })).toBe("native");
+    expect(resolve({ targetCwd: `${CWD}//` })).toBe("native");
+    expect(resolve({ targetCwd: "/Users/dev/./project" })).toBe("native");
+    expect(resolve({ targetCwd: "/Users/dev/other/../project" })).toBe("native");
+    expect(resolve({ targetCwd: "/Users/Dev/Project" })).toBe("native");
+  });
+
+  it("still falls back for a genuinely different directory", () => {
+    // A git worktree really does live somewhere else; normalization must not
+    // paper over that.
+    expect(resolve({ targetCwd: "/Users/dev/project-worktree" })).toBe("attachment");
+    expect(resolve({ targetCwd: "/Users/dev/project/sub" })).toBe("attachment");
+    expect(resolve({ targetCwd: "/Users/dev" })).toBe("attachment");
+  });
+
   it("falls back to the attachment when the target directory is not decided yet", () => {
     expect(resolve({ targetCwd: null })).toBe("attachment");
     expect(resolve({ targetCwd: "   " })).toBe("attachment");
