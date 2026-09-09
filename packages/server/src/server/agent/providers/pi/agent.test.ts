@@ -2104,6 +2104,30 @@ describe("PiRpcAgentSession steering", () => {
     expect(session.getPendingPermissions()).toEqual([]);
   });
 
+  test("dismisses pending extension dialogs when the turn is interrupted", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("work");
+    fakeSession.emit({
+      type: "extension_ui_request",
+      id: "perm-1",
+      method: "select",
+      title: "Runtime: which runtime?",
+      options: ["Node", "Bun"],
+    });
+    await events.nextPermissionRequest();
+    expect(session.getPendingPermissions()).toHaveLength(1);
+
+    await session.interrupt();
+
+    // Pi drops its side of the dialog on abort without telling us, so an
+    // uncleared entry here comes back as a ghost question on the next refresh.
+    expect(fakeSession.extensionUiResponses).toEqual([
+      { id: "perm-1", response: { cancelled: true } },
+    ]);
+    expect(session.getPendingPermissions()).toEqual([]);
+  });
+
   test("leaves permissions open for a steer without the clearing flag", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
