@@ -83,6 +83,7 @@ import {
   deleteForkedClaudeSession,
   forkClaudeSession,
 } from "./fork-session.js";
+import { readClaudeCompactSummary } from "./compact-summary.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
@@ -2825,6 +2826,17 @@ class ClaudeAgentSession implements AgentSession {
       logger: this.logger,
     });
     return { providerHandleId: fork.sessionId };
+  }
+
+  /**
+   * The summary Claude wrote for this session's last completed compaction.
+   *
+   * Read from the transcript rather than the timeline, because the history
+   * conversion drops compact-summary entries on purpose and keeps only the
+   * marker.
+   */
+  async readCompactionSummary(): Promise<string | null> {
+    return readClaudeCompactSummary(this.readSessionTranscript(this.claudeSessionId));
   }
 
   /**

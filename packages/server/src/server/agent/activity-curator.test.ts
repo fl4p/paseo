@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildAgentForkContextAttachment,
   curateAgentActivity,
+  loadForkCompactionSummary,
   resolveForkBoundaryMessageId,
 } from "./activity-curator.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
@@ -463,7 +464,10 @@ describe("fork context budget and compaction boundary", () => {
     expect(result.attachment.text).not.toContain("ancient answer");
     expect(result.attachment.text).toContain("current task");
     expect(result.attachment.text).toContain("current answer");
-    expect(result.attachment.text).toContain("last compaction omitted");
+    // No summary was available, so the header must say the history is GONE,
+    // not that something stands in for it.
+    expect(result.attachment.text).toContain("no compaction summary was available");
+    expect(result.attachment.text).not.toContain("compaction summary below");
     expect(result.itemCount).toBe(2);
   });
 
@@ -477,7 +481,7 @@ describe("fork context budget and compaction boundary", () => {
     });
 
     expect(result.attachment.text).toContain("ancient task");
-    expect(result.attachment.text).not.toContain("last compaction omitted");
+    expect(result.attachment.text).not.toContain("The source session was compacted");
   });
 
   it("only skips history before a compaction that precedes the boundary", () => {
@@ -681,5 +685,161 @@ describe("resolveForkBoundaryMessageId", () => {
         cursorBoundary: { timelineEpoch: "e1", cursor: { epoch: "e1", seq: 1 } },
       }),
     ).toThrow("no provider message");
+  });
+});
+
+describe("fork context compaction summary", () => {
+  const COMPACTED_ROWS = [
+    row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+    row(2, { type: "assistant_message", text: "ancient answer", messageId: "assistant-1" }),
+    row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+    row(4, { type: "user_message", text: "current task", messageId: "user-2" }),
+  ] as const;
+
+  it("carries the provider's compaction summary into the attachment body", () => {
+    // Without this the fork loses everything the compaction preserved: the
+    // pre-compaction turns are deliberately not replayed, and the summary that
+    // replaced them was never in the timeline to begin with.
+    const result = buildAgentForkContextAttachment({
+      rows: [...COMPACTED_ROWS],
+      compactionSummary: "The user was refactoring the payment adapter.",
+    });
+
+    expect(result.attachment.text).toContain("The user was refactoring the payment adapter.");
+    expect(result.attachment.text).toContain("[Compaction summary of the earlier conversation]");
+    expect(result.attachment.text).toContain("[Conversation since the compaction]");
+    expect(result.attachment.text).toContain("current task");
+    // The raw pre-compaction turns stay out; only their summary comes through.
+    expect(result.attachment.text).not.toContain("ancient answer");
+  });
+
+  it("says the earlier history is summarized, not dropped, when a summary exists", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [...COMPACTED_ROWS],
+      compactionSummary: "Earlier context.",
+    });
+
+    expect(result.attachment.text).toContain(
+      "represented by the provider's own compaction summary below",
+    );
+    expect(result.attachment.text).not.toContain("no compaction summary was available");
+  });
+
+  it("says the earlier history was dropped when no summary is available", () => {
+    // Non-Claude providers keep no summary; the header must not imply one.
+    const result = buildAgentForkContextAttachment({ rows: [...COMPACTED_ROWS] });
+
+    expect(result.attachment.text).toContain("no compaction summary was available");
+    expect(result.attachment.text).not.toContain("compaction summary below");
+  });
+
+  it("never degrades to the empty placeholder when the compaction is the last row", () => {
+    // A session compacted as its newest event has nothing left to replay, which
+    // used to produce an attachment that said only "No chat history to display".
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      ],
+      compactionSummary: "The user was refactoring the payment adapter.",
+    });
+
+    expect(result.attachment.text).not.toContain("No chat history to display.");
+    expect(result.attachment.text).toContain("The user was refactoring the payment adapter.");
+  });
+
+  it("still says so when there is neither history nor a summary", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      ],
+    });
+
+    expect(result.attachment.text).toContain("No chat history to display.");
+    expect(result.attachment.text).toContain("no compaction summary was available");
+  });
+
+  it("ignores a summary when the selection did not start at a compaction", () => {
+    // Nothing was skipped, so the pre-compaction history is already in the body
+    // and repeating its summary would double it.
+    const result = buildAgentForkContextAttachment({
+      rows: [row(1, { type: "user_message", text: "only task", messageId: "user-1" })],
+      compactionSummary: "Earlier context.",
+    });
+
+    expect(result.attachment.text).not.toContain("Earlier context.");
+    expect(result.attachment.text).not.toContain("Compaction summary");
+  });
+
+  it("keeps the summary inside the character budget, truncating rather than dropping it", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [...COMPACTED_ROWS],
+      compactionSummary: "S".repeat(5_000),
+      maxChars: 400,
+    });
+
+    expect(result.attachment.text).toContain("[Compaction summary of the earlier conversation]");
+    expect(result.attachment.text).toContain("message truncated to fit the context budget");
+    // Half the budget for the summary, the rest for the turns after it.
+    expect(result.attachment.text.length).toBeLessThan(400 + 600);
+    expect(result.attachment.text).toContain("current task");
+  });
+});
+
+describe("loadForkCompactionSummary", () => {
+  const compactedRows = [
+    row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+    row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+  ];
+
+  it("asks the provider only when the source was actually compacted", async () => {
+    const read = vi.fn(async () => "summary");
+    expect(await loadForkCompactionSummary({ agentId: "agent-1", rows: compactedRows, read })).toBe(
+      "summary",
+    );
+    expect(read).toHaveBeenCalledWith("agent-1");
+  });
+
+  it("skips the provider read when nothing was compacted away", async () => {
+    // Nothing was skipped, so there is no summary to add and no reason to read
+    // a transcript that can be megabytes.
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows: [row(1, { type: "user_message", text: "task", messageId: "user-1" })],
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("ignores a compaction that never completed", async () => {
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows: [row(1, { type: "compaction", status: "running", trigger: "auto" })],
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("degrades to no summary rather than failing the fork when the read throws", async () => {
+    const warn = vi.fn();
+    const read = vi.fn(() => Promise.reject(new Error("transcript unreadable")));
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows: compactedRows,
+        read,
+        logger: { warn } as unknown as Parameters<typeof loadForkCompactionSummary>[0]["logger"],
+      }),
+    ).toBeNull();
+    // Silently returning null would let the header claim a summary exists; the
+    // caller must be able to see that the read failed.
+    expect(warn).toHaveBeenCalled();
   });
 });

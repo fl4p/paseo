@@ -719,6 +719,17 @@ export interface AgentSession {
     atCompletedTurn?: boolean;
   }): Promise<{ providerHandleId: string }>;
   /**
+   * The summary the provider wrote for this session's last completed
+   * compaction, or `null` when there is none.
+   *
+   * The timeline keeps only a compaction MARKER (the summary is not shown as if
+   * the user had typed it), so the text-attachment fork -- which starts after
+   * the last compaction -- would otherwise drop everything the summary
+   * retained. Implemented only by providers that persist one; callers must
+   * treat `null` as "the pre-compaction history was dropped".
+   */
+  readCompactionSummary?(): Promise<string | null>;
+  /**
    * Delete a provider session this session previously forked, undoing an
    * otherwise irreversible `forkProviderSession`.
    *

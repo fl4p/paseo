@@ -1,3 +1,4 @@
+import type { Logger } from "pino";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
@@ -244,8 +245,24 @@ const FORK_CONTEXT_OMITTED_NOTE =
   "Some earlier history was omitted to fit the context budget; the gap is marked inline.";
 const FORK_CONTEXT_ENTRY_TRUNCATED_NOTE =
   "Long messages were cut short to fit the context budget; each cut is marked inline.";
-const FORK_CONTEXT_COMPACTION_MARKER =
-  "[… history before the source session's last compaction omitted …]";
+/**
+ * Header notes for a source session that had already been compacted.
+ *
+ * The selection starts strictly after the last completed compaction, so the
+ * turns before it are NOT in the body. Which of these two the header carries is
+ * the difference between "the provider's summary of that history is below" and
+ * "that history is gone" — never imply the first when only the second is true.
+ */
+const FORK_CONTEXT_COMPACTION_SUMMARIZED_NOTE =
+  "The source session was compacted: its earlier turns are not replayed here, " +
+  "and are represented by the provider's own compaction summary below.";
+const FORK_CONTEXT_COMPACTION_DROPPED_NOTE =
+  "The source session was compacted: its earlier turns are not replayed here, " +
+  "and no compaction summary was available, so that history is not included at all.";
+/** Label opening the compaction summary block in the body. */
+const FORK_CONTEXT_SUMMARY_HEADING = "[Compaction summary of the earlier conversation]";
+/** Label opening the replayed turns when a compaction summary precedes them. */
+const FORK_CONTEXT_SINCE_COMPACTION_HEADING = "[Conversation since the compaction]";
 
 function findForkBoundaryIndex(input: {
   rows: readonly AgentTimelineRow[];
@@ -502,6 +519,48 @@ function collectForkContextTail(
   return tail;
 }
 
+/**
+ * Fit the compaction summary into its share of the budget.
+ *
+ * It gets at most half, so a long summary cannot squeeze out the turns that
+ * came after it, and it is truncated rather than dropped: half a summary still
+ * carries the task, none of it carries nothing.
+ */
+function fitCompactionSummary(summary: string | null | undefined, maxChars: number): string | null {
+  const text = summary?.trim();
+  if (!text) {
+    return null;
+  }
+  const cap = Math.floor(maxChars / 2) - FORK_CONTEXT_SUMMARY_HEADING.length - 1;
+  if (cap <= FORK_CONTEXT_ENTRY_TRUNCATION_MARKER.length) {
+    return null;
+  }
+  const fitted =
+    text.length <= cap
+      ? text
+      : `${text.slice(0, cap - FORK_CONTEXT_ENTRY_TRUNCATION_MARKER.length)}${FORK_CONTEXT_ENTRY_TRUNCATION_MARKER}`;
+  return `${FORK_CONTEXT_SUMMARY_HEADING}\n${fitted}`;
+}
+
+/**
+ * Assemble the attachment body.
+ *
+ * "No chat history to display." is only correct when there is genuinely nothing
+ * to say. A compacted session whose newest row IS the compaction has no
+ * replayable turns but does have the summary, and answering with the empty
+ * placeholder there is what made a fork of it useless.
+ */
+function buildForkContextBody(entries: readonly ActivityEntry[], summary: string | null): string {
+  const turns = entries.map((entry) => entry.text).join("\n");
+  if (!summary) {
+    return turns || "No chat history to display.";
+  }
+  if (!turns) {
+    return summary;
+  }
+  return `${summary}\n\n${FORK_CONTEXT_SINCE_COMPACTION_HEADING}\n${turns}`;
+}
+
 function trimContextMetadata(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
   return trimmed ? trimmed : null;
@@ -512,6 +571,7 @@ function buildForkContextText(input: {
   agentTitle?: string | null;
   cwd?: string | null;
   startedAtCompaction: boolean;
+  hasCompactionSummary: boolean;
   omitted: boolean;
   truncatedEntries: boolean;
 }): string {
@@ -525,7 +585,11 @@ function buildForkContextText(input: {
     header.push(`Source directory: ${cwd}`);
   }
   if (input.startedAtCompaction) {
-    header.push(FORK_CONTEXT_COMPACTION_MARKER);
+    header.push(
+      input.hasCompactionSummary
+        ? FORK_CONTEXT_COMPACTION_SUMMARIZED_NOTE
+        : FORK_CONTEXT_COMPACTION_DROPPED_NOTE,
+    );
   }
   if (input.omitted) {
     header.push(FORK_CONTEXT_OMITTED_NOTE);
@@ -536,12 +600,55 @@ function buildForkContextText(input: {
   return `<chat-history-summary>\n${header.join("\n")}\n\n${input.body}\n</chat-history-summary>`;
 }
 
+/**
+ * Fetch the provider's compaction summary for a fork attachment, or `null`.
+ *
+ * Two failure modes, both of which must degrade to "the earlier history was
+ * dropped" rather than to a failed fork or an invented summary:
+ *
+ * - the source timeline shows no completed compaction, so nothing was skipped
+ *   and reading the provider transcript would be pointless work;
+ * - the read throws (no transcript, an unsupported provider, an I/O error).
+ *   The attachment is still worth having, so the error is logged and the header
+ *   says the pre-compaction history is gone.
+ */
+export async function loadForkCompactionSummary(input: {
+  agentId: string;
+  rows: readonly AgentTimelineRow[];
+  read: (agentId: string) => Promise<string | null>;
+  logger?: Logger | null;
+}): Promise<string | null> {
+  const compacted = input.rows.some(
+    (row) => row.item.type === "compaction" && row.item.status === "completed",
+  );
+  if (!compacted) {
+    return null;
+  }
+  try {
+    return await input.read(input.agentId);
+  } catch (error) {
+    input.logger?.warn(
+      { err: error, agentId: input.agentId },
+      "agent.fork_context.compaction_summary_unavailable",
+    );
+    return null;
+  }
+}
+
 export function buildAgentForkContextAttachment(input: {
   rows: readonly AgentTimelineRow[];
   cursorBoundary?: ForkCursorBoundary | null;
   boundaryMessageId?: string | null;
   agentTitle?: string | null;
   cwd?: string | null;
+  /**
+   * The provider's own summary for the source session's last completed
+   * compaction, when it has one. The selection below starts after that
+   * compaction, so this is the only thing carrying the history it replaced;
+   * without it the attachment silently drops that context, and a session whose
+   * newest row IS the compaction produces an empty body.
+   */
+  compactionSummary?: string | null;
   maxChars?: number;
 }): {
   attachment: TextAgentAttachment;
@@ -560,14 +667,17 @@ export function buildAgentForkContextAttachment(input: {
     includeKinds: ["user_message", "assistant_message", "tool_call"],
     includeExternalToolInput: false,
   });
+  const maxChars = input.maxChars ?? DEFAULT_FORK_CONTEXT_MAX_CHARS;
+  // The summary is only meaningful when the selection actually started at the
+  // compaction it belongs to; otherwise its history is already in the body.
+  const summary = selected.startedAtCompaction
+    ? fitCompactionSummary(input.compactionSummary, maxChars)
+    : null;
   const budgeted = applyForkContextBudget(
     curated,
-    input.maxChars ?? DEFAULT_FORK_CONTEXT_MAX_CHARS,
+    Math.max(0, maxChars - (summary ? summary.length + 2 : 0)),
   );
-  const body =
-    budgeted.entries.length > 0
-      ? budgeted.entries.map((entry) => entry.text).join("\n")
-      : "No chat history to display.";
+  const body = buildForkContextBody(budgeted.entries, summary);
   return {
     attachment: {
       type: "text",
@@ -579,6 +689,7 @@ export function buildAgentForkContextAttachment(input: {
         agentTitle: input.agentTitle,
         cwd: input.cwd,
         startedAtCompaction: selected.startedAtCompaction,
+        hasCompactionSummary: summary !== null,
         omitted: budgeted.omitted,
         truncatedEntries: budgeted.truncatedEntries,
       }),

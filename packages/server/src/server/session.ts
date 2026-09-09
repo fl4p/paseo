@@ -123,7 +123,10 @@ import {
   type TimelineProjectionEntry,
   type TimelineProjectionMode,
 } from "./agent/timeline-projection.js";
-import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
+import {
+  buildAgentForkContextAttachment,
+  loadForkCompactionSummary,
+} from "./agent/activity-curator.js";
 import { forkAgentSessionNatively, type ForkAgentSessionDeps } from "./agent/fork-agent-session.js";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
@@ -7476,6 +7479,12 @@ export class Session {
         boundaryMessageId: msg.boundaryMessageId,
         agentTitle: agentPayload.title,
         cwd: snapshot.cwd,
+        compactionSummary: await loadForkCompactionSummary({
+          agentId: msg.agentId,
+          rows: timeline.rows,
+          read: (agentId) => this.agentManager.readProviderCompactionSummary(agentId),
+          logger: this.sessionLogger,
+        }),
       });
 
       this.emit({

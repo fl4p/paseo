@@ -3039,6 +3039,20 @@ export class AgentManager {
   }
 
   /**
+   * The provider's own summary for `agentId`'s last completed compaction, or
+   * `null` when the provider keeps none. Used to keep the text-attachment fork
+   * of a compacted session from losing everything the compaction summarized.
+   */
+  async readProviderCompactionSummary(agentId: string): Promise<string | null> {
+    const agent = this.requireSessionAgent(agentId);
+    const read = agent.session.readCompactionSummary;
+    if (!read) {
+      return null;
+    }
+    return (await read.call(agent.session)) ?? null;
+  }
+
+  /**
    * Delete a provider session branched off `agentId` by `forkProviderSession`.
    *
    * Rollback only: the provider fork is irreversible, so a fork whose import
