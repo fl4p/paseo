@@ -78,7 +78,11 @@ import {
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
 import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
-import { createClaudeForkTranscriptStore, forkClaudeSession } from "./fork-session.js";
+import {
+  createClaudeForkTranscriptStore,
+  deleteForkedClaudeSession,
+  forkClaudeSession,
+} from "./fork-session.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
@@ -2816,6 +2820,20 @@ class ClaudeAgentSession implements AgentSession {
       logger: this.logger,
     });
     return { providerHandleId: fork.sessionId };
+  }
+
+  /**
+   * Undo a `forkProviderSession` by deleting the branch it created.
+   *
+   * The guard in `deleteForkedClaudeSession` is what keeps this from ever
+   * reaching the live session: it refuses any id equal to this session's own.
+   */
+  async deleteForkedProviderSession(input: { providerHandleId: string }): Promise<void> {
+    await deleteForkedClaudeSession({
+      sdk: realClaudeRewindSdk,
+      forkSessionId: input.providerHandleId,
+      sourceSessionId: this.claudeSessionId,
+    });
   }
 
   private readSessionTranscript(sessionId: string | null): string | null {

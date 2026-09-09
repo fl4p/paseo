@@ -24,6 +24,13 @@ export interface ForkAgentSessionDeps {
   }>;
   /** Read the source agent's timeline, used only to resolve a boundary. */
   fetchTimeline(agentId: string): { epoch: string; rows: readonly AgentTimelineRow[] };
+  /**
+   * Everything that can be checked BEFORE the irreversible provider fork:
+   * the directory still exists, and the requested workspace (and its project)
+   * is present, unarchived and points at that directory. Throwing here means
+   * no provider session is created at all.
+   */
+  validateForkTarget(input: { cwd: string; workspaceId: string | undefined }): Promise<void>;
   /** Branch the provider session; returns the new provider-level handle. */
   forkProviderSession(
     agentId: string,
@@ -44,6 +51,11 @@ export interface ForkAgentSessionDeps {
     createdWorkspace: PersistedWorkspaceRecord | null;
   }>;
   registerCreatedWorkspace(workspace: PersistedWorkspaceRecord): Promise<void>;
+  /**
+   * Undo `forkProviderSession`. Best effort: the caller reports the original
+   * failure, so a rollback that fails is logged and swallowed.
+   */
+  deleteForkedProviderSession(agentId: string, input: { providerHandleId: string }): Promise<void>;
   logger: Logger;
 }
 
@@ -90,19 +102,16 @@ export async function forkAgentSessionNatively(
   // canonical one.
   const cwd = source.cwd;
 
+  const workspaceId = request.workspaceId ?? source.workspaceId;
   const boundaryMessageId = resolveBoundary(request, deps);
+  // Last point at which nothing has happened yet. Everything below this line
+  // has to be rolled back by hand.
+  await deps.validateForkTarget({ cwd, workspaceId });
+
   const fork = await deps.forkProviderSession(request.agentId, { boundaryMessageId });
-  const imported = await deps.importProviderSession({
-    provider: fork.provider,
-    providerHandleId: fork.providerHandleId,
-    cwd,
-    workspaceId: request.workspaceId ?? source.workspaceId,
-    requestId: request.requestId,
-    config: inheritedForkConfig(source.config),
-  });
-  if (imported.createdWorkspace) {
-    await deps.registerCreatedWorkspace(imported.createdWorkspace);
-  }
+  const imported = await withForkRollback(request.agentId, fork.providerHandleId, deps, () =>
+    importForkedSession({ deps, fork, cwd, workspaceId, request, config: source.config }),
+  );
   deps.logger.info(
     {
       agentId: request.agentId,
@@ -181,6 +190,66 @@ export function inheritedForkConfig(config: AgentSessionConfig): Partial<AgentSe
  */
 function isSameDirectory(left: string, right: string): boolean {
   return createRealpathAwarePathMatcher(left)(right);
+}
+
+async function importForkedSession(input: {
+  deps: ForkAgentSessionDeps;
+  fork: { providerHandleId: string; provider: AgentProvider };
+  cwd: string;
+  workspaceId: string | undefined;
+  request: ForkAgentSessionRequest;
+  config: AgentSessionConfig;
+}): Promise<{ agentId: string; timelineSize: number }> {
+  const imported = await input.deps.importProviderSession({
+    provider: input.fork.provider,
+    providerHandleId: input.fork.providerHandleId,
+    cwd: input.cwd,
+    workspaceId: input.workspaceId,
+    requestId: input.request.requestId,
+    config: inheritedForkConfig(input.config),
+  });
+  if (imported.createdWorkspace) {
+    await input.deps.registerCreatedWorkspace(imported.createdWorkspace);
+  }
+  return { agentId: imported.agentId, timelineSize: imported.timelineSize };
+}
+
+/**
+ * Run the steps that follow the irreversible provider fork, deleting the fork
+ * if any of them fails.
+ *
+ * Without this a failed import (missing cwd, absent or archived workspace,
+ * failed hydration) answers the client with an error and no paseo agent, while
+ * a brand-new provider transcript stays on disk — where the importable-session
+ * list later offers it to the user as if they had created it.
+ *
+ * The rollback is best effort and never masks the failure that triggered it:
+ * a rollback error is logged and dropped, and the ORIGINAL error is what the
+ * caller sees.
+ */
+async function withForkRollback<T>(
+  agentId: string,
+  providerHandleId: string,
+  deps: ForkAgentSessionDeps,
+  run: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    try {
+      await deps.deleteForkedProviderSession(agentId, { providerHandleId });
+      deps.logger.warn(
+        { err: error, agentId, providerHandleId },
+        "agent.fork_session.rolled_back: deleted the forked provider session after a failure",
+      );
+    } catch (rollbackError) {
+      deps.logger.error(
+        { err: rollbackError, cause: error, agentId, providerHandleId },
+        "agent.fork_session.rollback_failed: an orphan provider session may remain on disk",
+      );
+    }
+    throw error;
+  }
 }
 
 function resolveBoundary(

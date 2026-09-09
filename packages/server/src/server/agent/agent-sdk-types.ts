@@ -713,6 +713,15 @@ export interface AgentSession {
     boundaryMessageId?: string | null;
   }): Promise<{ providerHandleId: string }>;
   /**
+   * Delete a provider session this session previously forked, undoing an
+   * otherwise irreversible `forkProviderSession`.
+   *
+   * Only meaningful for the fork rollback path: the handle must name a fork,
+   * never this session's own store entry, and implementations must refuse
+   * anything else. Implemented alongside `forkProviderSession`.
+   */
+  deleteForkedProviderSession?(input: { providerHandleId: string }): Promise<void>;
+  /**
    * Out-of-band prompt handler. When non-null, the manager runs the returned
    * handler instead of allocating a turn. The handler emits stream events
    * directly via the provided `emit` callback, which routes through the

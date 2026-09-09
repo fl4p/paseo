@@ -407,6 +407,34 @@ export async function forkClaudeSession(input: {
   return fork;
 }
 
+/**
+ * Delete a session created by `forkClaudeSession`.
+ *
+ * The fork is irreversible at the provider level: once `forkSession` has
+ * written the branch, a later failure (a missing workspace, a failed import,
+ * a removed cwd) would otherwise leave an orphan transcript on disk that the
+ * "recent provider sessions" list happily offers for import. Callers use this
+ * to roll that back, best effort — the caller keeps and reports the ORIGINAL
+ * error, so this one is returned rather than thrown.
+ *
+ * Refuses to touch anything other than the fork it was handed, so a mistake in
+ * the caller cannot delete the source session.
+ */
+export async function deleteForkedClaudeSession(input: {
+  sdk: ClaudeRewindSdk;
+  forkSessionId: string;
+  sourceSessionId: string | null;
+}): Promise<void> {
+  const forkSessionId = input.forkSessionId.trim();
+  if (!forkSessionId) {
+    throw new Error("Cannot delete a forked Claude session without its id");
+  }
+  if (forkSessionId === input.sourceSessionId?.trim()) {
+    throw new Error(`Refusing to delete the source Claude session ${forkSessionId}`);
+  }
+  await input.sdk.deleteSession(forkSessionId);
+}
+
 async function forkAtBoundary(input: {
   sdk: ClaudeRewindSdk;
   sessionId: string;

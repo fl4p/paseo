@@ -8,6 +8,10 @@ export class FakeClaudeSdk implements ClaudeRewindSdk {
     upToMessageId: string | undefined;
   }> = [];
   readonly recordedFileRewinds: Array<{ userMessageId: string }> = [];
+  readonly recordedDeletes: string[] = [];
+
+  /** When set, `deleteSession` rejects with this error instead of recording. */
+  deleteSessionError: Error | null = null;
 
   private nextSessionId = "forked-session-1";
 
@@ -22,6 +26,13 @@ export class FakeClaudeSdk implements ClaudeRewindSdk {
     this.recordedForks.push({ upToMessageId: options?.upToMessageId });
     this.recordedForkCalls.push({ sessionId, upToMessageId: options?.upToMessageId });
     return { sessionId: this.nextSessionId };
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    if (this.deleteSessionError) {
+      throw this.deleteSessionError;
+    }
+    this.recordedDeletes.push(sessionId);
   }
 
   createQuery(): {

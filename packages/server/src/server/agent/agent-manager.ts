@@ -3036,6 +3036,29 @@ export class AgentManager {
     };
   }
 
+  /**
+   * Delete a provider session branched off `agentId` by `forkProviderSession`.
+   *
+   * Rollback only: the provider fork is irreversible, so a fork whose import
+   * fails afterwards would leave an orphan transcript that later shows up in
+   * the importable-sessions list.
+   */
+  async deleteForkedProviderSession(
+    agentId: string,
+    input: { providerHandleId: string },
+  ): Promise<void> {
+    const agent = this.requireSessionAgent(agentId);
+    const remove = agent.session.deleteForkedProviderSession;
+    if (!remove) {
+      throw new ProviderForkUnsupportedError(agent.provider);
+    }
+    await remove.call(agent.session, { providerHandleId: input.providerHandleId });
+    this.logger.info(
+      { agentId, provider: agent.provider, providerHandleId: input.providerHandleId },
+      "agent.fork_session.provider_fork_deleted",
+    );
+  }
+
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     const submittedRow = this.timelineStore

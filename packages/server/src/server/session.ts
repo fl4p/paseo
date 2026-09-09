@@ -2,6 +2,7 @@ import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
 import type { AgentRequests } from "./agent/requests/index.js";
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
+import { existsSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { basename, resolve, sep } from "path";
 import { homedir } from "node:os";
@@ -7586,8 +7587,23 @@ export class Session {
           direction: "tail",
           limit: 0,
         }),
+      validateForkTarget: async (input) => {
+        // The provider fork is irreversible, so everything knowable up front is
+        // checked up front: a removed directory and an absent, archived or
+        // mismatched workspace all fail here rather than after a branch has
+        // been written to the provider's session store.
+        if (!existsSync(input.cwd)) {
+          throw new Error(`Cannot fork: the source directory no longer exists (${input.cwd})`);
+        }
+        await this.workspaceProvisioning.assertImportWorkspaceUsable({
+          cwd: input.cwd,
+          ...(input.workspaceId ? { requestedWorkspaceId: input.workspaceId } : {}),
+        });
+      },
       forkProviderSession: (agentId, input) =>
         this.agentManager.forkProviderSession(agentId, input),
+      deleteForkedProviderSession: (agentId, input) =>
+        this.agentManager.deleteForkedProviderSession(agentId, input),
       importProviderSession: async (input) => {
         const imported = await importProviderSession({
           request: {

@@ -1,4 +1,8 @@
-import { forkSession as claudeForkSession, type Query } from "@anthropic-ai/claude-agent-sdk";
+import {
+  deleteSession as claudeDeleteSession,
+  forkSession as claudeForkSession,
+  type Query,
+} from "@anthropic-ai/claude-agent-sdk";
 
 /**
  * Seam over the Claude Agent SDK's session mutation surface. Both rewind and
@@ -11,10 +15,17 @@ export interface ClaudeRewindSdk {
     sessionId: string,
     options?: { upToMessageId?: string },
   ): Promise<{ sessionId: string }>;
+  /**
+   * Remove a session file. Only ever used to roll a *just created* fork back
+   * when the step after it fails, so the daemon does not leave an orphan
+   * transcript on disk that would later surface as an importable session.
+   */
+  deleteSession(sessionId: string): Promise<void>;
 }
 
 export const realClaudeRewindSdk: ClaudeRewindSdk = {
   forkSession: claudeForkSession,
+  deleteSession: (sessionId) => claudeDeleteSession(sessionId),
 };
 
 export async function revertClaudeConversation(input: {

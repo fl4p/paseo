@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ClaudeForkBoundaryError,
+  deleteForkedClaudeSession,
   forkClaudeSession,
   parseTranscriptBoundaryEntries,
   resolveForkBoundaryUuid,
@@ -111,5 +112,39 @@ describe("forkClaudeSession", () => {
     await expect(
       forkClaudeSession({ sdk, sessionId: null, readTranscript: () => null }),
     ).rejects.toThrow(/not ready to fork/);
+  });
+});
+
+describe("deleteForkedClaudeSession", () => {
+  it("deletes the fork so a failed import leaves no orphan transcript", async () => {
+    const sdk = new FakeClaudeSdk();
+    await deleteForkedClaudeSession({
+      sdk,
+      forkSessionId: "forked-session-1",
+      sourceSessionId: "source-session",
+    });
+    expect(sdk.recordedDeletes).toEqual(["forked-session-1"]);
+  });
+
+  it("refuses to delete the source session", async () => {
+    // Rollback is the only caller, and a mix-up here would destroy the live
+    // conversation the user forked FROM.
+    const sdk = new FakeClaudeSdk();
+    await expect(
+      deleteForkedClaudeSession({
+        sdk,
+        forkSessionId: "source-session",
+        sourceSessionId: "source-session",
+      }),
+    ).rejects.toThrow(/Refusing to delete the source/);
+    expect(sdk.recordedDeletes).toEqual([]);
+  });
+
+  it("refuses an empty handle rather than asking the SDK to delete nothing", async () => {
+    const sdk = new FakeClaudeSdk();
+    await expect(
+      deleteForkedClaudeSession({ sdk, forkSessionId: "  ", sourceSessionId: "source-session" }),
+    ).rejects.toThrow(/without its id/);
+    expect(sdk.recordedDeletes).toEqual([]);
   });
 });

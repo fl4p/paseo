@@ -178,6 +178,8 @@ describe("forkAgentSessionNatively", () => {
         return { agentId: "agent-forked", timelineSize: timeline.length, createdWorkspace: null };
       },
       registerCreatedWorkspace: vi.fn(async () => {}),
+      validateForkTarget: vi.fn(async () => {}),
+      deleteForkedProviderSession: vi.fn(async () => {}),
       logger,
     };
   });
@@ -354,6 +356,63 @@ describe("forkAgentSessionNatively", () => {
     expect(config).not.toHaveProperty("provider");
     expect(config).not.toHaveProperty("title");
     expect(config).not.toHaveProperty("internal");
+  });
+
+  it("refuses before the irreversible fork when the target is unusable", async () => {
+    // The provider fork writes a new transcript that cannot be un-written, so
+    // anything knowable up front has to fail before it, not after.
+    deps.validateForkTarget = vi.fn(async () => {
+      throw new Error("Workspace not found: ws-gone");
+    });
+
+    await expect(
+      forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-validate" }, deps),
+    ).rejects.toThrow(/Workspace not found/);
+    expect(sdk.recordedForkCalls).toEqual([]);
+    expect(deps.deleteForkedProviderSession).not.toHaveBeenCalled();
+  });
+
+  it("deletes the forked provider session when the import afterwards fails", async () => {
+    deps.importProviderSession = vi.fn(() => Promise.reject(new Error("hydration failed")));
+
+    await expect(
+      forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-rollback" }, deps),
+    ).rejects.toThrow("hydration failed");
+    // Otherwise the fork stays on disk and later surfaces in the
+    // importable-sessions list as a session the user never created.
+    expect(deps.deleteForkedProviderSession).toHaveBeenCalledWith("agent-source", {
+      providerHandleId: "forked-session",
+    });
+  });
+
+  it("deletes the forked provider session when registering its workspace fails", async () => {
+    deps.importProviderSession = vi.fn(() =>
+      Promise.resolve({
+        agentId: "agent-forked",
+        timelineSize: 1,
+        createdWorkspace: { workspaceId: "ws-new" } as never,
+      }),
+    );
+    deps.registerCreatedWorkspace = vi.fn(() => Promise.reject(new Error("registry offline")));
+
+    await expect(
+      forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-rollback-2" }, deps),
+    ).rejects.toThrow("registry offline");
+    expect(deps.deleteForkedProviderSession).toHaveBeenCalledWith("agent-source", {
+      providerHandleId: "forked-session",
+    });
+  });
+
+  it("still reports the original failure when the rollback itself fails", async () => {
+    deps.importProviderSession = vi.fn(() => Promise.reject(new Error("hydration failed")));
+    deps.deleteForkedProviderSession = vi.fn(() => Promise.reject(new Error("delete refused")));
+
+    // A failed rollback must not become the error the user sees: it would hide
+    // the reason the fork failed behind a cleanup detail.
+    await expect(
+      forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-rollback-3" }, deps),
+    ).rejects.toThrow("hydration failed");
+    expect(deps.deleteForkedProviderSession).toHaveBeenCalled();
   });
 
   it("registers a workspace the import had to create", async () => {

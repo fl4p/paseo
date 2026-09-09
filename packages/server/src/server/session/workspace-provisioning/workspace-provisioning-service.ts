@@ -51,6 +51,18 @@ export interface CreateWorktreeWorkspaceInput {
 }
 
 export interface WorkspaceProvisioningService {
+  /**
+   * Throw if an import into `requestedWorkspaceId` could not succeed: the
+   * workspace is missing or archived, its project is missing or archived, or
+   * its directory is not the one being imported.
+   *
+   * `runInImportWorkspace` applies exactly these checks, but only once the
+   * caller is already inside it. Callers that must do something irreversible
+   * first (the provider-native fork branches the provider's own session store)
+   * run them up front so the irreversible step never happens for an import
+   * that was doomed anyway. A no-op when no workspace was requested.
+   */
+  assertImportWorkspaceUsable(input: ImportWorkspaceInput): Promise<void>;
   runInImportWorkspace<T>(
     input: ImportWorkspaceInput,
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
@@ -98,24 +110,38 @@ export function createWorkspaceProvisioningService(deps: {
 }): WorkspaceProvisioningService {
   const { serverId, workspaceRegistry, projectRegistry, workspaceGitService, logger } = deps;
 
+  async function resolveRequestedImportWorkspace(
+    input: ImportWorkspaceInput,
+  ): Promise<PersistedWorkspaceRecord | null> {
+    if (!input.requestedWorkspaceId) {
+      return null;
+    }
+    const workspace = await workspaceRegistry.get(input.requestedWorkspaceId);
+    if (!workspace || workspace.archivedAt) {
+      throw new Error(`Workspace not found: ${input.requestedWorkspaceId}`);
+    }
+    const project = await projectRegistry.get(workspace.projectId);
+    if (!project || project.archivedAt) {
+      throw new Error(`Project not found: ${workspace.projectId}`);
+    }
+    if (!createRealpathAwarePathMatcher(workspace.cwd)(input.cwd)) {
+      throw new Error(`Import cwd does not match workspace: ${workspace.workspaceId}`);
+    }
+    return workspace;
+  }
+
+  async function assertImportWorkspaceUsable(input: ImportWorkspaceInput): Promise<void> {
+    await resolveRequestedImportWorkspace(input);
+  }
+
   async function runInImportWorkspace<T>(
     input: ImportWorkspaceInput,
     operation: (workspace: PersistedWorkspaceRecord) => Promise<T>,
   ): Promise<ImportWorkspaceResult<T>> {
-    if (input.requestedWorkspaceId) {
-      const workspace = await workspaceRegistry.get(input.requestedWorkspaceId);
-      if (!workspace || workspace.archivedAt) {
-        throw new Error(`Workspace not found: ${input.requestedWorkspaceId}`);
-      }
-      const project = await projectRegistry.get(workspace.projectId);
-      if (!project || project.archivedAt) {
-        throw new Error(`Project not found: ${workspace.projectId}`);
-      }
-      if (!createRealpathAwarePathMatcher(workspace.cwd)(input.cwd)) {
-        throw new Error(`Import cwd does not match workspace: ${workspace.workspaceId}`);
-      }
+    const requestedWorkspace = await resolveRequestedImportWorkspace(input);
+    if (requestedWorkspace) {
       return {
-        value: await operation(workspace),
+        value: await operation(requestedWorkspace),
         createdWorkspace: null,
       };
     }
@@ -457,6 +483,7 @@ export function createWorkspaceProvisioningService(deps: {
   }
 
   return {
+    assertImportWorkspaceUsable,
     runInImportWorkspace,
     findOrCreateWorkspaceForDirectory,
     resolveOrCreateWorkspaceIdForCreateAgent,
