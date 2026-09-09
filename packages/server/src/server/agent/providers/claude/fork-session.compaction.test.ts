@@ -392,6 +392,47 @@ describe("forked compact boundaries", () => {
     expect(reconstructChain(forked)).toHaveLength(sourceChain.length);
   });
 
+  it("forks a fork: an unbounded fork of a fork is a fork the SDK accepts", async () => {
+    // `forkSession` appends a uuid-bearing `custom-title` entry to every fork
+    // it writes, and its own transcript reader does NOT count `custom-title` as
+    // a message. An unbounded fork of a fork used to pick that title uuid as
+    // its cut and the SDK answered `Message ... not found in session ...`, so
+    // forking a fork was broken outright.
+    const first = await forkClaudeSession({
+      sdk: realClaudeRewindSdk,
+      sessionId: SESSION_ID,
+      readTranscript: () => readTranscriptFile(SESSION_ID),
+      forkTranscript: store(),
+      logger,
+    });
+    const firstContent = readTranscriptFile(first.sessionId);
+    // Precondition: the fork really does end with a uuid-bearing title entry.
+    const lastEntry = firstContent
+      .split("\n")
+      .filter((line) => line.trim().startsWith("{"))
+      .map((line) => JSON.parse(line) as TranscriptEntry)
+      .at(-1);
+    expect(lastEntry?.type).toBe("custom-title");
+    expect(typeof lastEntry?.uuid).toBe("string");
+
+    const second = await forkClaudeSession({
+      sdk: realClaudeRewindSdk,
+      sessionId: first.sessionId,
+      readTranscript: () => readTranscriptFile(first.sessionId),
+      forkTranscript: store(),
+      logger,
+    });
+
+    expect(second.sessionId).not.toBe(first.sessionId);
+    expect(second.sessionId).not.toBe(SESSION_ID);
+    // The fork of the fork carries the conversation, not just a title.
+    const forkedTypes = parseTranscript(readTranscriptFile(second.sessionId)).map(
+      (entry) => entry.type,
+    );
+    expect(forkedTypes).toContain("assistant");
+    expect(forkedTypes).toContain("user");
+  });
+
   it("is idempotent: repairing an already repaired fork changes nothing", async () => {
     const fork = await forkClaudeSession({
       sdk: realClaudeRewindSdk,

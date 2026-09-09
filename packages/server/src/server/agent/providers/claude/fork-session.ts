@@ -109,6 +109,40 @@ export function resolveForkBoundaryUuid(
 }
 
 /**
+ * Entry types the SDK's `forkSession` treats as transcript messages.
+ *
+ * Read out of @anthropic-ai/claude-agent-sdk 0.3.246's own transcript reader
+ * rather than inferred from the names: it keeps exactly these types, and only
+ * when the entry carries a string `uuid`, then resolves `upToMessageId` against
+ * that list and throws `Message ... not found in session ...` for anything
+ * else.
+ *
+ * The type that is NOT in it is the one that matters. `forkSession` APPENDS a
+ * uuid-bearing `custom-title` entry to every fork it writes, so an unbounded
+ * fork of a fork used to select that title as its cut and the SDK rejected it —
+ * forking a fork failed outright. `progress` is in the list even though the
+ * copy drops those entries, because the SDK resolves the cut before dropping
+ * them; mirroring its list exactly is the point.
+ *
+ * The other uuid-bearing types seen across ~2000 real transcripts are `user`,
+ * `assistant`, `attachment` and `system` — all present here — plus
+ * `custom-title`, which appeared only on transcripts that were themselves
+ * forks.
+ */
+const SDK_TRANSCRIPT_ENTRY_TYPES = new Set([
+  "user",
+  "assistant",
+  "attachment",
+  "system",
+  "progress",
+]);
+
+/** Would the SDK's `upToMessageId` lookup find this entry? */
+function isSdkTranscriptMessage(entry: ClaudeForkBoundaryEntry): boolean {
+  return typeof entry.type === "string" && SDK_TRANSCRIPT_ENTRY_TYPES.has(entry.type);
+}
+
+/**
  * `stop_reason` values that mean the assistant's reply is OVER.
  *
  * `tool_use` is the odd one out: it ends the API response but not the turn — a
@@ -202,6 +236,10 @@ function readToolBlockIds(entry: ClaudeForkBoundaryEntry): {
  * still streaming. With an explicit boundary the user has chosen the position,
  * so only the tool-pairing invariant is enforced.
  *
+ * A cut is also restricted to entries the SDK itself counts as transcript
+ * messages (`isSdkTranscriptMessage`); anything else is a uuid it would refuse
+ * as an `upToMessageId`.
+ *
  * Returns `null` when no position qualifies (nothing has completed yet).
  */
 export function resolveSafeForkUuid(
@@ -229,7 +267,12 @@ export function resolveSafeForkUuid(
       open.add(id);
     }
     const endsATurn = endsAssistantTurn(entry, conversation[index + 1]);
-    if (uuid && open.size === 0 && (!options.requireTurnEnd || endsATurn)) {
+    if (
+      uuid &&
+      isSdkTranscriptMessage(entry) &&
+      open.size === 0 &&
+      (!options.requireTurnEnd || endsATurn)
+    ) {
       safe = uuid;
     }
     if (until && uuid === until) {

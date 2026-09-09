@@ -220,6 +220,35 @@ describe("resolveSafeForkUuid", () => {
     expect(resolveSafeForkUuid(noStopReason)).toBe("a1");
   });
 
+  it("never cuts at an entry the SDK does not count as a message", () => {
+    // `forkSession` appends a uuid-bearing `custom-title` to every fork it
+    // writes, and its own reader excludes `custom-title` from the message list
+    // it resolves `upToMessageId` against. Selecting it makes the SDK throw
+    // "Message ... not found in session ...", which is what broke forking a
+    // fork. `progress` is in the SDK's list, so it stays selectable.
+    const forkOfAFork = parseTranscriptBoundaryEntries(
+      [
+        JSON.stringify({ type: "user", uuid: "u1", message: { content: "hi" } }),
+        JSON.stringify({
+          type: "assistant",
+          uuid: "a1",
+          message: {
+            id: "msg_1",
+            content: [{ type: "text", text: "done" }],
+            stop_reason: "end_turn",
+          },
+        }),
+        JSON.stringify({
+          type: "custom-title",
+          uuid: "title-1",
+          customTitle: "Something (fork)",
+        }),
+      ].join("\n"),
+    );
+    expect(resolveSafeForkUuid(forkOfAFork)).toBe("a1");
+    expect(resolveSafeForkUuid(forkOfAFork, { requireTurnEnd: true })).toBe("a1");
+  });
+
   it("stops at the requested boundary", () => {
     expect(resolveSafeForkUuid(inFlight, { untilUuid: "u2" })).toBe("u2");
     expect(resolveSafeForkUuid(inFlight, { untilUuid: "a1" })).toBe("a1");
