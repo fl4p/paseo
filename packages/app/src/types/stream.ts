@@ -1477,8 +1477,15 @@ function reduceTimelineCompaction(
   timestamp: Date,
   timelineCursor?: TimelinePosition,
 ): StreamItem[] {
-  if (item.status === "completed") {
-    const loadingIdx = state.findIndex((s) => s.kind === "compaction" && s.status === "loading");
+  const loadingIdx = state.findIndex((s) => s.kind === "compaction" && s.status === "loading");
+  if (item.status === "loading") {
+    // A provider can report the same compaction as in-progress more than once (Claude repeats
+    // its `compacting` status message). Keep one spinner per compaction: only one of them would
+    // ever be terminalized by the single completion event, and the rest spin forever.
+    if (loadingIdx >= 0) {
+      return state;
+    }
+  } else {
     const existing = loadingIdx >= 0 ? state[loadingIdx] : undefined;
     if (loadingIdx >= 0 && existing && existing.kind === "compaction") {
       const updated: CompactionItem = {
@@ -1488,7 +1495,11 @@ function reduceTimelineCompaction(
         trigger: item.trigger ?? existing.trigger,
         preTokens: item.preTokens ?? existing.preTokens,
       };
-      return [...state.slice(0, loadingIdx), updated, ...state.slice(loadingIdx + 1)];
+      const next = [...state.slice(0, loadingIdx), updated, ...state.slice(loadingIdx + 1)];
+      // Drop stragglers from a stream that still carried duplicate loading markers.
+      return next.filter(
+        (s, index) => index === loadingIdx || s.kind !== "compaction" || s.status !== "loading",
+      );
     }
     if (loadingIdx >= 0) {
       return state;
@@ -1596,6 +1607,17 @@ function reduceTimelineEvent(
   }
 }
 
+function terminalizeLoadingCompaction(state: StreamItem[]): StreamItem[] {
+  if (!state.some((item) => item.kind === "compaction" && item.status === "loading")) {
+    return state;
+  }
+  return state.map((item) =>
+    item.kind === "compaction" && item.status === "loading"
+      ? { ...item, status: "completed" as const }
+      : item,
+  );
+}
+
 /**
  * Reduce a single AgentManager stream event into the UI timeline
  */
@@ -1619,11 +1641,14 @@ export function reduceStreamUpdate(
         ),
         event,
       );
-    case "thread_started":
-    case "turn_started":
     case "turn_completed":
     case "turn_failed":
     case "turn_canceled":
+      // A turn cannot outlive a compaction it triggered: whatever the provider did or did not
+      // report, an open marker at turn end is stale and must not keep spinning.
+      return finalizeActiveThoughts(terminalizeLoadingCompaction(state));
+    case "thread_started":
+    case "turn_started":
     case "permission_requested":
     case "permission_resolved":
     case "attention_required":

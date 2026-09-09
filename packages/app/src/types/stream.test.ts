@@ -1427,6 +1427,56 @@ describe("stream reducer canonical tool calls", () => {
     );
   });
 
+  it("keeps a single spinner when a provider repeats the loading compaction", () => {
+    const state = hydrateStreamState([
+      {
+        event: compactionTimeline("loading"),
+        timestamp: new Date("2025-01-01T10:50:00Z"),
+      },
+      {
+        event: compactionTimeline("loading"),
+        timestamp: new Date("2025-01-01T10:50:01Z"),
+      },
+      {
+        event: compactionTimeline("loading"),
+        timestamp: new Date("2025-01-01T10:50:02Z"),
+      },
+      {
+        event: compactionTimeline("completed", "manual"),
+        timestamp: new Date("2025-01-01T10:50:03Z"),
+      },
+    ]);
+
+    const compactions = state.filter(
+      (item): item is Extract<StreamItem, { kind: "compaction" }> => item.kind === "compaction",
+    );
+
+    assert.strictEqual(compactions.length, 1);
+    assert.strictEqual(compactions[0].status, "completed");
+    assert.strictEqual(compactions[0].trigger, "manual");
+  });
+
+  it("stops the compaction spinner when the turn ends without a completion event", () => {
+    const state = hydrateStreamState([
+      {
+        event: compactionTimeline("loading", "manual"),
+        timestamp: new Date("2025-01-01T10:50:00Z"),
+      },
+      {
+        event: { type: "turn_completed", provider: "pi" },
+        timestamp: new Date("2025-01-01T10:50:05Z"),
+      },
+    ]);
+
+    const compactions = state.filter(
+      (item): item is Extract<StreamItem, { kind: "compaction" }> => item.kind === "compaction",
+    );
+
+    assert.strictEqual(compactions.length, 1);
+    assert.strictEqual(compactions[0].status, "completed");
+    assert.strictEqual(compactions[0].trigger, "manual");
+  });
+
   it("renders Claude TodoWrite as todo_list and suppresses tool call badge", () => {
     const state = hydrateStreamState([
       {

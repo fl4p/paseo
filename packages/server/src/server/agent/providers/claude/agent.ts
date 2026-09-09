@@ -2096,6 +2096,8 @@ class ClaudeAgentSession implements AgentSession {
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
   private compacting = false;
+  /** A `compaction`/`loading` marker has been emitted and not yet terminalized. */
+  private compactionMarkerOpen = false;
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
   private pendingInterruptAbort = false;
@@ -4261,15 +4263,22 @@ class ClaudeAgentSession implements AgentSession {
       const status = toObjectRecord(message)?.status;
       if (status === "compacting") {
         this.compacting = true;
-        events.push({
-          type: "timeline",
-          item: { type: "compaction", status: "loading" },
-          provider: "claude",
-        });
+        // The CLI repeats the `compacting` status while a compaction runs. Emit one marker per
+        // compaction: only one of them is ever terminalized by `compact_boundary`, so the extra
+        // ones would spin forever.
+        if (!this.compactionMarkerOpen) {
+          this.compactionMarkerOpen = true;
+          events.push({
+            type: "timeline",
+            item: { type: "compaction", status: "loading" },
+            provider: "claude",
+          });
+        }
       }
       return;
     }
     if (message.subtype === "compact_boundary") {
+      this.compactionMarkerOpen = false;
       const compactMetadata = readCompactionMetadata(message);
       events.push({
         type: "timeline",
@@ -4457,6 +4466,16 @@ class ClaudeAgentSession implements AgentSession {
     events: AgentStreamEvent[],
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
+    // A compaction that ends without a `compact_boundary` (failed, interrupted, or a no-op
+    // /compact) would otherwise leave the spinner running until something else redraws it.
+    if (this.compactionMarkerOpen) {
+      this.compactionMarkerOpen = false;
+      events.push({
+        type: "timeline",
+        item: { type: "compaction", status: "completed" },
+        provider: "claude",
+      });
+    }
     if (message.subtype === "success") {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
