@@ -113,6 +113,21 @@ describe("SessionAuthorization", () => {
     expect(authorization.allowsOutbound(outboundMessage("agent_update"))).toBe(false);
   });
 
+  test("a fork of a transcript is not visible to write-only authority", () => {
+    // Both fork paths clone or export the same transcript, so the response of
+    // either must need the read authority, not merely the write authority that
+    // creating an agent needs. The handler enforces the matching read
+    // requirement on the request, which this table cannot express (its
+    // requirement lists are OR-ed).
+    const writeOnly = new SessionAuthorization(["workspace.write"]);
+
+    expect(writeOnly.allowsOutbound(outboundMessage("agent.fork_session.response"))).toBe(false);
+    expect(writeOnly.allowsOutbound(outboundMessage("agent.fork_context.response"))).toBe(false);
+
+    const reader = new SessionAuthorization(["workspace.read", "workspace.write"]);
+    expect(reader.allowsOutbound(outboundMessage("agent.fork_session.response"))).toBe(true);
+  });
+
   test("correlated authorization errors can always be emitted", () => {
     const authorization = new SessionAuthorization([]);
 

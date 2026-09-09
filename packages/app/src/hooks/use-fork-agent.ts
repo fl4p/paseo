@@ -8,6 +8,7 @@ import type { WorkspaceComposerAttachment } from "@/attachments/types";
 import type { AssistantForkTarget } from "@/components/assistant-fork-menu";
 import type { ToastApi } from "@/components/toast-host";
 import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
+import { resolveForkMode, resolveForkTargetCwd } from "@/hooks/fork-mode";
 import { useStableEvent } from "@/hooks/use-stable-event";
 import { useHostFeature } from "@/runtime/host-features";
 import { generateDraftId } from "@/stores/draft-keys";
@@ -42,9 +43,17 @@ export type ForkAgentSource = Pick<
 
 /**
  * Boundary marking where the forked context should stop. Omit it entirely to
- * fork the whole timeline *up to now* — including a partially streamed
- * in-flight turn. `selectForkContextRows` projects the full timeline when
- * neither field is present, which is what makes mid-run forking work.
+ * fork *up to now*.
+ *
+ * What "now" means depends on the fork mode, and the menu says which:
+ *
+ * - `attachment` — the daemon renders the live timeline, so a partially
+ *   streamed in-flight turn IS included (`selectForkContextRows` projects the
+ *   full timeline when neither field is present);
+ * - `native` — the daemon branches the provider's own transcript, which does
+ *   not contain the running turn yet, so it cuts at the last COMPLETED turn.
+ *   Forking the visible tail instead would clone a half-written turn, or a
+ *   `tool_use` whose `tool_result` never arrived.
  */
 export type ForkAgentBoundary = Pick<
   AgentForkContextOptions,
@@ -59,6 +68,11 @@ export interface ForkAgentRequest {
   boundary?: ForkAgentBoundary;
 }
 
+/**
+ * Extra context the native fork needs but the attachment fork does not: the
+ * workspace the source agent lives in (the fork is registered there) and the
+ * ability to open the resulting agent instead of a composer draft.
+ */
 export interface UseForkAgentInput {
   serverId: string;
   toast?: ToastApi | null;
@@ -118,10 +132,38 @@ function buildForkDraftTabTarget(
 }
 
 /**
+ * Provider-native fork: the daemon branches the provider's own session, so the
+ * result is a real agent (not a composer draft) that already carries the source
+ * conversation, its prompt-cache prefix and its compaction.
+ */
+async function runNativeFork(input: {
+  client: DaemonClient;
+  agentId: string;
+  cwd: string;
+  workspaceId: string;
+  boundary?: ForkAgentBoundary;
+  failureMessage: string;
+}): Promise<string> {
+  const payload = await input.client.forkAgentSession(input.agentId, {
+    ...(input.boundary?.boundaryCursor ? { boundaryCursor: input.boundary.boundaryCursor } : {}),
+    ...(input.boundary?.boundaryMessageId
+      ? { boundaryMessageId: input.boundary.boundaryMessageId }
+      : {}),
+    cwd: input.cwd,
+    workspaceId: input.workspaceId,
+  });
+  if (!payload.forkedAgentId) {
+    throw new Error(input.failureMessage);
+  }
+  return payload.forkedAgentId;
+}
+
+/**
  * Shared fork driver behind both turn-footer fork affordances: the completed
  * turn's footer (which supplies a boundary pinned to that turn) and the
- * in-flight turn's footer next to the progress loader (which omits the boundary
- * so the fork captures the still-streaming response).
+ * in-flight turn's footer next to the progress loader (which omits the
+ * boundary, so the fork runs up to "now" — see `ForkAgentBoundary` for what
+ * each mode can actually deliver there).
  */
 export function useForkAgent(
   input: UseForkAgentInput,
@@ -131,6 +173,7 @@ export function useForkAgent(
   const router = useRouter();
   const client = useSessionStore((state) => state.sessions[serverId]?.client ?? null);
   const supportsAgentForkContext = useHostFeature(serverId, "agentForkContext") && !readOnly;
+  const supportsAgentForkSession = useHostFeature(serverId, "agentForkSession") && !readOnly;
 
   return useStableEvent(async ({ agentId, agent, workspaceId, target, boundary }) => {
     try {
@@ -141,6 +184,32 @@ export function useForkAgent(
       if (!client) {
         throw new Error(t("workspace.terminal.hostDisconnected"));
       }
+      const forkMode = resolveForkMode({
+        hostSupportsNativeFork: supportsAgentForkSession,
+        provider: agent.provider,
+        sourceCwd: agent.cwd,
+        targetCwd: resolveForkTargetCwd({ target, sourceCwd: agent.cwd }),
+      });
+      if (forkMode === "native") {
+        if (!workspaceId) {
+          throw new Error(t("message.actions.forkMissingWorkspace"));
+        }
+        const forkedAgentId = await runNativeFork({
+          client,
+          agentId,
+          cwd: agent.cwd,
+          workspaceId,
+          boundary,
+          failureMessage: t("message.actions.forkFailed"),
+        });
+        navigateToWorkspace({
+          serverId,
+          workspaceId,
+          target: { kind: "agent", agentId: forkedAgentId },
+        });
+        return;
+      }
+
       const draftSetup = buildForkDraftSetup(agent);
       const prepareForkDraft = async () => {
         const draftId = generateDraftId();

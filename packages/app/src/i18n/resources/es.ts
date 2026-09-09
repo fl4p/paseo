@@ -303,6 +303,10 @@ export const es: TranslationResources = {
       forkMenu: "Bifurcar mensaje",
       forkInNewTab: "Bifurcar en una pestaña nueva",
       forkInNewWorkspace: "Bifurcar en un espacio de trabajo nuevo",
+      forkKeepsContext: "Conserva el contexto completo y la caché de prompts",
+      forkKeepsContextFromLastTurn:
+        "Conserva el contexto completo y la caché de prompts, hasta la última respuesta completada",
+      forkCopiesSummary: "Copia un resumen de texto de este chat",
       forkUnavailable: "Actualiza el host para usar esto.",
       forkMissingWorkspace: "Este agente no está en un espacio de trabajo.",
       forkFailed: "No se pudo bifurcar el chat",
@@ -361,6 +365,10 @@ export const es: TranslationResources = {
       manual: "Contexto compactado manualmente",
       withTokens: "Contexto compactado (tokens{{tokens}}K)",
       completed: "Contexto compactado",
+    },
+    peer: {
+      from: "De {{sender}}",
+      fromUnknown: "De otra sesión",
     },
   },
   importSession: {

@@ -187,6 +187,14 @@ Claude Code announces subagent lifecycle on the SDK stream (`task_started` / `ta
 - **On replay, `<session>/subagents/` holds every descendant beside the root.** Resolve the tree one proven generation at a time: the root transcript admits direct children, then each admitted sidechain transcript admits its children by `toolUseId`. `spawnDepth` orders candidates but does not establish ownership. Unresolved sidecars remain excluded as ambient or unrelated work.
 - **Replay `totalTokens` is a context-size reading, not cumulative spend.** Claude Code finalizes a subagent by summing the _last_ assistant message's usage block and shipping that as `usage.total_tokens`. Summing per-entry usage instead multiplies the cached prefix by the turn count and reports a number several times larger than the live path.
 
+### Claude peer messages
+
+Another session's `SendMessage` arrives at the recipient as a user-role turn stamped with `origin`, on the live stream and in the transcript alike. Claude marks every injected entry `isMeta`, which is also how it marks system reminders and skill preambles, so the provider's synthetic-entry filter drops all of them; `origin.kind` is what separates a message a person needs to read from that noise (`providers/claude/peer-message.ts`).
+
+- **Render `origin.body`, not the message text.** The delivered text wraps the message in a `<cross-session-message>` envelope. The SDK documents `body` as byte-exact with what the model saw.
+- **`from` and `name` are authored by the sender.** The harness keys real identity on a kernel-verified pid that never reaches the stream, so both fields are attribution to display and never a permission. The app labels them as reported speech and offers no rewind on a peer's turn.
+- **The id is remembered on replay even though the turn is not a rewind anchor**, because a resume can deliver the same entry on the live stream afterwards.
+
 Archived Paseo subagents disappear from the track, by design. To remove one from the track without closing its tab, use the **archive button** on the row — it opens a confirm dialog and archives the subagent on confirm. Provider-owned rows have no individual Paseo lifecycle controls.
 
 The **Archive finished** row at the foot of the panel covers every finished row. It archives idle or errored managed Paseo subagents one at a time, and hides completed, failed, or canceled provider-owned rows in the current app session. Native sessions and timelines are untouched. Running and initializing children remain in the track. If a hidden provider child starts running again, the app brings it back to the track.

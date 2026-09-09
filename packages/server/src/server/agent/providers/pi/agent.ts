@@ -65,6 +65,7 @@ import {
 } from "./history-mapper.js";
 import { materializeProviderImage } from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
+import { shouldDisplayPiCustomMessage } from "./custom-message.js";
 import { revertPiConversation } from "./rewind.js";
 import { listPiImportableSessions, readPiImportSessionConfig } from "./session-descriptor.js";
 import type { PiRuntime, PiRuntimeSession, PiStartSessionInput } from "./runtime.js";
@@ -1428,13 +1429,16 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private async clearPendingPermissionsForSteer(): Promise<void> {
+    await this.denyPendingPermissions(
+      "The user answered with a message instead of approving. Their message follows.",
+    );
+  }
+
+  private async denyPendingPermissions(message: string): Promise<void> {
     const requestIds = Array.from(this.pendingExtensionUiRequests.keys());
     for (const requestId of requestIds) {
       if (!this.pendingExtensionUiRequests.has(requestId)) continue;
-      await this.respondToPermission(requestId, {
-        behavior: "deny",
-        message: "The user answered with a message instead of approving. Their message follows.",
-      });
+      await this.respondToPermission(requestId, { behavior: "deny", message });
     }
   }
 
@@ -1539,6 +1543,11 @@ export class PiRpcAgentSession implements AgentSession {
       this.activeTurnId || this.activeTurnStarted ? { turnId, error: null } : null;
     this.interruptingTurn = interruption;
     try {
+      // Pi drops its own pending extension-dialog promise when the turn aborts
+      // and sends the host nothing, so anything still open here would sit in
+      // pendingExtensionUiRequests forever and resurface as a ghost question on
+      // the next state refresh. Dismiss them while Pi still holds the promise.
+      await this.denyPendingPermissions("The user interrupted the turn.");
       try {
         await this.runtimeSession.clearQueue();
       } catch (error) {
@@ -2403,14 +2412,16 @@ export class PiRpcAgentSession implements AgentSession {
       return;
     }
     if (event.message.role === "custom") {
-      const text = getUserMessageText(event.message.content);
-      if (text) {
-        this.emit({
-          type: "timeline",
-          provider: this.provider,
-          turnId,
-          item: { type: "assistant_message", text },
-        });
+      if (shouldDisplayPiCustomMessage(event.message)) {
+        const text = getUserMessageText(event.message.content);
+        if (text) {
+          this.emit({
+            type: "timeline",
+            provider: this.provider,
+            turnId,
+            item: { type: "assistant_message", text },
+          });
+        }
       }
       if (!this.activeTurnStarted) {
         this.completeTurn(turnId, []);

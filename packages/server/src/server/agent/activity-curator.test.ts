@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
-import { buildAgentForkContextAttachment, curateAgentActivity } from "./activity-curator.js";
+import { describe, expect, it, vi } from "vitest";
+import {
+  buildAgentForkContextAttachment,
+  curateAgentActivity,
+  loadForkCompactionSummary,
+  resolveForkBoundaryMessageId,
+} from "./activity-curator.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
@@ -438,5 +443,500 @@ second line'`,
         rows: [row(1, { type: "assistant_message", text: "Done.", messageId: "assistant-1" })],
       }),
     ).toThrow("Selected assistant message is no longer available.");
+  });
+});
+
+describe("fork context budget and compaction boundary", () => {
+  it("starts after the last completed compaction instead of replaying pre-compaction history", () => {
+    // The source session already summarized everything before the boundary;
+    // replaying it is exactly what inflated a <200k-token session into ~700k.
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "assistant_message", text: "ancient answer", messageId: "assistant-1" }),
+        row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+        row(4, { type: "user_message", text: "current task", messageId: "user-2" }),
+        row(5, { type: "assistant_message", text: "current answer", messageId: "assistant-2" }),
+      ],
+    });
+
+    expect(result.attachment.text).not.toContain("ancient task");
+    expect(result.attachment.text).not.toContain("ancient answer");
+    expect(result.attachment.text).toContain("current task");
+    expect(result.attachment.text).toContain("current answer");
+    // No summary was available, so the header must say the history is GONE,
+    // not that something stands in for it.
+    expect(result.attachment.text).toContain("no compaction summary was available");
+    expect(result.attachment.text).not.toContain("compaction summary below");
+    expect(result.itemCount).toBe(2);
+  });
+
+  it("ignores a compaction that has not completed", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "compaction", status: "running", trigger: "auto" }),
+        row(3, { type: "user_message", text: "current task", messageId: "user-2" }),
+      ],
+    });
+
+    expect(result.attachment.text).toContain("ancient task");
+    expect(result.attachment.text).not.toContain("The source session was compacted");
+  });
+
+  it("only skips history before a compaction that precedes the boundary", () => {
+    const result = buildAgentForkContextAttachment({
+      boundaryMessageId: "assistant-1",
+      rows: [
+        row(1, { type: "user_message", text: "early task", messageId: "user-1" }),
+        row(2, { type: "assistant_message", text: "early answer", messageId: "assistant-1" }),
+        row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+        row(4, { type: "user_message", text: "later task", messageId: "user-2" }),
+      ],
+    });
+
+    // The compaction happened after the selected boundary, so it says nothing
+    // about the selected range and must not truncate it.
+    expect(result.attachment.text).toContain("early task");
+    expect(result.attachment.text).not.toContain("later task");
+    expect(result.attachment.text).not.toContain("last compaction omitted");
+  });
+
+  it("truncates to the budget, keeping the opening task and the recent tail", () => {
+    const filler = "x".repeat(400);
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: "THE ORIGINAL TASK", messageId: "user-1" }),
+    ];
+    for (let index = 0; index < 20; index += 1) {
+      rows.push(
+        row(index + 2, {
+          type: "user_message",
+          text: `middle ${index} ${filler}`,
+          messageId: `user-mid-${index}`,
+        }),
+      );
+    }
+    rows.push(row(100, { type: "user_message", text: "THE LATEST TASK", messageId: "user-last" }));
+
+    const result = buildAgentForkContextAttachment({ rows, maxChars: 2000 });
+
+    expect(result.attachment.text.length).toBeLessThan(3000);
+    expect(result.attachment.text).toContain("THE ORIGINAL TASK");
+    expect(result.attachment.text).toContain("THE LATEST TASK");
+    expect(result.attachment.text).toContain("middle 19");
+    expect(result.attachment.text).not.toContain("middle 0 ");
+    expect(result.attachment.text).toContain("earlier history omitted");
+  });
+
+  it("caps an oversized opening message instead of keeping it whole", () => {
+    // The opener is pinned, but pinned is not the same as unbounded: a single
+    // 70k-character first message used to walk straight past the budget.
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: `OPENING ${"o".repeat(70_000)}`, messageId: "user-1" }),
+      row(2, { type: "user_message", text: "middle", messageId: "user-2" }),
+      row(3, { type: "user_message", text: "THE LATEST TASK", messageId: "user-3" }),
+    ];
+
+    const result = buildAgentForkContextAttachment({ rows, maxChars: 2000 });
+
+    expect(result.attachment.text.length).toBeLessThan(2500);
+    expect(result.attachment.text).toContain("OPENING ooo");
+    expect(result.attachment.text).toContain("THE LATEST TASK");
+    expect(result.attachment.text).toContain("message truncated");
+  });
+
+  it("keeps the selected boundary message even when it alone exceeds the budget", () => {
+    // The newest entry of a bounded fork IS the message the user picked. The
+    // old tail loop broke on it and emitted a header claiming only "earlier"
+    // history had been dropped.
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: "THE ORIGINAL TASK", messageId: "user-1" }),
+      row(2, { type: "user_message", text: "middle", messageId: "user-2" }),
+      row(3, {
+        type: "assistant_message",
+        text: `BOUNDARY ${"b".repeat(70_000)}`,
+        messageId: "assistant-3",
+      }),
+    ];
+
+    const result = buildAgentForkContextAttachment({
+      rows,
+      boundaryMessageId: "assistant-3",
+      maxChars: 2000,
+    });
+
+    expect(result.attachment.text).toContain("THE ORIGINAL TASK");
+    expect(result.attachment.text).toContain("BOUNDARY bbb");
+    expect(result.attachment.text).toContain("message truncated");
+    expect(result.attachment.text.length).toBeLessThan(2500);
+  });
+
+  it("says in the header that history was omitted, not that it was cut short", () => {
+    const filler = "x".repeat(400);
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: "THE ORIGINAL TASK", messageId: "user-1" }),
+    ];
+    for (let index = 0; index < 20; index += 1) {
+      rows.push(
+        row(index + 2, {
+          type: "user_message",
+          text: `middle ${index} ${filler}`,
+          messageId: `user-mid-${index}`,
+        }),
+      );
+    }
+    rows.push(row(100, { type: "user_message", text: "THE LATEST TASK", messageId: "user-last" }));
+
+    const header = buildAgentForkContextAttachment({ rows, maxChars: 2000 }).attachment.text;
+
+    expect(header).toContain("Some earlier history was omitted");
+    expect(header).not.toContain("cut short");
+  });
+
+  it("says in the header that a message was cut short, not that history was dropped", () => {
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: `OPENING ${"o".repeat(9_000)}`, messageId: "user-1" }),
+      row(2, { type: "user_message", text: "THE LATEST TASK", messageId: "user-2" }),
+    ];
+
+    const header = buildAgentForkContextAttachment({ rows, maxChars: 2000 }).attachment.text;
+
+    // Nothing was dropped here: both entries are still present, one is shorter.
+    expect(header).toContain("cut short");
+    expect(header).not.toContain("Some earlier history was omitted");
+    expect(header).toContain("THE LATEST TASK");
+  });
+
+  it("reports both when history was dropped and a message was cut short", () => {
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: `OPENING ${"o".repeat(9_000)}`, messageId: "user-1" }),
+    ];
+    for (let index = 0; index < 20; index += 1) {
+      rows.push(
+        row(index + 2, {
+          type: "user_message",
+          text: `middle ${index} ${"x".repeat(400)}`,
+          messageId: `user-mid-${index}`,
+        }),
+      );
+    }
+    rows.push(row(100, { type: "user_message", text: "THE LATEST TASK", messageId: "user-last" }));
+
+    const header = buildAgentForkContextAttachment({ rows, maxChars: 2000 }).attachment.text;
+
+    expect(header).toContain("Some earlier history was omitted");
+    expect(header).toContain("cut short");
+  });
+
+  it("leaves a within-budget history untouched", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "small task", messageId: "user-1" }),
+        row(2, { type: "assistant_message", text: "small answer", messageId: "assistant-1" }),
+      ],
+      maxChars: 2000,
+    });
+
+    expect(result.attachment.text).not.toContain("earlier history omitted");
+    expect(result.attachment.text).toContain("small task");
+    expect(result.attachment.text).toContain("small answer");
+  });
+});
+
+describe("resolveForkBoundaryMessageId", () => {
+  const rows: AgentTimelineRow[] = [
+    row(1, { type: "user_message", text: "task", messageId: "user-1" }),
+    row(2, { type: "assistant_message", text: "answer", messageId: "assistant-1" }),
+    row(3, { type: "todo", items: [{ text: "step", completed: false }] }),
+  ];
+
+  it("returns null when no boundary was requested", () => {
+    expect(resolveForkBoundaryMessageId({ rows })).toBeNull();
+  });
+
+  it("resolves an assistant message id", () => {
+    expect(resolveForkBoundaryMessageId({ rows, boundaryMessageId: "assistant-1" })).toBe(
+      "assistant-1",
+    );
+  });
+
+  it("walks back from a cursor row that carries no message id", () => {
+    expect(
+      resolveForkBoundaryMessageId({
+        rows,
+        cursorBoundary: { timelineEpoch: "e1", cursor: { epoch: "e1", seq: 3 } },
+      }),
+    ).toBe("assistant-1");
+  });
+
+  it("rejects a stale cursor", () => {
+    expect(() =>
+      resolveForkBoundaryMessageId({
+        rows,
+        cursorBoundary: { timelineEpoch: "e2", cursor: { epoch: "e1", seq: 3 } },
+      }),
+    ).toThrow("Selected timeline position is no longer available.");
+  });
+
+  it("rejects a boundary with no provider message before it", () => {
+    expect(() =>
+      resolveForkBoundaryMessageId({
+        rows: [row(1, { type: "todo", items: [] })],
+        cursorBoundary: { timelineEpoch: "e1", cursor: { epoch: "e1", seq: 1 } },
+      }),
+    ).toThrow("no provider message");
+  });
+});
+
+describe("fork context compaction summary", () => {
+  const COMPACTED_ROWS = [
+    row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+    row(2, { type: "assistant_message", text: "ancient answer", messageId: "assistant-1" }),
+    row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+    row(4, { type: "user_message", text: "current task", messageId: "user-2" }),
+  ] as const;
+
+  it("carries the provider's compaction summary into the attachment body", () => {
+    // Without this the fork loses everything the compaction preserved: the
+    // pre-compaction turns are deliberately not replayed, and the summary that
+    // replaced them was never in the timeline to begin with.
+    const result = buildAgentForkContextAttachment({
+      rows: [...COMPACTED_ROWS],
+      compactionSummary: "The user was refactoring the payment adapter.",
+    });
+
+    expect(result.attachment.text).toContain("The user was refactoring the payment adapter.");
+    expect(result.attachment.text).toContain("[Compaction summary of the earlier conversation]");
+    expect(result.attachment.text).toContain("[Conversation since the compaction]");
+    expect(result.attachment.text).toContain("current task");
+    // The raw pre-compaction turns stay out; only their summary comes through.
+    expect(result.attachment.text).not.toContain("ancient answer");
+  });
+
+  it("says the earlier history is summarized, not dropped, when a summary exists", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [...COMPACTED_ROWS],
+      compactionSummary: "Earlier context.",
+    });
+
+    expect(result.attachment.text).toContain(
+      "represented by the provider's own compaction summary below",
+    );
+    expect(result.attachment.text).not.toContain("no compaction summary was available");
+  });
+
+  it("says the earlier history was dropped when no summary is available", () => {
+    // Non-Claude providers keep no summary; the header must not imply one.
+    const result = buildAgentForkContextAttachment({ rows: [...COMPACTED_ROWS] });
+
+    expect(result.attachment.text).toContain("no compaction summary was available");
+    expect(result.attachment.text).not.toContain("compaction summary below");
+  });
+
+  it("never degrades to the empty placeholder when the compaction is the last row", () => {
+    // A session compacted as its newest event has nothing left to replay, which
+    // used to produce an attachment that said only "No chat history to display".
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      ],
+      compactionSummary: "The user was refactoring the payment adapter.",
+    });
+
+    expect(result.attachment.text).not.toContain("No chat history to display.");
+    expect(result.attachment.text).toContain("The user was refactoring the payment adapter.");
+  });
+
+  it("still says so when there is neither history nor a summary", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      ],
+    });
+
+    expect(result.attachment.text).toContain("No chat history to display.");
+    expect(result.attachment.text).toContain("no compaction summary was available");
+  });
+
+  it("ignores a summary when the selection did not start at a compaction", () => {
+    // Nothing was skipped, so the pre-compaction history is already in the body
+    // and repeating its summary would double it.
+    const result = buildAgentForkContextAttachment({
+      rows: [row(1, { type: "user_message", text: "only task", messageId: "user-1" })],
+      compactionSummary: "Earlier context.",
+    });
+
+    expect(result.attachment.text).not.toContain("Earlier context.");
+    expect(result.attachment.text).not.toContain("Compaction summary");
+  });
+
+  it("keeps the summary inside the character budget, truncating rather than dropping it", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [...COMPACTED_ROWS],
+      compactionSummary: "S".repeat(5_000),
+      maxChars: 400,
+    });
+
+    expect(result.attachment.text).toContain("[Compaction summary of the earlier conversation]");
+    expect(result.attachment.text).toContain("message truncated to fit the context budget");
+    // Half the budget for the summary, the rest for the turns after it.
+    expect(result.attachment.text.length).toBeLessThan(400 + 600);
+    expect(result.attachment.text).toContain("current task");
+  });
+});
+
+describe("loadForkCompactionSummary", () => {
+  const compactedRows = [
+    row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+    row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+  ];
+
+  it("asks the provider only when the source was actually compacted", async () => {
+    const read = vi.fn(async () => "summary");
+    expect(await loadForkCompactionSummary({ agentId: "agent-1", rows: compactedRows, read })).toBe(
+      "summary",
+    );
+    // Unbounded fork: the whole session is in scope, so no bound is passed.
+    expect(read).toHaveBeenCalledWith("agent-1", { untilMessageId: null });
+  });
+
+  it("bounds the read at the fork point so a LATER compaction cannot supply the summary", async () => {
+    // compaction A -> the selected reply -> more conversation -> compaction B.
+    // Reading unbounded answers with B's summary: content from after the fork
+    // point, describing turns the fork does not contain.
+    const rows = [
+      row(1, { type: "user_message", text: "first", messageId: "user-1" }),
+      row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(3, { type: "assistant_message", text: "the selected reply", messageId: "msg_cut" }),
+      row(4, { type: "user_message", text: "later", messageId: "user-2" }),
+      row(5, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(6, { type: "assistant_message", text: "after B", messageId: "msg_after" }),
+    ];
+    const read = vi.fn(async () => "summary A");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        boundaryMessageId: "msg_cut",
+        read,
+      }),
+    ).toBe("summary A");
+    expect(read).toHaveBeenCalledWith("agent-1", { untilMessageId: "msg_cut" });
+  });
+
+  it("keeps content unique to a later compaction out of the attachment", async () => {
+    const rows = [
+      row(1, { type: "user_message", text: "first", messageId: "user-1" }),
+      row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(3, { type: "assistant_message", text: "the selected reply", messageId: "msg_cut" }),
+      row(4, { type: "user_message", text: "later", messageId: "user-2" }),
+      row(5, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(6, { type: "assistant_message", text: "after B", messageId: "msg_after" }),
+    ];
+    // Stands in for the provider transcript: unbounded reads answer with B.
+    const read = async (_agentId: string, options: { untilMessageId: string | null }) =>
+      options.untilMessageId === "msg_cut" ? "Summary A: adapter" : "Summary B: refund flow";
+
+    const attachment = buildAgentForkContextAttachment({
+      rows,
+      boundaryMessageId: "msg_cut",
+      compactionSummary: await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        boundaryMessageId: "msg_cut",
+        read,
+      }),
+    });
+
+    expect(attachment.attachment.text).toContain("Summary A: adapter");
+    expect(attachment.attachment.text).not.toContain("refund flow");
+    expect(attachment.attachment.text).not.toContain("after B");
+    expect(attachment.attachment.text).toContain(
+      "represented by the provider's own compaction summary below",
+    );
+  });
+
+  it("skips the read when no compaction happened at or before the boundary", async () => {
+    // The only compaction is AFTER the fork point, so nothing was summarized
+    // away from what the fork contains.
+    const rows = [
+      row(1, { type: "user_message", text: "first", messageId: "user-1" }),
+      row(2, { type: "assistant_message", text: "the selected reply", messageId: "msg_cut" }),
+      row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(4, { type: "assistant_message", text: "after", messageId: "msg_after" }),
+    ];
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        boundaryMessageId: "msg_cut",
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("refuses to read unbounded when a boundary names no provider message", async () => {
+    // Falling back to an unbounded read here is exactly the leak; answering
+    // "no summary" is the honest degradation.
+    const rows = [
+      row(1, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(2, { type: "todo", items: [] } as unknown as AgentTimelineItem),
+    ];
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        cursorBoundary: { timelineEpoch: "epoch-1", cursor: { epoch: "epoch-1", seq: 2 } },
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("skips the provider read when nothing was compacted away", async () => {
+    // Nothing was skipped, so there is no summary to add and no reason to read
+    // a transcript that can be megabytes.
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows: [row(1, { type: "user_message", text: "task", messageId: "user-1" })],
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("ignores a compaction that never completed", async () => {
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows: [row(1, { type: "compaction", status: "running", trigger: "auto" })],
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("degrades to no summary rather than failing the fork when the read throws", async () => {
+    const warn = vi.fn();
+    const read = vi.fn(() => Promise.reject(new Error("transcript unreadable")));
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows: compactedRows,
+        read,
+        logger: { warn } as unknown as Parameters<typeof loadForkCompactionSummary>[0]["logger"],
+      }),
+    ).toBeNull();
+    // Silently returning null would let the header claim a summary exists; the
+    // caller must be able to see that the read failed.
+    expect(warn).toHaveBeenCalled();
   });
 });

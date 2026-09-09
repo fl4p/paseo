@@ -301,6 +301,10 @@ export const ko: TranslationResources = {
       forkMenu: "여기에서 채팅 분기",
       forkInNewTab: "새 탭으로 분기",
       forkInNewWorkspace: "새 워크스페이스로 분기",
+      forkKeepsContext: "전체 컨텍스트와 프롬프트 캐시를 유지합니다",
+      forkKeepsContextFromLastTurn:
+        "완료된 마지막 응답까지 전체 컨텍스트와 프롬프트 캐시를 유지합니다",
+      forkCopiesSummary: "이 대화의 텍스트 요약을 복사합니다",
       forkUnavailable: "이를 사용하려면 호스트를 업데이트하세요.",
       forkMissingWorkspace: "이 에이전트는 워크스페이스에 속해 있지 않습니다.",
       forkFailed: "채팅을 분기하지 못했습니다.",
@@ -359,6 +363,10 @@ export const ko: TranslationResources = {
       manual: "컨텍스트가 수동으로 압축되었습니다",
       withTokens: "컨텍스트가 압축되었습니다 ({{tokens}}K 토큰)",
       completed: "컨텍스트가 압축되었습니다",
+    },
+    peer: {
+      from: "{{sender}}(으)로부터",
+      fromUnknown: "다른 세션에서",
     },
   },
   importSession: {

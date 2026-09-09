@@ -140,6 +140,19 @@ describe("Pi history mapper", () => {
     ]);
   });
 
+  test("skips replayed custom messages that Pi marks display:false", async () => {
+    await expect(
+      collectHistory([
+        {
+          role: "custom",
+          customType: "pi-plan-context",
+          display: false,
+          content: "[PLAN MODE ACTIVE]",
+        },
+      ]),
+    ).resolves.toEqual([]);
+  });
+
   test("uses Pi tree entry ids for replayed user messages", async () => {
     await expect(
       collectHistory(

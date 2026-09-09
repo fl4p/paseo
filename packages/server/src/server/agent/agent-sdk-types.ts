@@ -2,6 +2,7 @@ import type {
   AgentProviderNotice,
   AgentTaskItem,
   JsonValue,
+  PeerMessageOrigin,
   ProviderOptions,
   ToolPolicy,
 } from "@getpaseo/protocol/agent-types";
@@ -409,7 +410,13 @@ export interface PluginTimelineItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      origin?: PeerMessageOrigin;
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem
@@ -707,6 +714,51 @@ export interface AgentSession {
   revertConversation?(input: { messageId: string }): Promise<void>;
   revertFiles?(input: { messageId: string }): Promise<void>;
   revertBoth?(input: { messageId: string }): Promise<void>;
+  /**
+   * Provider-native fork: copy this session's own transcript into a fresh
+   * provider session and return its handle, without touching this session.
+   * The caller then imports that handle as a new paseo agent, which is what
+   * makes the fork inherit the source message prefix (warm prompt cache) and
+   * any compaction the provider already performed.
+   *
+   * Implemented only by providers whose session store supports branching;
+   * callers must feature-detect and fall back to a text-attachment fork.
+   */
+  forkProviderSession?(input: {
+    boundaryMessageId?: string | null;
+    /**
+     * A turn is in flight on this session, so its transcript is being appended
+     * to. Implementations must branch at the last COMPLETED turn rather than at
+     * the end of the file, so the fork never carries half of a streaming turn.
+     */
+    atCompletedTurn?: boolean;
+  }): Promise<{ providerHandleId: string }>;
+  /**
+   * The summary the provider wrote for the last completed compaction at or
+   * before `untilMessageId`, or `null` when there is none.
+   *
+   * The timeline keeps only a compaction MARKER (the summary is not shown as if
+   * the user had typed it), so the text-attachment fork -- which starts after
+   * the last compaction -- would otherwise drop everything the summary
+   * retained. Implemented only by providers that persist one; callers must
+   * treat `null` as "the pre-compaction history was dropped".
+   *
+   * `untilMessageId` is the fork point. Without it a fork bounded before a
+   * LATER compaction inherits that later summary, leaking content from after
+   * the fork point and describing turns the fork does not contain. `null` (or
+   * an omitted option) means the whole session, which is only correct for an
+   * unbounded fork.
+   */
+  readCompactionSummary?(input?: { untilMessageId?: string | null }): Promise<string | null>;
+  /**
+   * Delete a provider session this session previously forked, undoing an
+   * otherwise irreversible `forkProviderSession`.
+   *
+   * Only meaningful for the fork rollback path: the handle must name a fork,
+   * never this session's own store entry, and implementations must refuse
+   * anything else. Implemented alongside `forkProviderSession`.
+   */
+  deleteForkedProviderSession?(input: { providerHandleId: string }): Promise<void>;
   /**
    * Out-of-band prompt handler. When non-null, the manager runs the returned
    * handler instead of allocating a turn. The handler emits stream events

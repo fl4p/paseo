@@ -76,6 +76,7 @@ import {
   type PendingForegroundRun,
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
+import { ProviderForkUnsupportedError } from "./provider-fork.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
 import { resolveCreateAgentTitles } from "./create-agent-title.js";
@@ -1358,6 +1359,12 @@ export class AgentManager {
     cwd: string;
     workspaceId: string;
     labels?: Record<string, string>;
+    /**
+     * Settings the imported agent must start from. A native fork passes the
+     * source agent's config here so the fork does not silently land on the
+     * daemon's current defaults (which would also cost it the prompt cache).
+     */
+    config?: Partial<AgentSessionConfig>;
   }): Promise<ManagedAgent> {
     return this.trackAgentRegistrationOperation(this.importProviderSessionInternal(input));
   }
@@ -1368,6 +1375,7 @@ export class AgentManager {
     cwd: string;
     workspaceId: string;
     labels?: Record<string, string>;
+    config?: Partial<AgentSessionConfig>;
   }): Promise<ManagedAgent> {
     this.assertAcceptingAgentRegistrations();
     const resolvedAgentId = validateAgentId(this.idFactory(), "importProviderSession");
@@ -1380,6 +1388,7 @@ export class AgentManager {
 
     const { storedConfig, launchConfig, paseoToolPolicy } = await this.prepareSessionConfig(
       {
+        ...input.config,
         provider: input.provider,
         cwd: input.cwd,
       },
@@ -3059,6 +3068,87 @@ export class AgentManager {
     await this.hydrateTimelineFromLegacyProviderHistory(agent, options);
   }
 
+  /**
+   * Branch an agent's provider session, returning the new provider handle.
+   *
+   * The source agent is left running and untouched; the handle is meant to be
+   * handed to `importProviderSession` so the fork becomes its own agent that
+   * replays the source transcript (warm prompt cache, inherited compaction).
+   */
+  async forkProviderSession(
+    agentId: string,
+    input: { boundaryMessageId?: string | null; atCompletedTurn?: boolean },
+  ): Promise<{ providerHandleId: string; provider: AgentProvider; cwd: string }> {
+    const agent = this.requireSessionAgent(agentId);
+    const fork = agent.session.forkProviderSession;
+    if (!fork) {
+      throw new ProviderForkUnsupportedError(agent.provider);
+    }
+    const result = await fork.call(agent.session, {
+      boundaryMessageId: input.boundaryMessageId ?? null,
+      atCompletedTurn: input.atCompletedTurn === true,
+    });
+    this.logger.info(
+      {
+        agentId,
+        provider: agent.provider,
+        providerHandleId: result.providerHandleId,
+        boundaryMessageId: input.boundaryMessageId ?? null,
+        atCompletedTurn: input.atCompletedTurn === true,
+      },
+      "agent.fork_session.provider_fork",
+    );
+    return {
+      providerHandleId: result.providerHandleId,
+      provider: agent.provider,
+      cwd: agent.config.cwd,
+    };
+  }
+
+  /**
+   * The provider's own summary for the last completed compaction at or before
+   * `input.untilMessageId` on `agentId`, or `null` when the provider keeps
+   * none. Used to keep the text-attachment fork of a compacted session from
+   * losing everything the compaction summarized — and, via the bound, from
+   * inheriting the summary of a compaction that happened AFTER the fork point.
+   */
+  async readProviderCompactionSummary(
+    agentId: string,
+    input?: { untilMessageId?: string | null },
+  ): Promise<string | null> {
+    const agent = this.requireSessionAgent(agentId);
+    const read = agent.session.readCompactionSummary;
+    if (!read) {
+      return null;
+    }
+    return (
+      (await read.call(agent.session, { untilMessageId: input?.untilMessageId ?? null })) ?? null
+    );
+  }
+
+  /**
+   * Delete a provider session branched off `agentId` by `forkProviderSession`.
+   *
+   * Rollback only: the provider fork is irreversible, so a fork whose import
+   * fails afterwards would leave an orphan transcript that later shows up in
+   * the importable-sessions list.
+   */
+  async deleteForkedProviderSession(
+    agentId: string,
+    input: { providerHandleId: string },
+  ): Promise<void> {
+    const agent = this.requireSessionAgent(agentId);
+    const remove = agent.session.deleteForkedProviderSession;
+    if (!remove) {
+      throw new ProviderForkUnsupportedError(agent.provider);
+    }
+    await remove.call(agent.session, { providerHandleId: input.providerHandleId });
+    this.logger.info(
+      { agentId, provider: agent.provider, providerHandleId: input.providerHandleId },
+      "agent.fork_session.provider_fork_deleted",
+    );
+  }
+
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
     const agent = this.requireSessionAgent(agentId);
     const submittedRow = this.timelineStore
@@ -3378,7 +3468,7 @@ export class AgentManager {
       owner?: AgentOwner;
     },
   ): Promise<ManagedAgent> {
-    let registered = false;
+    let registeredAgent: ActiveManagedAgent | null = null;
     try {
       this.assertAcceptingAgentRegistrations();
       const resolvedAgentId = validateAgentId(agentId, "registerSession");
@@ -3409,7 +3499,7 @@ export class AgentManager {
 
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
-      registered = true;
+      registeredAgent = managed;
       // Initialize previousStatus to track transitions
       this.previousStatuses.set(resolvedAgentId, managed.lifecycle);
       await this.refreshRuntimeInfo(managed, { emit: false });
@@ -3432,11 +3522,68 @@ export class AgentManager {
       this.subscribeToSession(managed);
       return { ...managed };
     } catch (error) {
-      if (!registered) {
+      if (registeredAgent) {
+        await this.unwindFailedRegistration(registeredAgent, session);
+      } else {
         await this.closeUnregisteredSession(session);
       }
       throw error;
     }
+  }
+
+  /**
+   * Undo a registration whose later steps failed.
+   *
+   * `registerSession` puts the agent into `this.agents` BEFORE the persistence
+   * writes that follow it, so a failure in any of them used to answer the
+   * caller with an error while a live agent record stayed behind. A caller that
+   * treats its own failure as atomic then rolls back what IT created: the
+   * native fork deletes the branched provider transcript, and the surviving
+   * record is left pointing at a file that is gone, so resuming it loses the
+   * provider history the fork existed to keep.
+   *
+   * The registration is this method's own, so it unwinds it here rather than
+   * asking every caller to clean up a half-built agent it cannot see. The
+   * caller keeps and reports the ORIGINAL error: every step below is best
+   * effort and a failure is logged, never thrown.
+   *
+   * Skipped when `this.agents` no longer holds the record we put there — a
+   * concurrent close or a shutdown already took ownership of it, and removing
+   * someone else's agent would be worse than leaking ours.
+   */
+  private async unwindFailedRegistration(
+    agent: ActiveManagedAgent,
+    session: AgentSession,
+  ): Promise<void> {
+    if (this.agents.get(agent.id) !== agent) {
+      return;
+    }
+    // Same in-memory teardown a close performs, minus the events: this agent
+    // must end up as if it had never been registered, not as a closed one.
+    this.prepareAgentForClosure(agent, "agent registration failed");
+    await this.closeUnregisteredSession(session);
+    try {
+      await this.deleteAgentState(agent.id);
+    } catch (error) {
+      this.logger.warn(
+        { err: error, agentId: agent.id },
+        "agent.register.unwind_state_failed: retained state may survive a failed registration",
+      );
+    }
+    try {
+      // Snapshot writes may already have landed; without this the agent comes
+      // back on the next daemon start, still pointing at a rolled-back session.
+      await this.registry?.remove(agent.id);
+    } catch (error) {
+      this.logger.warn(
+        { err: error, agentId: agent.id },
+        "agent.register.unwind_snapshot_failed: a durable record may survive a failed registration",
+      );
+    }
+    this.logger.warn(
+      { agentId: agent.id },
+      "agent.register.unwound: removed the agent registered by a failed registerSession",
+    );
   }
 
   private assertAcceptingAgentRegistrations(): void {

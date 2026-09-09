@@ -705,6 +705,12 @@ const ToolCallTimelineItemPayloadSchema: z.ZodType<ToolCallTimelineItem, unknown
     ToolCallCanceledPayloadSchema,
   ]);
 
+const PeerMessageOriginSchema = z.object({
+  kind: z.literal("peer"),
+  name: z.string().optional(),
+  address: z.string().optional(),
+});
+
 // zod-aot 0.20.4 miscompiles this as a nested discriminated union by omitting
 // the inner tool_call branch from the generated outer dispatch.
 export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknown> = z.union([
@@ -713,6 +719,7 @@ export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknow
     text: z.string(),
     messageId: z.string().optional(),
     clientMessageId: z.string().optional(),
+    origin: PeerMessageOriginSchema.optional(),
   }),
   z.object({
     type: z.literal("assistant_message"),
@@ -1862,6 +1869,35 @@ export const AgentForkContextRequestMessageSchema = z.object({
   agentId: z.string(),
   boundaryCursor: AgentTimelineCursorSchema.optional(),
   boundaryMessageId: z.string().optional(),
+  requestId: z.string(),
+});
+
+/**
+ * Provider-native fork. Unlike `agent.fork_context.request` — which renders the
+ * transcript into a text attachment for a brand-new session — this asks the
+ * daemon to fork the *provider's own* session file, so the new agent inherits
+ * the source message prefix (prompt cache stays warm) and any compaction the
+ * provider already performed.
+ *
+ * COMPAT(agentForkSession): new message type, added in v0.8.0. Only clients
+ * that see `features.agentForkSession` on the daemon may send it, and only
+ * those clients ever receive `agent.fork_session.response`, so peers built
+ * before this message existed never have to parse it.
+ */
+export const AgentForkSessionRequestMessageSchema = z.object({
+  type: z.literal("agent.fork_session.request"),
+  agentId: z.string(),
+  /** Same selection semantics as `agent.fork_context.request`. */
+  boundaryCursor: AgentTimelineCursorSchema.optional(),
+  boundaryMessageId: z.string().optional(),
+  /**
+   * Directory the forked agent must run in. The daemon rejects the request when
+   * it does not match the source agent's cwd: a provider transcript is keyed by
+   * project directory, so a cross-cwd fork would resume against a different
+   * store. Omit to inherit the source cwd.
+   */
+  cwd: z.string().optional(),
+  workspaceId: z.string().optional(),
   requestId: z.string(),
 });
 
@@ -3174,6 +3210,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   ProviderSubagentStopRequestMessageSchema,
   SetAgentTimelineSubscriptionRequestMessageSchema,
   AgentForkContextRequestMessageSchema,
+  AgentForkSessionRequestMessageSchema,
   SetAgentModeRequestMessageSchema,
   SetAgentModelRequestMessageSchema,
   SetAgentThinkingRequestMessageSchema,
@@ -3548,6 +3585,10 @@ export const ServerInfoStatusPayloadSchema = z
         agentForkContext: z.boolean().optional(),
         // COMPAT(agentForkContextCursor): added in v0.1.108, remove gate after 2027-01-14.
         agentForkContextCursor: z.boolean().optional(),
+        // COMPAT(agentForkSession): added in v0.8.0, remove gate after 2027-03-09.
+        // Gates `agent.fork_session.request`; absent on daemons that only know
+        // the text-attachment fork.
+        agentForkSession: z.boolean().optional(),
         // COMPAT(providerSubagents): added in v0.1.107, remove gate after 2027-01-12.
         providerSubagents: z.boolean().optional(),
         // COMPAT(providerSubagentNesting): added in v0.7, remove gate after 2027-03-04.
@@ -4665,6 +4706,21 @@ export const AgentForkContextResponseMessageSchema = z.object({
     itemCount: z.number().int().nonnegative(),
     boundaryMessageId: z.string().nullable(),
     boundaryCursor: AgentTimelineCursorSchema.nullable().optional(),
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentForkSessionResponseMessageSchema = z.object({
+  type: z.literal("agent.fork_session.response"),
+  payload: z.object({
+    requestId: z.string(),
+    /** The source agent that was forked. */
+    agentId: z.string(),
+    /** The agent created from the forked provider session, when the fork succeeded. */
+    forkedAgentId: z.string().nullable(),
+    /** Provider-level handle (for Claude: the new session UUID) of the fork. */
+    providerHandleId: z.string().nullable(),
+    timelineSize: z.number().int().nonnegative().nullable().optional(),
     error: z.string().nullable(),
   }),
 });
@@ -6576,6 +6632,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   SetAgentTimelineSubscriptionResponseMessageSchema,
   AgentAttentionRequiredMessageSchema,
   AgentForkContextResponseMessageSchema,
+  AgentForkSessionResponseMessageSchema,
   CancelAgentResponseMessageSchema,
   ClearAgentAttentionResponseMessageSchema,
   WorkspaceCreateResponseSchema,
@@ -6790,6 +6847,7 @@ export type AgentTimelineListPromptsResponseMessage = z.infer<
   typeof AgentTimelineListPromptsResponseMessageSchema
 >;
 export type AgentForkContextResponseMessage = z.infer<typeof AgentForkContextResponseMessageSchema>;
+export type AgentForkSessionResponseMessage = z.infer<typeof AgentForkSessionResponseMessageSchema>;
 export type CancelAgentResponseMessage = z.infer<typeof CancelAgentResponseMessageSchema>;
 export type SendAgentMessageResponseMessage = z.infer<typeof SendAgentMessageResponseMessageSchema>;
 export type SetVoiceModeResponseMessage = z.infer<typeof SetVoiceModeResponseMessageSchema>;
@@ -6894,6 +6952,7 @@ export type FetchWorkspacesRequestMessage = z.infer<typeof FetchWorkspacesReques
 export type ProjectListRequestMessage = z.infer<typeof ProjectListRequestMessageSchema>;
 export type FetchAgentRequestMessage = z.infer<typeof FetchAgentRequestMessageSchema>;
 export type AgentForkContextRequestMessage = z.infer<typeof AgentForkContextRequestMessageSchema>;
+export type AgentForkSessionRequestMessage = z.infer<typeof AgentForkSessionRequestMessageSchema>;
 export type SendAgentMessageRequest = z.infer<typeof SendAgentMessageRequestSchema>;
 export type WaitForFinishRequest = z.infer<typeof WaitForFinishRequestSchema>;
 export type DictationStreamStartMessage = z.infer<typeof DictationStreamStartMessageSchema>;

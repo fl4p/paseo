@@ -58,6 +58,35 @@ export function createRealpathAwarePathMatcher(target: string): (candidate: stri
   };
 }
 
+/**
+ * Do two paths name the SAME real directory?
+ *
+ * The strict counterpart to `createRealpathAwarePathMatcher`. That one collects
+ * the lexical AND the realpath spelling of both sides and answers true when ANY
+ * variant of one matches ANY variant of the other. That union is right for
+ * filtering ("could this candidate be the target?") and wrong for identity:
+ * with `source/link -> other/child`, the path `source/link/..` normalizes
+ * lexically to `source` and so matches a target of `source`, while the
+ * directory it actually names is `other`.
+ *
+ * `normalizePathForIdentity` canonicalizes through realpath but falls back to
+ * the raw string when the path cannot be resolved, so two paths that do not
+ * exist still compare equal. Here resolution is a PRECONDITION: an unresolvable
+ * path matches nothing, including itself.
+ *
+ * Both sides go through the same resolver, so a case-insensitive filesystem
+ * folds them onto the same on-disk spelling and a genuinely distinct directory
+ * (a second git worktree, say) still compares unequal.
+ */
+export function isSameRealDirectory(left: string, right: string): boolean {
+  const leftReal = resolveRealpathVariants(left)[0];
+  const rightReal = resolveRealpathVariants(right)[0];
+  if (leftReal === undefined || rightReal === undefined) {
+    return false;
+  }
+  return areEquivalentPaths(leftReal, rightReal);
+}
+
 export function isPathInsideRoot(root: string, candidate: string): boolean {
   return getRelativePathInsideRoot(root, candidate) !== null;
 }

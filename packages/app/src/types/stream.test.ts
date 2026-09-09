@@ -149,6 +149,61 @@ describe("user message identity", () => {
     );
   });
 
+  it("keeps the sender on a peer message", () => {
+    const result = applyStreamEvent({
+      tail: [],
+      head: [],
+      event: {
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "user_message",
+          text: "I changed things under you on farmgw.",
+          messageId: "peer-1",
+          origin: { kind: "peer", name: "dragino", address: "uds:/tmp/cc-socks/65428.sock" },
+        },
+      },
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+    });
+
+    expect(result.tail[0]).toEqual(
+      expect.objectContaining({
+        kind: "user_message",
+        messageId: "peer-1",
+        origin: { kind: "peer", name: "dragino", address: "uds:/tmp/cc-socks/65428.sock" },
+      }),
+    );
+  });
+
+  it("does not reconcile a peer message into a local submission that shares its text", () => {
+    const optimistic = createUserMessage({
+      clientMessageId: "hello-client",
+      text: "hello",
+      timestamp: new Date("2026-08-15T10:00:00Z"),
+    });
+
+    const result = applyStreamEvent({
+      tail: [optimistic],
+      head: [],
+      event: {
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "user_message",
+          text: "hello",
+          messageId: "peer-1",
+          origin: { kind: "peer", name: "dragino" },
+        },
+      },
+      timestamp: new Date("2026-08-15T10:00:01Z"),
+    });
+
+    expect(result.tail).toHaveLength(2);
+    expect(result.tail[1]).toEqual(
+      expect.objectContaining({ messageId: "peer-1", origin: { kind: "peer", name: "dragino" } }),
+    );
+  });
+
   it("clears provisional optimistic turn membership for a legacy canonical row", () => {
     const optimistic = createUserMessage({
       clientMessageId: "hello-client",
@@ -1370,6 +1425,56 @@ describe("stream reducer canonical tool calls", () => {
       state.some((item) => item.kind === "compaction" && item.status === "loading"),
       false,
     );
+  });
+
+  it("keeps a single spinner when a provider repeats the loading compaction", () => {
+    const state = hydrateStreamState([
+      {
+        event: compactionTimeline("loading"),
+        timestamp: new Date("2025-01-01T10:50:00Z"),
+      },
+      {
+        event: compactionTimeline("loading"),
+        timestamp: new Date("2025-01-01T10:50:01Z"),
+      },
+      {
+        event: compactionTimeline("loading"),
+        timestamp: new Date("2025-01-01T10:50:02Z"),
+      },
+      {
+        event: compactionTimeline("completed", "manual"),
+        timestamp: new Date("2025-01-01T10:50:03Z"),
+      },
+    ]);
+
+    const compactions = state.filter(
+      (item): item is Extract<StreamItem, { kind: "compaction" }> => item.kind === "compaction",
+    );
+
+    assert.strictEqual(compactions.length, 1);
+    assert.strictEqual(compactions[0].status, "completed");
+    assert.strictEqual(compactions[0].trigger, "manual");
+  });
+
+  it("stops the compaction spinner when the turn ends without a completion event", () => {
+    const state = hydrateStreamState([
+      {
+        event: compactionTimeline("loading", "manual"),
+        timestamp: new Date("2025-01-01T10:50:00Z"),
+      },
+      {
+        event: { type: "turn_completed", provider: "pi" },
+        timestamp: new Date("2025-01-01T10:50:05Z"),
+      },
+    ]);
+
+    const compactions = state.filter(
+      (item): item is Extract<StreamItem, { kind: "compaction" }> => item.kind === "compaction",
+    );
+
+    assert.strictEqual(compactions.length, 1);
+    assert.strictEqual(compactions[0].status, "completed");
+    assert.strictEqual(compactions[0].trigger, "manual");
   });
 
   it("renders Claude TodoWrite as todo_list and suppresses tool call badge", () => {

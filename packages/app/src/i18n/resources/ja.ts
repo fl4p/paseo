@@ -303,6 +303,10 @@ export const ja: TranslationResources = {
       forkMenu: "メッセージをフォーク",
       forkInNewTab: "新しいタブにフォーク",
       forkInNewWorkspace: "新しいワークスペースにフォーク",
+      forkKeepsContext: "完全なコンテキストとプロンプトキャッシュを維持します",
+      forkKeepsContextFromLastTurn:
+        "完全なコンテキストとプロンプトキャッシュを、完了した最後の応答まで維持します",
+      forkCopiesSummary: "このチャットのテキスト要約をコピーします",
       forkUnavailable: "これを使用するにはホストを更新してください。",
       forkMissingWorkspace: "このエージェントはワークスペース内にありません。",
       forkFailed: "チャットのフォークに失敗しました",
@@ -361,6 +365,10 @@ export const ja: TranslationResources = {
       manual: "コンテキストが手動で圧縮されました",
       withTokens: "コンテキストを圧縮しました（{{tokens}}Kトークン）",
       completed: "コンテキストを圧縮しました",
+    },
+    peer: {
+      from: "{{sender}} から",
+      fromUnknown: "別のセッションから",
     },
   },
   importSession: {

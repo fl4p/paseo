@@ -300,6 +300,10 @@ export const ar: TranslationResources = {
       forkMenu: "تفريع الرسالة",
       forkInNewTab: "تفريع في تبويب جديد",
       forkInNewWorkspace: "تفريع في مساحة عمل جديدة",
+      forkKeepsContext: "يحتفظ بالسياق الكامل وذاكرة التخزين المؤقت للمطالبات",
+      forkKeepsContextFromLastTurn:
+        "يحتفظ بالسياق الكامل وذاكرة التخزين المؤقت للمطالبات حتى آخر رد مكتمل",
+      forkCopiesSummary: "ينسخ ملخصًا نصيًا لهذه المحادثة",
       forkUnavailable: "حدّث المضيف لاستخدام هذا.",
       forkMissingWorkspace: "هذا الوكيل ليس في مساحة عمل.",
       forkFailed: "فشل تفريع المحادثة",
@@ -358,6 +362,10 @@ export const ar: TranslationResources = {
       manual: "تم ضغط السياق يدويًا",
       withTokens: "تم ضغط السياق (رموز{{tokens}}K)",
       completed: "تم ضغط السياق",
+    },
+    peer: {
+      from: "من {{sender}}",
+      fromUnknown: "من جلسة أخرى",
     },
   },
   importSession: {

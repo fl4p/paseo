@@ -111,6 +111,12 @@ const TaskActivitySchema = z.discriminatedUnion("type", [
   }),
 ]);
 
+const StoredPeerMessageOriginSchema = z.strictObject({
+  kind: z.literal("peer"),
+  name: z.string().optional(),
+  address: z.string().optional(),
+});
+
 const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
   z.strictObject({
     ...TimelineItemBaseShape,
@@ -118,6 +124,7 @@ const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
     clientMessageId: z.string().optional(),
     messageId: z.string().optional(),
     text: z.string(),
+    origin: StoredPeerMessageOriginSchema.optional(),
   }),
   z.strictObject({
     ...TimelineItemBaseShape,
@@ -428,6 +435,7 @@ function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {
         ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
         ...(item.messageId ? { messageId: item.messageId } : {}),
         text: item.text,
+        ...(item.origin ? { origin: item.origin } : {}),
       };
     case "assistant_message":
       return {
@@ -520,6 +528,7 @@ function deserializeBuiltinTimelineItem(
         ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
         ...(item.messageId ? { messageId: item.messageId } : {}),
         text: item.text,
+        ...(item.origin ? { origin: item.origin } : {}),
       };
     case "assistant_message":
       return {

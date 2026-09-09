@@ -298,6 +298,10 @@ export const en = {
       forkMenu: "Fork chat from here",
       forkInNewTab: "Fork in a new tab",
       forkInNewWorkspace: "Fork in a new workspace",
+      forkKeepsContext: "Keeps the full context and prompt cache",
+      forkKeepsContextFromLastTurn:
+        "Keeps the full context and prompt cache, up to the last completed reply",
+      forkCopiesSummary: "Copies a text summary of this chat",
       forkUnavailable: "Update the host to use this.",
       forkMissingWorkspace: "This agent is not in a workspace.",
       forkFailed: "Failed to fork chat",
@@ -356,6 +360,10 @@ export const en = {
       manual: "Context manually compacted",
       withTokens: "Context compacted ({{tokens}}K tokens)",
       completed: "Context compacted",
+    },
+    peer: {
+      from: "From {{sender}}",
+      fromUnknown: "From another session",
     },
   },
   importSession: {

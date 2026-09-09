@@ -1042,3 +1042,86 @@ test("auto-completes an open autonomous turn when a foreground prompt starts", a
   subscribedEvents.close();
   await session.close();
 });
+
+/**
+ * An interrupted compaction never reaches `appendResultEvents` — the aborted result is suppressed
+ * as stale — so the marker has to be terminalized on the cancel path itself. Leaving it open is
+ * worse than the spinner it replaced: the flag that suppresses duplicate markers would then
+ * silently swallow the NEXT real compaction's marker.
+ */
+test("interrupting a compaction closes its marker and leaves the next compaction visible", async () => {
+  const sessionId = "compaction-interrupt-session";
+  let query: ScriptedQuery | null = null;
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    query = createScriptedQuery({
+      prompt,
+      sessionId,
+      async handlePrompt({ query: scripted }) {
+        scripted.emit({
+          type: "system",
+          subtype: "status",
+          status: "compacting",
+          session_id: sessionId,
+        });
+      },
+    });
+    return query;
+  });
+
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+
+  const observed: AgentStreamEvent[] = [];
+  const unsubscribe = session.subscribe((event) => {
+    observed.push(event);
+  });
+
+  const turn = streamSession(session, "compact this");
+  await turn.next();
+  await waitFor(() =>
+    observed.some(
+      (event) =>
+        event.type === "timeline" &&
+        event.item.type === "compaction" &&
+        event.item.status === "loading",
+    ),
+  );
+
+  await session.interrupt();
+  await collectUntilTerminal(turn);
+  query?.emit(buildAbortedResult(sessionId));
+
+  const canceledIndex = observed.findIndex((event) => event.type === "turn_canceled");
+  expect(canceledIndex).toBeGreaterThanOrEqual(0);
+  const closedIndex = observed.findIndex(
+    (event) =>
+      event.type === "timeline" &&
+      event.item.type === "compaction" &&
+      event.item.status === "completed",
+  );
+  expect(closedIndex).toBeGreaterThanOrEqual(0);
+  expect(closedIndex).toBeLessThan(canceledIndex);
+
+  // The next compaction must still announce itself.
+  query?.emit({
+    type: "system",
+    subtype: "status",
+    status: "compacting",
+    session_id: sessionId,
+  });
+  await waitFor(
+    () =>
+      observed.filter(
+        (event) =>
+          event.type === "timeline" &&
+          event.item.type === "compaction" &&
+          event.item.status === "loading",
+      ).length === 2,
+  );
+
+  unsubscribe();
+  await session.close();
+});

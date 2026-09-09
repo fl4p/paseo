@@ -2,6 +2,7 @@ import type { SessionEventSubscription } from "@getpaseo/protocol/messages";
 import type { AgentRequests } from "./agent/requests/index.js";
 import equal from "fast-deep-equal";
 import { v4 as uuidv4 } from "uuid";
+import { existsSync } from "node:fs";
 import { lstat, mkdir, mkdtemp, rename, rm, stat } from "node:fs/promises";
 import { basename, resolve, sep } from "path";
 import { homedir } from "node:os";
@@ -122,7 +123,11 @@ import {
   type TimelineProjectionEntry,
   type TimelineProjectionMode,
 } from "./agent/timeline-projection.js";
-import { buildAgentForkContextAttachment } from "./agent/activity-curator.js";
+import {
+  buildAgentForkContextAttachment,
+  loadForkCompactionSummary,
+} from "./agent/activity-curator.js";
+import { forkAgentSessionNatively, type ForkAgentSessionDeps } from "./agent/fork-agent-session.js";
 import { buildAgentPrompt } from "./agent/prompt-attachments.js";
 import type { StructuredGenerationDaemonConfig } from "./agent/structured-generation-providers.js";
 import {
@@ -2369,6 +2374,8 @@ export class Session {
       }
       case "agent.fork_context.request":
         return this.handleAgentForkContextRequest(msg);
+      case "agent.fork_session.request":
+        return this.handleAgentForkSessionRequest(msg);
       default:
         return undefined;
     }
@@ -7572,6 +7579,17 @@ export class Session {
         boundaryMessageId: msg.boundaryMessageId,
         agentTitle: agentPayload.title,
         cwd: snapshot.cwd,
+        compactionSummary: await loadForkCompactionSummary({
+          agentId: msg.agentId,
+          rows: timeline.rows,
+          cursorBoundary: msg.boundaryCursor
+            ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
+            : null,
+          boundaryMessageId: msg.boundaryMessageId,
+          read: (agentId, options) =>
+            this.agentManager.readProviderCompactionSummary(agentId, options),
+          logger: this.sessionLogger,
+        }),
       });
 
       this.emit({
@@ -7604,6 +7622,127 @@ export class Session {
         },
       });
     }
+  }
+
+  /**
+   * Provider-native fork.
+   *
+   * Unlike the text-attachment fork, this branches the provider's own session
+   * file and imports the branch as a new agent, so the fork keeps the source
+   * message prefix (the prompt cache is a prefix match, so it stays warm) and
+   * inherits any compaction the provider already performed instead of
+   * re-inflating the pre-compaction history.
+   */
+  private async handleAgentForkSessionRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.fork_session.request" }>,
+  ): Promise<void> {
+    // Forking clones a transcript, so it demands at least the read authority
+    // `agent.fork_context.request` demands — otherwise a write-but-not-read
+    // principal could clone a transcript it may not export and then prompt the
+    // clone to reveal it. The permission table cannot express the AND (its
+    // requirement lists are OR-ed), so the read half is checked here while the
+    // table keeps enforcing the write half.
+    if (!this.authorization.allowsPermission("workspace.read")) {
+      this.emit({
+        type: "rpc_error",
+        payload: {
+          requestId: msg.requestId,
+          requestType: msg.type,
+          error: `Session is not authorized for ${msg.type}`,
+          code: "access_denied",
+        },
+      });
+      return;
+    }
+    try {
+      const forked = await forkAgentSessionNatively(msg, this.buildForkAgentSessionDeps());
+      this.emit({
+        type: "agent.fork_session.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          forkedAgentId: forked.agentId,
+          providerHandleId: forked.providerHandleId,
+          timelineSize: forked.timelineSize,
+          error: null,
+        },
+      });
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId: msg.agentId },
+        "Failed to handle agent.fork_session.request",
+      );
+      this.emit({
+        type: "agent.fork_session.response",
+        payload: {
+          requestId: msg.requestId,
+          agentId: msg.agentId,
+          forkedAgentId: null,
+          providerHandleId: null,
+          timelineSize: null,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      });
+    }
+  }
+
+  private buildForkAgentSessionDeps(): ForkAgentSessionDeps {
+    return {
+      loadAgent: async (agentId) => {
+        const snapshot = await ensureAgentLoaded(agentId, {
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        });
+        return { cwd: snapshot.cwd, workspaceId: snapshot.workspaceId, config: snapshot.config };
+      },
+      fetchTimeline: (agentId) =>
+        this.agentManager.fetchTimeline(agentId, {
+          direction: "tail",
+          limit: 0,
+        }),
+      validateForkTarget: async (input) => {
+        // The provider fork is irreversible, so everything knowable up front is
+        // checked up front: a removed directory and an absent, archived or
+        // mismatched workspace all fail here rather than after a branch has
+        // been written to the provider's session store.
+        if (!existsSync(input.cwd)) {
+          throw new Error(`Cannot fork: the source directory no longer exists (${input.cwd})`);
+        }
+        await this.workspaceProvisioning.assertImportWorkspaceUsable({
+          cwd: input.cwd,
+          ...(input.workspaceId ? { requestedWorkspaceId: input.workspaceId } : {}),
+        });
+      },
+      hasInFlightRun: (agentId) => this.agentManager.hasInFlightRun(agentId),
+      forkProviderSession: (agentId, input) =>
+        this.agentManager.forkProviderSession(agentId, input),
+      deleteForkedProviderSession: (agentId, input) =>
+        this.agentManager.deleteForkedProviderSession(agentId, input),
+      importProviderSession: async (input) => {
+        const imported = await importProviderSession({
+          request: {
+            provider: input.provider,
+            providerHandleId: input.providerHandleId,
+            cwd: input.cwd,
+            workspaceId: input.workspaceId,
+            requestId: input.requestId,
+            config: input.config,
+          },
+          workspaceProvisioning: this.workspaceProvisioning,
+          agentManager: this.agentManager,
+          agentStorage: this.agentStorage,
+          logger: this.sessionLogger,
+        });
+        return {
+          agentId: imported.snapshot.id,
+          timelineSize: imported.timelineSize,
+          createdWorkspace: imported.createdWorkspace,
+        };
+      },
+      registerCreatedWorkspace: (workspace) => this.registerWorkspaceForImportedAgent(workspace),
+      logger: this.sessionLogger,
+    };
   }
 
   private async handleSendAgentMessageRequest(

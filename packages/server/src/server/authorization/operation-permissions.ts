@@ -10,6 +10,12 @@ const INBOUND_PERMISSION = {
   "agent.config.apply.request": ["workspace.write", "hub.execute"],
   "agent.detach.request": "workspace.write",
   "agent.fork_context.request": "workspace.read",
+  // A native fork clones a transcript, so it needs at least the read authority
+  // the transcript-export fork above needs, PLUS the write authority creating an
+  // agent needs. Requirement lists are OR-ed (see SessionAuthorization.allows),
+  // so this table can only express one half: the write half lives here and the
+  // read half is enforced in the handler (handleAgentForkSessionRequest).
+  "agent.fork_session.request": "workspace.write",
   "agent.provider_subagents.list.request": "workspace.read",
   "agent.provider_subagents.timeline.get.request": "workspace.read",
   "agent.provider_subagents.stop.request": "workspace.write",
@@ -211,6 +217,10 @@ const OUTBOUND_PERMISSION = {
   "agent.config.apply.response": ["workspace.write", "hub.execute"],
   "agent.detach.response": "workspace.write",
   "agent.fork_context.response": "workspace.read",
+  // Same reasoning as the request: only a principal that may read the source
+  // workspace may see the fork of it, and OR semantics means naming the read
+  // half here is the tighter of the two.
+  "agent.fork_session.response": "workspace.read",
   "agent.provider_subagents.list.response": "workspace.read",
   "agent.provider_subagents.timeline.get.response": "workspace.read",
   "agent.provider_subagents.stop.response": "workspace.write",

@@ -7,7 +7,11 @@ import type {
   ManagedImportableProviderSession,
 } from "./agent-manager.js";
 import type { AgentStorage, StoredAgentRecord } from "./agent-storage.js";
-import type { AgentPersistenceHandle, AgentProvider } from "./agent-sdk-types.js";
+import type {
+  AgentPersistenceHandle,
+  AgentProvider,
+  AgentSessionConfig,
+} from "./agent-sdk-types.js";
 import { ensureAgentLoaded, type AgentLoaderManager } from "./agent-loading.js";
 import { unarchiveAgentState } from "./agent-prompt.js";
 import { toRecentProviderSessionDescriptorPayload } from "./agent-projections.js";
@@ -49,6 +53,12 @@ export interface NormalizedImportAgentRequest {
   workspaceId?: string;
   labels?: Record<string, string>;
   requestId: string;
+  /**
+   * Settings the new agent must start from instead of the daemon defaults.
+   * Only the native fork sets this, to keep the fork on the source agent's
+   * model, permission mode, tools and provider options.
+   */
+  config?: Partial<AgentSessionConfig>;
 }
 
 export class ImportSessionsRequestError extends Error {
@@ -204,7 +214,7 @@ async function importProviderSessionNow(
   cwd: string,
   workspaceId: string,
 ): Promise<ImportedProviderSession> {
-  const { provider, providerHandleId, labels } = input.request;
+  const { provider, providerHandleId, labels, config } = input.request;
 
   const matchingRecords = await input.agentStorage.listByProviderSession(
     provider,
@@ -253,6 +263,7 @@ async function importProviderSessionNow(
     cwd,
     workspaceId,
     labels,
+    ...(config ? { config } : {}),
   });
   await unarchiveAgentState(input.agentStorage, input.agentManager, snapshot.id);
 

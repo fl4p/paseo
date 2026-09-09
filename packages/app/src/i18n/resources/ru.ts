@@ -302,6 +302,10 @@ export const ru: TranslationResources = {
       forkMenu: "Форкнуть чат отсюда",
       forkInNewTab: "Создать форк в новой вкладке",
       forkInNewWorkspace: "Создать форк в новом рабочем пространстве",
+      forkKeepsContext: "Сохраняет полный контекст и кэш промптов",
+      forkKeepsContextFromLastTurn:
+        "Сохраняет полный контекст и кэш промптов до последнего завершённого ответа",
+      forkCopiesSummary: "Копирует текстовую сводку этого чата",
       forkUnavailable: "Обновите хост, чтобы использовать эту функцию.",
       forkMissingWorkspace: "Этот агент не связан с рабочим пространством.",
       forkFailed: "Не удалось создать форк чата",
@@ -360,6 +364,10 @@ export const ru: TranslationResources = {
       manual: "Контекст сжат вручную",
       withTokens: "Контекст сжат ({{tokens}} тыс. токенов)",
       completed: "Контекст сжат",
+    },
+    peer: {
+      from: "От {{sender}}",
+      fromUnknown: "Из другой сессии",
     },
   },
   importSession: {

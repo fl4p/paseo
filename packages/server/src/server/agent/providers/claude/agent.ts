@@ -44,6 +44,7 @@ import {
 } from "./model-manifest.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
+import { readClaudePeerMessage } from "./peer-message.js";
 import { ClaudeTaskState } from "./task-state.js";
 import {
   ClaudeTaskProtocolSource,
@@ -77,6 +78,12 @@ import {
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
 import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
+import {
+  createClaudeForkTranscriptStore,
+  deleteForkedClaudeSession,
+  forkClaudeSession,
+} from "./fork-session.js";
+import { readClaudeCompactSummary } from "./compact-summary.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
@@ -2103,6 +2110,10 @@ class ClaudeAgentSession implements AgentSession {
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
   private compacting = false;
+  /** A `compaction`/`loading` marker has been emitted and not yet terminalized. */
+  private compactionMarkerOpen = false;
+  /** The open marker was terminalized by something other than a `compact_boundary`. */
+  private compactionMarkerClosedWithoutBoundary = false;
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
   private pendingInterruptAbort = false;
@@ -2834,6 +2845,83 @@ class ClaudeAgentSession implements AgentSession {
     await this.revertConversation(input);
   }
 
+  /**
+   * Branch this session's transcript into a new Claude session file and hand
+   * back its id. The live session is untouched — the caller imports the
+   * returned handle as a separate paseo agent.
+   */
+  async forkProviderSession(input: {
+    boundaryMessageId?: string | null;
+    atCompletedTurn?: boolean;
+  }): Promise<{ providerHandleId: string }> {
+    const sessionId = this.claudeSessionId;
+    const fork = await forkClaudeSession({
+      sdk: realClaudeRewindSdk,
+      sessionId,
+      boundaryMessageId: input.boundaryMessageId,
+      // While a turn is running the transcript is a moving target: cut at the
+      // last completed turn so the fork can never carry a partially written
+      // one, nor a tool_use whose result has not been appended yet.
+      atCompletedTurn: input.atCompletedTurn,
+      readTranscript: () => this.readSessionTranscript(sessionId),
+      // The forked file needs a post-pass: `forkSession` remaps top-level uuids
+      // but not the ones embedded in a compact boundary, which would make the
+      // resumed fork skip the relink and replay the pre-compaction history.
+      forkTranscript: createClaudeForkTranscriptStore((forkSessionId) =>
+        this.resolveHistoryPath(forkSessionId),
+      ),
+      logger: this.logger,
+    });
+    return { providerHandleId: fork.sessionId };
+  }
+
+  /**
+   * The summary Claude wrote for the last completed compaction at or before
+   * `input.untilMessageId` (the whole session when it is absent).
+   *
+   * Read from the transcript rather than the timeline, because the history
+   * conversion drops compact-summary entries on purpose and keeps only the
+   * marker.
+   */
+  async readCompactionSummary(input?: { untilMessageId?: string | null }): Promise<string | null> {
+    return readClaudeCompactSummary(this.readSessionTranscript(this.claudeSessionId), {
+      untilMessageId: input?.untilMessageId ?? null,
+    });
+  }
+
+  /**
+   * Undo a `forkProviderSession` by deleting the branch it created.
+   *
+   * The guard in `deleteForkedClaudeSession` is what keeps this from ever
+   * reaching the live session: it refuses any id equal to this session's own.
+   */
+  async deleteForkedProviderSession(input: { providerHandleId: string }): Promise<void> {
+    await deleteForkedClaudeSession({
+      sdk: realClaudeRewindSdk,
+      forkSessionId: input.providerHandleId,
+      sourceSessionId: this.claudeSessionId,
+    });
+  }
+
+  private readSessionTranscript(sessionId: string | null): string | null {
+    if (!sessionId) {
+      return null;
+    }
+    try {
+      const historyPath = this.resolveHistoryPath(sessionId);
+      if (!historyPath || !fs.existsSync(historyPath)) {
+        return null;
+      }
+      return fs.readFileSync(historyPath, "utf8");
+    } catch (error) {
+      this.logger.warn(
+        { err: error, sessionId },
+        "Failed to read Claude transcript for fork boundary resolution",
+      );
+      return null;
+    }
+  }
+
   private resolveSlashCommandInvocation(prompt: AgentPromptInput): SlashCommandInvocation | null {
     if (typeof prompt !== "string") {
       return null;
@@ -2997,6 +3085,8 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private rebindConversationSession(sessionId: string): void {
+    // The new session cannot inherit the old one's in-flight compaction.
+    this.notifyCompactionMarkerClosed();
     const oldSessionId = this.claudeSessionId;
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = null;
@@ -3613,12 +3703,38 @@ class ClaudeAgentSession implements AgentSession {
     return message.toLowerCase().includes("request was aborted");
   }
 
+  /**
+   * Terminalize an open compaction marker. A marker that outlives its compaction spins forever,
+   * and — worse — a flag left set makes the NEXT real compaction emit no marker at all, so every
+   * path that ends a turn has to come through here.
+   */
+  private closeCompactionMarker(): Extract<AgentStreamEvent, { type: "timeline" }> | null {
+    if (!this.compactionMarkerOpen) {
+      return null;
+    }
+    this.compactionMarkerOpen = false;
+    this.compactionMarkerClosedWithoutBoundary = true;
+    return {
+      type: "timeline",
+      provider: "claude",
+      item: { type: "compaction", status: "completed" },
+    };
+  }
+
+  private notifyCompactionMarkerClosed(): void {
+    const closed = this.closeCompactionMarker();
+    if (closed) {
+      this.notifySubscribers(closed);
+    }
+  }
+
   private finishForegroundTurn(
     event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
   ): void {
     if (event.type === "turn_failed" || event.type === "turn_canceled") {
       this.flushPendingToolCalls();
     }
+    this.notifyCompactionMarkerClosed();
     this.notifySubscribers(event);
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
@@ -3631,6 +3747,9 @@ class ClaudeAgentSession implements AgentSession {
   private dispatchEvents(events: AgentStreamEvent[]): void {
     let terminalSeen = false;
     for (const event of events) {
+      if (this.isTerminalTurnEvent(event)) {
+        this.notifyCompactionMarkerClosed();
+      }
       this.notifySubscribers(event);
       terminalSeen ||= this.isTerminalTurnEvent(event);
     }
@@ -3672,6 +3791,7 @@ class ClaudeAgentSession implements AgentSession {
     if (!this.autonomousTurn) {
       return;
     }
+    this.notifyCompactionMarkerClosed();
     this.notifySubscribers({ type: "turn_completed", provider: "claude" });
     this.autonomousTurn = null;
     this.activeForegroundQuery = null;
@@ -4287,6 +4407,49 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  private appendStatusMessageEvents(
+    message: Extract<SDKMessage, { type: "system" }>,
+    events: AgentStreamEvent[],
+  ): void {
+    const record = toObjectRecord(message);
+    if (record?.status === "compacting") {
+      this.compacting = true;
+      // The CLI repeats the `compacting` status while a compaction runs. Emit one marker per
+      // compaction: only one of them is ever terminalized by `compact_boundary`, so the extra
+      // ones would spin forever.
+      if (!this.compactionMarkerOpen) {
+        this.compactionMarkerOpen = true;
+        this.compactionMarkerClosedWithoutBoundary = false;
+        events.push({
+          type: "timeline",
+          item: { type: "compaction", status: "loading" },
+          provider: "claude",
+        });
+      }
+    }
+    // The compaction's own outcome, reported on a later status message. A failed compaction must
+    // not be reported as a successful one, so the marker closes and the error is stated.
+    const compactResult = record?.compact_result;
+    if (compactResult !== "success" && compactResult !== "failed") {
+      return;
+    }
+    const closed = this.closeCompactionMarker();
+    if (closed) {
+      events.push(closed);
+    }
+    if (compactResult === "failed") {
+      const detail = typeof record?.compact_error === "string" ? record.compact_error : null;
+      events.push({
+        type: "timeline",
+        provider: "claude",
+        item: {
+          type: "error",
+          message: detail ? `Compaction failed: ${detail}` : "Compaction failed.",
+        },
+      });
+    }
+  }
+
   private appendSystemMessageEvents(
     message: Extract<SDKMessage, { type: "system" }>,
     events: AgentStreamEvent[],
@@ -4310,29 +4473,29 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     if (message.subtype === "status") {
-      const status = toObjectRecord(message)?.status;
-      if (status === "compacting") {
-        this.compacting = true;
-        events.push({
-          type: "timeline",
-          item: { type: "compaction", status: "loading" },
-          provider: "claude",
-        });
-      }
+      this.appendStatusMessageEvents(message, events);
       return;
     }
     if (message.subtype === "compact_boundary") {
+      const alreadyClosed = this.compactionMarkerClosedWithoutBoundary;
+      this.compactionMarkerOpen = false;
+      this.compactionMarkerClosedWithoutBoundary = false;
       const compactMetadata = readCompactionMetadata(message);
-      events.push({
-        type: "timeline",
-        item: {
-          type: "compaction",
-          status: "completed",
-          trigger: compactMetadata?.trigger === "manual" ? "manual" : "auto",
-          preTokens: compactMetadata?.preTokens,
-        },
-        provider: "claude",
-      });
+      // A marker already terminalized without a boundary owns this compaction's separator.
+      // Emitting a second completed item here would render two separators, since a completed
+      // compaction with no marker open appends rather than resolves.
+      if (!alreadyClosed) {
+        events.push({
+          type: "timeline",
+          item: {
+            type: "compaction",
+            status: "completed",
+            trigger: compactMetadata?.trigger === "manual" ? "manual" : "auto",
+            preTokens: compactMetadata?.preTokens,
+          },
+          provider: "claude",
+        });
+      }
       events.push(this.contextUsage.buildCompactionUsageEvent(compactMetadata?.postTokens));
       return;
     }
@@ -4383,6 +4546,26 @@ class ClaudeAgentSession implements AgentSession {
     message: Extract<SDKMessage, { type: "user" }>,
     events: AgentStreamEvent[],
   ): void {
+    const messageId =
+      typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
+    const peerMessage = readClaudePeerMessage(message);
+    if (peerMessage) {
+      if (messageId && this.emittedUserMessageIds.has(messageId)) {
+        return;
+      }
+      this.rememberEmittedUserMessageId(messageId);
+      events.push({
+        type: "timeline",
+        item: {
+          type: "user_message",
+          text: peerMessage.text,
+          origin: peerMessage.origin,
+          ...(messageId ? { messageId } : {}),
+        },
+        provider: "claude",
+      });
+      return;
+    }
     if (isSyntheticUserEntry(message)) {
       return;
     }
@@ -4390,8 +4573,6 @@ class ClaudeAgentSession implements AgentSession {
       this.compacting = false;
       return;
     }
-    const messageId =
-      typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
     if (messageId && this.emittedUserMessageIds.has(messageId)) {
       return;
     }
@@ -4491,6 +4672,12 @@ class ClaudeAgentSession implements AgentSession {
     events: AgentStreamEvent[],
   ): void {
     const usage = this.convertUsage(message, message.modelUsage);
+    // A compaction that ends without a `compact_boundary` (failed, interrupted, or a no-op
+    // /compact) would otherwise leave the spinner running until something else redraws it.
+    const closedCompaction = this.closeCompactionMarker();
+    if (closedCompaction) {
+      events.push(closedCompaction);
+    }
     if (message.subtype === "success") {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
@@ -5042,10 +5229,7 @@ class ClaudeAgentSession implements AgentSession {
       typeof entry.uuid === "string" &&
       !isSyntheticHistoryUserEntry(entry) &&
       !isToolResultUserEntry(entry);
-    if (isVisibleUserEntry && typeof entry.uuid === "string") {
-      this.rememberUserMessageId(entry.uuid);
-      this.rememberRewindUserAnchor(entry.uuid);
-    }
+    this.rememberReplayedUserEntry(entry, isVisibleUserEntry);
     if (entry.type === "assistant" && typeof entry.uuid === "string") {
       this.rememberRewindAssistantAnchor(entry.uuid);
     }
@@ -5057,6 +5241,24 @@ class ClaudeAgentSession implements AgentSession {
           timestamp: historyTimestamp ?? undefined,
         })),
       );
+    }
+  }
+
+  /**
+   * A peer's message is not a rewind point, but the live stream can deliver it again after a
+   * resume, so its id still has to be remembered as emitted.
+   */
+  private rememberReplayedUserEntry(entry: Record<string, unknown>, isVisible: boolean): void {
+    if (typeof entry.uuid !== "string") {
+      return;
+    }
+    if (isVisible) {
+      this.rememberUserMessageId(entry.uuid);
+      this.rememberRewindUserAnchor(entry.uuid);
+      return;
+    }
+    if (readClaudePeerMessage(entry)) {
+      this.rememberEmittedUserMessageId(entry.uuid);
     }
   }
 
@@ -6005,6 +6207,20 @@ function mapAssistantHistoryBlocksWithMessageId(
   return items;
 }
 
+function buildPeerMessageTimelineItem(entry: ClaudeHistoryEntry): AgentTimelineItem | null {
+  const peerMessage = readClaudePeerMessage(entry);
+  if (!peerMessage) {
+    return null;
+  }
+  const messageId = typeof entry.uuid === "string" && entry.uuid.length > 0 ? entry.uuid : null;
+  return {
+    type: "user_message",
+    text: peerMessage.text,
+    origin: peerMessage.origin,
+    ...(messageId ? { messageId } : {}),
+  };
+}
+
 function convertClaudeHistoryEntryPreamble(
   entry: ClaudeHistoryEntry,
 ): { shortCircuit: AgentTimelineItem[] } | { proceed: { content: unknown } } {
@@ -6029,6 +6245,10 @@ function convertClaudeHistoryEntryPreamble(
 
   if (entry.isCompactSummary) {
     return { shortCircuit: [] };
+  }
+  const peerMessageItem = buildPeerMessageTimelineItem(entry);
+  if (peerMessageItem) {
+    return { shortCircuit: [peerMessageItem] };
   }
   if (entry.type === "user" && isSyntheticHistoryUserEntry(entry)) {
     return { shortCircuit: [] };

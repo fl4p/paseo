@@ -42,6 +42,7 @@ import {
   Scissors,
   MicVocal,
   FileSymlink,
+  Bot,
 } from "lucide-react-native";
 import { StyleSheet, withUnistyles } from "react-native-unistyles";
 import { ICON_SIZE, type Theme } from "@/styles/theme";
@@ -91,6 +92,7 @@ import {
   useAssistantLinkPress,
 } from "@/assistant-file-links";
 import { getCompactionMarkerLabel } from "./message-compaction-label";
+import { getPeerMessageOriginLabel } from "./message-peer-origin-label";
 import { useAssistantImage } from "@/assistant-image/use-assistant-image";
 import {
   AttachmentFrame,
@@ -100,7 +102,7 @@ import {
 import { AttachmentLightbox, type ImageLightboxSource } from "@/components/attachment-lightbox";
 import type { DaemonClient } from "@getpaseo/client/internal/daemon-client";
 import { isWeb, isNative } from "@/constants/platform";
-import type { AgentCapabilityFlags } from "@getpaseo/protocol/agent-types";
+import type { AgentCapabilityFlags, PeerMessageOrigin } from "@getpaseo/protocol/agent-types";
 import { RewindMenu, type RewindMode } from "@/components/rewind/rewind-menu";
 import { useRewindAgentMutation } from "@/components/rewind/use-rewind-agent-mutation";
 import { AssistantForkMenu, type AssistantForkTarget } from "@/components/assistant-fork-menu";
@@ -120,6 +122,7 @@ interface UserMessageProps {
   agentId?: string;
   messageId?: string;
   message: string;
+  origin?: PeerMessageOrigin;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
   timestamp: number;
@@ -180,6 +183,8 @@ const mutedForegroundColorMapping = (theme: Theme) => ({
   color: theme.colors.mutedForeground,
 });
 const destructiveColorMapping = (theme: Theme) => ({ color: theme.colors.destructive });
+
+const ThemedBot = withUnistyles(Bot, foregroundMutedColorMapping);
 const infoColorMapping = (theme: Theme) => ({ color: theme.colors.palette.blue[300] });
 const warningColorMapping = (theme: Theme) => ({ color: theme.colors.palette.amber[500] });
 const WEB_TOOLCALL_SHIMMER_KEYFRAME_CSS = `
@@ -402,6 +407,16 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     color: theme.colors.foregroundMuted,
     fontSize: STREAM_METADATA_FONT_SIZE,
   },
+  originRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+    marginBottom: theme.spacing[2],
+  },
+  originText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: STREAM_METADATA_FONT_SIZE,
+  },
 }));
 
 interface UserMessageImagePillProps {
@@ -426,6 +441,7 @@ export const UserMessage = memo(function UserMessage({
   agentId,
   messageId,
   message,
+  origin,
   images = [],
   attachments = [],
   timestamp,
@@ -509,6 +525,14 @@ export const UserMessage = memo(function UserMessage({
         onPointerLeave={handlePointerLeave}
       >
         <View style={userMessageStylesheet.bubble}>
+          {origin ? (
+            <View style={userMessageStylesheet.originRow}>
+              <ThemedBot size={12} />
+              <Text style={userMessageStylesheet.originText} testID="user-message-origin">
+                {getPeerMessageOriginLabel(origin)}
+              </Text>
+            </View>
+          ) : null}
           {hasImages ? (
             <View style={imagePreviewContainerStyle}>
               {images.map((image) => (
@@ -554,7 +578,7 @@ export const UserMessage = memo(function UserMessage({
             <Text style={userMessageStylesheet.timestampText} testID="user-message-timestamp">
               {formattedTimestamp}
             </Text>
-            {capabilities && messageId ? (
+            {capabilities && messageId && !origin ? (
               <RewindMenu
                 capabilities={capabilities}
                 isPending={rewindMutation.isPending}

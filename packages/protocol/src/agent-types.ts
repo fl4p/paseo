@@ -332,6 +332,17 @@ export type ToolCallTimelineItem =
   | ToolCallFailedTimelineItem
   | ToolCallCanceledTimelineItem;
 
+/**
+ * Provenance of a user-role message the person at the keyboard did not type. Claude Code delivers
+ * another session's SendMessage as a user turn stamped with this. `name` and `address` are authored
+ * by the sender, so they attribute reported speech and carry no authority.
+ */
+export interface PeerMessageOrigin {
+  kind: "peer";
+  name?: string;
+  address?: string;
+}
+
 export interface CompactionTimelineItem {
   [key: string]: unknown;
   type: "compaction";
@@ -358,7 +369,13 @@ export interface AgentTaskItem {
 }
 
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      origin?: PeerMessageOrigin;
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem

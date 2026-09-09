@@ -481,6 +481,30 @@ describe("ReplicaCache", () => {
     expect((await reader.readTimeline(SERVER_ID, "agent-1"))?.items).toEqual([pluginItem]);
   });
 
+  it("round-trips the sender of a peer message", async () => {
+    const storage = new MemoryStorage();
+    const writer = createCache(storage);
+    const peerItem: StreamItem = {
+      kind: "user_message",
+      id: "peer-1",
+      messageId: "peer-1",
+      text: "I changed things under you on farmgw.",
+      timestamp: new Date("2026-07-18T08:02:00.000Z"),
+      timelineCursor: { epoch: "epoch-1", seq: 12 },
+      origin: { kind: "peer", name: "dragino", address: "uds:/tmp/cc-socks/65428.sock" },
+    };
+    writer.commitTimeline(SERVER_ID, "agent-1", {
+      agentId: "agent-1",
+      items: [peerItem],
+      range: { epoch: "epoch-1", startSeq: 12, endSeq: 12 },
+      hasOlder: true,
+    });
+    await writer.flush();
+
+    const reader = createCache(storage);
+    expect((await reader.readTimeline(SERVER_ID, "agent-1"))?.items).toEqual([peerItem]);
+  });
+
   it("drops cached plugin timeline items without a plugin-local id", async () => {
     const storage = new MemoryStorage();
     const writer = createCache(storage);

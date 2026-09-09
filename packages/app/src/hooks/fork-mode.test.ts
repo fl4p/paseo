@@ -1,0 +1,122 @@
+import { describe, expect, it } from "vitest";
+import {
+  forkModeDescriptionKey,
+  providerSupportsNativeFork,
+  resolveForkMode,
+  resolveForkTargetCwd,
+} from "./fork-mode";
+
+const CWD = "/Users/dev/project";
+
+function resolve(overrides: Partial<Parameters<typeof resolveForkMode>[0]> = {}) {
+  return resolveForkMode({
+    hostSupportsNativeFork: true,
+    provider: "claude",
+    sourceCwd: CWD,
+    targetCwd: CWD,
+    ...overrides,
+  });
+}
+
+describe("resolveForkMode", () => {
+  it("uses the native path for the same provider in the same directory", () => {
+    expect(resolve()).toBe("native");
+  });
+
+  it("falls back to the attachment for a different provider", () => {
+    // Only Claude's session store can branch; everything else has to re-send
+    // the conversation as text.
+    expect(resolve({ provider: "codex" })).toBe("attachment");
+    expect(resolve({ provider: "opencode" })).toBe("attachment");
+    expect(resolve({ provider: null })).toBe("attachment");
+  });
+
+  it("falls back to the attachment for a different directory", () => {
+    // A provider transcript is keyed by its project directory, so a fork that
+    // lands elsewhere could not resume the branch.
+    expect(resolve({ targetCwd: "/Users/dev/project-worktree" })).toBe("attachment");
+  });
+
+  it("treats a trailing separator, a dot segment and a case difference as the same directory", () => {
+    // The daemon compares directory IDENTITY (realpath), so a hint that said
+    // "attachment" here would downgrade a perfectly forkable session to a
+    // cold-cache attachment fork for a purely cosmetic path difference.
+    expect(resolve({ targetCwd: `${CWD}/` })).toBe("native");
+    expect(resolve({ targetCwd: `${CWD}//` })).toBe("native");
+    expect(resolve({ targetCwd: "/Users/dev/./project" })).toBe("native");
+    expect(resolve({ targetCwd: "/Users/dev/other/../project" })).toBe("native");
+    expect(resolve({ targetCwd: "/Users/Dev/Project" })).toBe("native");
+  });
+
+  it("still falls back for a genuinely different directory", () => {
+    // A git worktree really does live somewhere else; normalization must not
+    // paper over that.
+    expect(resolve({ targetCwd: "/Users/dev/project-worktree" })).toBe("attachment");
+    expect(resolve({ targetCwd: "/Users/dev/project/sub" })).toBe("attachment");
+    expect(resolve({ targetCwd: "/Users/dev" })).toBe("attachment");
+  });
+
+  it("falls back to the attachment when the target directory is not decided yet", () => {
+    expect(resolve({ targetCwd: null })).toBe("attachment");
+    expect(resolve({ targetCwd: "   " })).toBe("attachment");
+  });
+
+  it("falls back to the attachment when the source directory is unknown", () => {
+    expect(resolve({ sourceCwd: null })).toBe("attachment");
+  });
+
+  it("falls back to the attachment when the daemon does not advertise the feature", () => {
+    // An older daemon has no `agent.fork_session.request` handler at all.
+    expect(resolve({ hostSupportsNativeFork: false })).toBe("attachment");
+  });
+});
+
+describe("resolveForkTargetCwd", () => {
+  it("keeps the source directory for a new tab in the same workspace", () => {
+    expect(resolveForkTargetCwd({ target: "tab", sourceCwd: CWD })).toBe(CWD);
+  });
+
+  it("leaves a new-workspace fork undecided", () => {
+    // The user picks the directory (and a worktree gets its own path) after the
+    // menu closes, so the mode cannot be promised as native here.
+    expect(resolveForkTargetCwd({ target: "workspace", sourceCwd: CWD })).toBeNull();
+  });
+
+  it("reports an unknown source directory as undecided", () => {
+    expect(resolveForkTargetCwd({ target: "tab", sourceCwd: "  " })).toBeNull();
+    expect(resolveForkTargetCwd({ target: "tab", sourceCwd: undefined })).toBeNull();
+  });
+});
+
+describe("providerSupportsNativeFork", () => {
+  it("recognizes only providers whose session store can branch", () => {
+    expect(providerSupportsNativeFork("claude")).toBe(true);
+    expect(providerSupportsNativeFork("codex")).toBe(false);
+    expect(providerSupportsNativeFork(undefined)).toBe(false);
+  });
+});
+
+describe("forkModeDescriptionKey", () => {
+  it("promises the full context only when nothing is streaming", () => {
+    expect(forkModeDescriptionKey({ mode: "native", inFlight: false })).toBe(
+      "message.actions.forkKeepsContext",
+    );
+  });
+
+  it("says a native fork stops at the last completed reply during a turn", () => {
+    // The provider transcript does not contain the running turn yet, so the
+    // daemon cuts at the last completed one. The menu must not promise more.
+    expect(forkModeDescriptionKey({ mode: "native", inFlight: true })).toBe(
+      "message.actions.forkKeepsContextFromLastTurn",
+    );
+  });
+
+  it("keeps the attachment description, which does include the streaming turn", () => {
+    expect(forkModeDescriptionKey({ mode: "attachment", inFlight: true })).toBe(
+      "message.actions.forkCopiesSummary",
+    );
+    expect(forkModeDescriptionKey({ mode: "attachment", inFlight: false })).toBe(
+      "message.actions.forkCopiesSummary",
+    );
+  });
+});

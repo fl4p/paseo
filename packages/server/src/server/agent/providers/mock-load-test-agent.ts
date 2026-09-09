@@ -364,6 +364,11 @@ function shouldEmitUserMessageBeforeTurnAcceptance(prompt: AgentPromptInput): bo
   return /emit synthetic user message before accepting turn/i.test(promptToText(prompt));
 }
 
+function parsePeerMessageSender(prompt: AgentPromptInput): string | null {
+  const match = /deliver peer message from ([^\n]+)/i.exec(promptToText(prompt));
+  return match?.[1]?.trim() || null;
+}
+
 function parseAssistantMessagesBeforeUserMessage(prompt: AgentPromptInput): number | null {
   const match = /emit (\d+) assistant messages before synthetic user message/i.exec(
     promptToText(prompt),
@@ -822,6 +827,7 @@ export class MockLoadTestAgentSession implements AgentSession {
     const structuredBranchName = parseStructuredBranchNamePrompt(prompt);
     const settledAssistantImageMarkdown = parseSettledAssistantImageMarkdown(prompt);
     const steeringReplayShape = parseSteeringReplayShape(prompt);
+    const peerMessageSender = parsePeerMessageSender(prompt);
     const scheduleTurn = () => {
       if (shouldEmitTurnFailure(prompt)) {
         this.scheduleFailedTurn(turn);
@@ -843,6 +849,8 @@ export class MockLoadTestAgentSession implements AgentSession {
         this.scheduleLargePayloadTurn(turn, largePayload);
       } else if (stress) {
         this.scheduleStressTurn(turn, stress);
+      } else if (peerMessageSender) {
+        this.schedulePeerMessageTurn(turn, peerMessageSender);
       } else {
         this.schedule(turn, 0);
       }
@@ -1173,6 +1181,21 @@ export class MockLoadTestAgentSession implements AgentSession {
         this.finishTurnWithText(turn, "Foreground command completed after steering.");
       }, 5_000);
       turn.timer.unref?.();
+    }, 0);
+    turn.timer.unref?.();
+  }
+
+  /** Reproduces what another session's SendMessage looks like when it reaches this agent. */
+  private schedulePeerMessageTurn(turn: ActiveTurn, sender: string): void {
+    turn.timer = setTimeout(() => {
+      if (this.activeTurn !== turn) return;
+      this.emitTimeline(turn.turnId, {
+        type: "user_message",
+        text: "I changed things under you on farmgw.",
+        messageId: randomUUID(),
+        origin: { kind: "peer", name: sender, address: "uds:/tmp/cc-socks/65428.sock" },
+      });
+      this.finishTurnWithText(turn, "Read it, standing off that path.");
     }, 0);
     turn.timer.unref?.();
   }

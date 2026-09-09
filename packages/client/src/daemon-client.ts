@@ -39,6 +39,7 @@ import type {
   FileWriteResult,
   FetchAgentTimelineResponseMessage,
   AgentForkContextResponseMessage,
+  AgentForkSessionResponseMessage,
   GitSetupOptions,
   CheckoutStatusResponse,
   CheckoutCommit,
@@ -556,6 +557,7 @@ type ScheduleUpdatePayload = Extract<
 >["payload"];
 export type FetchAgentTimelinePayload = FetchAgentTimelineResponseMessage["payload"];
 export type AgentForkContextPayload = AgentForkContextResponseMessage["payload"];
+export type AgentForkSessionPayload = AgentForkSessionResponseMessage["payload"];
 
 export type FetchAgentTimelineDirection = FetchAgentTimelinePayload["direction"];
 export type FetchAgentTimelineProjection = FetchAgentTimelinePayload["projection"];
@@ -628,6 +630,13 @@ export interface AgentForkContextOptions {
   boundaryCursor?: FetchAgentTimelineCursor;
   boundaryMessageId?: string;
   requestId?: string;
+}
+
+export interface AgentForkSessionOptions extends AgentForkContextOptions {
+  /** Must match the source agent's cwd; the daemon rejects a cross-cwd fork. */
+  cwd?: string;
+  workspaceId?: string;
+  timeout?: number;
 }
 
 type AgentRefreshedStatusPayload = z.infer<typeof AgentRefreshedStatusPayloadSchema>;
@@ -3214,6 +3223,53 @@ export class DaemonClient {
       throw new Error(payload.error);
     }
 
+    return payload;
+  }
+
+  /**
+   * Provider-native fork: ask the daemon to branch the agent's own provider
+   * session and register the branch as a new agent. Returns the new agent id.
+   *
+   * Only available when the daemon advertises `features.agentForkSession`;
+   * callers must fall back to `buildAgentForkContext` otherwise.
+   */
+  async forkAgentSession(
+    agentId: string,
+    options: AgentForkSessionOptions = {},
+  ): Promise<AgentForkSessionPayload> {
+    const resolvedRequestId = this.createRequestId(options.requestId);
+    const message = SessionInboundMessageSchema.parse({
+      type: "agent.fork_session.request",
+      agentId,
+      requestId: resolvedRequestId,
+      ...(options.boundaryCursor ? { boundaryCursor: options.boundaryCursor } : {}),
+      ...(options.boundaryMessageId ? { boundaryMessageId: options.boundaryMessageId } : {}),
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      ...(options.workspaceId ? { workspaceId: options.workspaceId } : {}),
+    });
+
+    const payload = await this.sendRequest({
+      requestId: resolvedRequestId,
+      message,
+      timeout: options.timeout ?? 60000,
+      options: { skipQueue: true },
+      select: (msg) => {
+        if (msg.type !== "agent.fork_session.response") {
+          return null;
+        }
+        if (msg.payload.requestId !== resolvedRequestId) {
+          return null;
+        }
+        return msg.payload;
+      },
+    });
+
+    if (payload.error) {
+      throw new Error(payload.error);
+    }
+    if (!payload.forkedAgentId) {
+      throw new Error("Fork did not return an agent");
+    }
     return payload;
   }
 

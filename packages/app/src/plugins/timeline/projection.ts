@@ -43,6 +43,7 @@ function sourceTimelineItem(item: StreamItem): AgentTimelineItem | null {
         text: item.text,
         ...(item.messageId ? { messageId: item.messageId } : {}),
         ...(item.clientMessageId ? { clientMessageId: item.clientMessageId } : {}),
+        ...(item.origin ? { origin: item.origin } : {}),
       };
     case "assistant_message":
       return {

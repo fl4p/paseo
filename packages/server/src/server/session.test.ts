@@ -3,6 +3,7 @@ import { execSync } from "child_process";
 import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join, resolve as resolvePath } from "path";
+import { fileURLToPath } from "node:url";
 import pino from "pino";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -768,6 +769,129 @@ describe("session authorization permissions", () => {
         error: null,
       },
     });
+  });
+
+  const FORK_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+
+  // A real directory, because the fork now refuses before it branches anything
+  // when the source directory has gone away. This file's own directory rather
+  // than `process.cwd()`: sibling suites chdir into worktrees and then archive
+  // them, which would delete the cwd out from under this test.
+  const FORK_CWD = resolvePath(fileURLToPath(import.meta.url), "..");
+
+  function createForkSessionForTest(
+    permissions: readonly DaemonPermission[],
+    overrides: { workspace?: unknown } = {},
+  ) {
+    const messages: SessionOutboundMessage[] = [];
+    const forkProviderSession = vi.fn(async () => ({
+      providerHandleId: "fork-handle",
+      provider: "claude" as const,
+      cwd: FORK_CWD,
+    }));
+    const session = createSessionForTest({
+      permissions,
+      messages,
+      workspaceRegistry: {
+        get: vi.fn(async () =>
+          "workspace" in overrides
+            ? overrides.workspace
+            : { workspaceId: "ws-1", projectId: "proj-1", cwd: FORK_CWD, archivedAt: null },
+        ),
+      },
+      projectRegistry: {
+        get: vi.fn(async () => ({ projectId: "proj-1", archivedAt: null })),
+      },
+      agentManager: {
+        waitForAgentClose: vi.fn(async () => {}),
+        getAgent: vi.fn(() => ({
+          id: FORK_AGENT_ID,
+          provider: "claude",
+          cwd: FORK_CWD,
+          workspaceId: "ws-1",
+          config: { provider: "claude", cwd: FORK_CWD },
+        })),
+        fetchTimeline: vi.fn(() => ({ epoch: "epoch-1", rows: [] })),
+        // Idle: an in-flight run makes the fork cut at the last completed turn
+        // instead, which these authorization cases are not about.
+        hasInFlightRun: vi.fn(() => false),
+        forkProviderSession,
+      },
+    });
+    return { session, messages, forkProviderSession };
+  }
+
+  test("refuses a native fork from a principal that may write but not read", async () => {
+    // Requirement lists are OR-ed, so the permission table alone cannot demand
+    // read AND write. Without the handler check a write-only principal could
+    // clone a transcript it is not allowed to export.
+    const { session, messages, forkProviderSession } = createForkSessionForTest([
+      "workspace.write",
+    ]);
+
+    await session.handleMessage({
+      type: "agent.fork_session.request",
+      requestId: "fork-denied",
+      agentId: FORK_AGENT_ID,
+    });
+
+    expect(forkProviderSession).not.toHaveBeenCalled();
+    expect(messages).toEqual([
+      {
+        type: "rpc_error",
+        payload: {
+          requestId: "fork-denied",
+          requestType: "agent.fork_session.request",
+          error: "Session is not authorized for agent.fork_session.request",
+          code: "access_denied",
+        },
+      },
+    ]);
+  });
+
+  test("lets a native fork through once the principal may read as well as write", async () => {
+    const { session, messages, forkProviderSession } = createForkSessionForTest([
+      "workspace.read",
+      "workspace.write",
+    ]);
+
+    await session.handleMessage({
+      type: "agent.fork_session.request",
+      requestId: "fork-allowed",
+      agentId: FORK_AGENT_ID,
+    });
+
+    expect(forkProviderSession).toHaveBeenCalled();
+    expect(messages).not.toContainEqual(
+      expect.objectContaining({ payload: expect.objectContaining({ code: "access_denied" }) }),
+    );
+  });
+
+  test("refuses a native fork before branching when the workspace is gone", async () => {
+    // Proves the pre-fork validation is actually wired to the real provisioning
+    // service: an archived/absent workspace must stop the request BEFORE the
+    // irreversible provider fork, not after it.
+    const { session, messages, forkProviderSession } = createForkSessionForTest(
+      ["workspace.read", "workspace.write"],
+      { workspace: undefined },
+    );
+
+    await session.handleMessage({
+      type: "agent.fork_session.request",
+      requestId: "fork-no-workspace",
+      agentId: FORK_AGENT_ID,
+    });
+
+    expect(forkProviderSession).not.toHaveBeenCalled();
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: "agent.fork_session.response",
+        payload: expect.objectContaining({
+          forkedAgentId: null,
+          error: "Workspace not found: ws-1",
+        }),
+      }),
+    );
   });
 
   test("rejects an operation without its semantic permission", async () => {

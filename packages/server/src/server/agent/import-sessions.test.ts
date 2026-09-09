@@ -10,7 +10,7 @@ import type {
 import { AgentStorage, type StoredAgentRecord } from "./agent-storage.js";
 import type { FetchRecentProviderSessionsRequestMessage } from "@getpaseo/protocol/messages";
 import { PARENT_AGENT_ID_LABEL } from "@getpaseo/protocol/agent-labels";
-import type { AgentTimelineItem } from "./agent-sdk-types.js";
+import type { AgentSessionConfig, AgentTimelineItem } from "./agent-sdk-types.js";
 import { createPersistedWorkspaceRecord } from "../workspace-registry.js";
 import type { WorkspaceProvisioningService } from "../session/workspace-provisioning/workspace-provisioning-service.js";
 import { createTestLogger } from "../../test-utils/test-logger.js";
@@ -735,7 +735,12 @@ class ProviderImportHarness {
     };
   }
 
-  import(input: { providerHandleId: string; cwd?: string; labels?: Record<string, string> }) {
+  import(input: {
+    providerHandleId: string;
+    cwd?: string;
+    labels?: Record<string, string>;
+    config?: Partial<AgentSessionConfig>;
+  }) {
     return importProviderSession({
       request: {
         requestId: "import-thread",
@@ -743,6 +748,7 @@ class ProviderImportHarness {
         providerHandleId: input.providerHandleId,
         cwd: input.cwd,
         labels: input.labels,
+        ...(input.config ? { config: input.config } : {}),
       },
       workspaceProvisioning: createImportWorkspace("ws-restored"),
       agentManager: this.manager,
@@ -779,6 +785,22 @@ test("importProviderSession uses the provider import path with the requested lab
     timelineSize: 2,
     createdWorkspace: null,
   });
+});
+
+test("importProviderSession forwards the requested config to the provider import", async () => {
+  // The native fork sends the source agent's settings along so the fork does
+  // not silently start on the daemon defaults.
+  const harness = await ProviderImportHarness.create();
+
+  await harness.import({
+    providerHandleId: "thread-forked",
+    cwd: "/tmp/imported-agent",
+    config: { model: "gpt-5.2-codex", modeId: "plan" },
+  });
+
+  expect(harness.freshImports).toEqual([
+    expect.objectContaining({ config: { model: "gpt-5.2-codex", modeId: "plan" } }),
+  ]);
 });
 
 test("importProviderSession rejects a provider session with an active stored owner", async () => {

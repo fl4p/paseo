@@ -304,6 +304,10 @@ export const fr: TranslationResources = {
       forkMenu: "Dupliquer le message",
       forkInNewTab: "Dupliquer dans un nouvel onglet",
       forkInNewWorkspace: "Dupliquer dans un nouvel espace de travail",
+      forkKeepsContext: "Conserve le contexte complet et le cache de prompts",
+      forkKeepsContextFromLastTurn:
+        "Conserve le contexte complet et le cache de prompts, jusqu’à la dernière réponse terminée",
+      forkCopiesSummary: "Copie un résumé textuel de cette discussion",
       forkUnavailable: "Mettez l'hôte à jour pour utiliser ceci.",
       forkMissingWorkspace: "Cet agent n'est pas dans un espace de travail.",
       forkFailed: "Impossible de dupliquer le chat",
@@ -362,6 +366,10 @@ export const fr: TranslationResources = {
       manual: "Contexte compacté manuellement",
       withTokens: "Contexte compacté (jetons{{tokens}}K)",
       completed: "Contexte compacté",
+    },
+    peer: {
+      from: "De {{sender}}",
+      fromUnknown: "D'une autre session",
     },
   },
   importSession: {
