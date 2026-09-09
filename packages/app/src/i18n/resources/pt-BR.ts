@@ -1291,6 +1291,14 @@ export const ptBR: TranslationResources = {
       restore: "Restaurar janela",
       close: "Fechar janela",
     },
+    find: {
+      placeholder: "Localizar",
+      matches: "{{current}} de {{total}}",
+      noMatches: "Sem resultados",
+      previous: "Ocorrência anterior",
+      next: "Próxima ocorrência",
+      close: "Fechar a barra de busca",
+    },
     quitting: {
       title: "Saindo do Paseo...",
       detail: "Parando o daemon local.",

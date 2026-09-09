@@ -1275,6 +1275,14 @@ export const en = {
       restore: "Restore window",
       close: "Close window",
     },
+    find: {
+      placeholder: "Find",
+      matches: "{{current}} of {{total}}",
+      noMatches: "No results",
+      previous: "Previous match",
+      next: "Next match",
+      close: "Close find bar",
+    },
     quitting: {
       title: "Quitting Paseo...",
       detail: "Stopping the local daemon.",

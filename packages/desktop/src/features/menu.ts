@@ -1,5 +1,6 @@
 import { app, Menu, BrowserWindow, ipcMain } from "electron";
 import { getActivePaseoBrowserWebContentsForHostWindow } from "./browser-webviews/index.js";
+import { FIND_NEXT_CHANNEL, FIND_OPEN_CHANNEL, FIND_PREVIOUS_CHANNEL } from "./find-in-page.js";
 
 interface ShowContextMenuInput {
   kind?: "terminal";
@@ -17,6 +18,15 @@ function withBrowserWindow(
     const win = baseWin instanceof BrowserWindow ? baseWin : BrowserWindow.getFocusedWindow();
     if (win) callback(win);
   };
+}
+
+/** Menu items whose behavior lives in the renderer just forward the intent. */
+function sendToRenderer(
+  channel: string,
+): (_item: Electron.MenuItem, baseWin: Electron.BaseWindow | undefined) => void {
+  return withBrowserWindow((win) => {
+    win.webContents.send(channel, {});
+  });
 }
 
 interface ReloadableWebContents {
@@ -70,6 +80,7 @@ function buildApplicationMenuTemplate(
 ): Electron.MenuItemConstructorOptions[] {
   const isMac = process.platform === "darwin";
   const zoomEnabled = !capturing;
+  const findEnabled = !capturing;
 
   return [
     ...(isMac
@@ -112,6 +123,25 @@ function buildApplicationMenuTemplate(
         { role: "copy" },
         { role: "paste" },
         { role: "selectAll" },
+        { type: "separator" },
+        {
+          label: "Find…",
+          accelerator: "CmdOrCtrl+F",
+          enabled: findEnabled,
+          click: sendToRenderer(FIND_OPEN_CHANNEL),
+        },
+        {
+          label: "Find Next",
+          accelerator: "CmdOrCtrl+G",
+          enabled: findEnabled,
+          click: sendToRenderer(FIND_NEXT_CHANNEL),
+        },
+        {
+          label: "Find Previous",
+          accelerator: "Shift+CmdOrCtrl+G",
+          enabled: findEnabled,
+          click: sendToRenderer(FIND_PREVIOUS_CHANNEL),
+        },
       ],
     },
     {

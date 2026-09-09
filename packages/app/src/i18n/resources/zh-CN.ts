@@ -1254,6 +1254,14 @@ export const zhCN: TranslationResources = {
       restore: "还原窗口",
       close: "关闭窗口",
     },
+    find: {
+      placeholder: "查找",
+      matches: "第 {{current}} 个，共 {{total}} 个",
+      noMatches: "无结果",
+      previous: "上一个匹配项",
+      next: "下一个匹配项",
+      close: "关闭查找栏",
+    },
     quitting: {
       title: "正在退出 Paseo...",
       detail: "正在停止本地 daemon。",

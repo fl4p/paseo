@@ -1266,6 +1266,14 @@ export const ar: TranslationResources = {
       restore: "استعادة النافذة",
       close: "إغلاق النافذة",
     },
+    find: {
+      placeholder: "بحث",
+      matches: "{{current}} من {{total}}",
+      noMatches: "لا نتائج",
+      previous: "النتيجة السابقة",
+      next: "النتيجة التالية",
+      close: "إغلاق شريط البحث",
+    },
     quitting: {
       title: "جارٍ إنهاء Paseo...",
       detail: "إيقاف البرنامج الخفي المحلي.",

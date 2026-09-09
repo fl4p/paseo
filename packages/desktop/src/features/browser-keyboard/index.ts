@@ -17,6 +17,9 @@ const POLICY_REQUEST_CHANNEL = "paseo:browser-keyboard-policy-request";
 const SHORTCUT_INPUT_CHANNEL = "paseo:browser-shortcut-input";
 const SHORTCUT_OUTPUT_CHANNEL = "paseo:event:browser-shortcut-input";
 const RESERVED_SHORTCUT_OUTPUT_CHANNEL = "paseo:event:browser-shortcut";
+// A guest that owns the keystroke suppresses menu accelerators, so the window's
+// Find item cannot fire while a browser pane has focus; open the find bar here.
+const FIND_OPEN_CHANNEL = "paseo:event:find-open";
 
 interface BrowserKeyboardContentsIdentity {
   readonly id: number;
@@ -210,6 +213,12 @@ export class BrowserKeyboard {
             action: reservedShortcut,
             browserId: registration.browserId,
           });
+        }
+        return;
+      case "find":
+        event.preventDefault();
+        if (!guest.hostContents.isDestroyed()) {
+          guest.hostContents.send(FIND_OPEN_CHANNEL, { browserId: registration.browserId });
         }
         return;
       case null:

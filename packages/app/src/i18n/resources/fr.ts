@@ -1300,6 +1300,14 @@ export const fr: TranslationResources = {
       restore: "Restaurer la fenêtre",
       close: "Fermer la fenêtre",
     },
+    find: {
+      placeholder: "Rechercher",
+      matches: "{{current}} sur {{total}}",
+      noMatches: "Aucun résultat",
+      previous: "Occurrence précédente",
+      next: "Occurrence suivante",
+      close: "Fermer la barre de recherche",
+    },
     quitting: {
       title: "QuitterPaseo...",
       detail: "Arrêt du démon local.",

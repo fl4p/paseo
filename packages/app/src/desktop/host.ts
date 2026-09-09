@@ -88,6 +88,27 @@ export interface DesktopWebUtilsBridge {
   getPathForFile?: (file: File) => string;
 }
 
+export type DesktopFindStopAction = "clearSelection" | "keepSelection" | "activateSelection";
+
+export interface DesktopFindStartInput {
+  query: string;
+  /** Search direction; defaults to forward. */
+  forward?: boolean;
+  /** Advance within the current query instead of restarting the search. */
+  findNext?: boolean;
+}
+
+export interface DesktopFindResult {
+  activeMatchOrdinal: number;
+  matches: number;
+  finalUpdate: boolean;
+}
+
+export interface DesktopFindBridge {
+  start?: (input: DesktopFindStartInput) => Promise<void>;
+  stop?: (action?: DesktopFindStopAction) => Promise<void>;
+}
+
 export interface DesktopMenuBridge {
   showContextMenu?: (input?: { kind?: "terminal"; hasSelection?: boolean }) => Promise<void>;
   setCapturingShortcut?: (capturing: boolean) => Promise<void>;
@@ -186,6 +207,7 @@ export interface DesktopHostBridge {
   editor?: DesktopEditorBridge;
   webUtils?: DesktopWebUtilsBridge;
   menu?: DesktopMenuBridge;
+  find?: DesktopFindBridge;
   browser?: DesktopBrowserBridge;
 }
 
