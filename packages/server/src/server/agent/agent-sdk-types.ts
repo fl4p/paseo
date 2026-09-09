@@ -719,16 +719,22 @@ export interface AgentSession {
     atCompletedTurn?: boolean;
   }): Promise<{ providerHandleId: string }>;
   /**
-   * The summary the provider wrote for this session's last completed
-   * compaction, or `null` when there is none.
+   * The summary the provider wrote for the last completed compaction at or
+   * before `untilMessageId`, or `null` when there is none.
    *
    * The timeline keeps only a compaction MARKER (the summary is not shown as if
    * the user had typed it), so the text-attachment fork -- which starts after
    * the last compaction -- would otherwise drop everything the summary
    * retained. Implemented only by providers that persist one; callers must
    * treat `null` as "the pre-compaction history was dropped".
+   *
+   * `untilMessageId` is the fork point. Without it a fork bounded before a
+   * LATER compaction inherits that later summary, leaking content from after
+   * the fork point and describing turns the fork does not contain. `null` (or
+   * an omitted option) means the whole session, which is only correct for an
+   * unbounded fork.
    */
-  readCompactionSummary?(): Promise<string | null>;
+  readCompactionSummary?(input?: { untilMessageId?: string | null }): Promise<string | null>;
   /**
    * Delete a provider session this session previously forked, undoing an
    * otherwise irreversible `forkProviderSession`.

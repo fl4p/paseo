@@ -2829,14 +2829,17 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   /**
-   * The summary Claude wrote for this session's last completed compaction.
+   * The summary Claude wrote for the last completed compaction at or before
+   * `input.untilMessageId` (the whole session when it is absent).
    *
    * Read from the transcript rather than the timeline, because the history
    * conversion drops compact-summary entries on purpose and keeps only the
    * marker.
    */
-  async readCompactionSummary(): Promise<string | null> {
-    return readClaudeCompactSummary(this.readSessionTranscript(this.claudeSessionId));
+  async readCompactionSummary(input?: { untilMessageId?: string | null }): Promise<string | null> {
+    return readClaudeCompactSummary(this.readSessionTranscript(this.claudeSessionId), {
+      untilMessageId: input?.untilMessageId ?? null,
+    });
   }
 
   /**

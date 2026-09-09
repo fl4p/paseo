@@ -23,7 +23,37 @@ interface CompactTranscriptEntry {
   subtype?: unknown;
   isCompactSummary?: unknown;
   compactMetadata?: { preservedMessages?: { anchorUuid?: unknown } | null } | null;
-  message?: { content?: unknown } | null;
+  message?: { id?: unknown; content?: unknown } | null;
+}
+
+function isCompactBoundary(entry: CompactTranscriptEntry | undefined): boolean {
+  return entry?.type === "system" && entry.subtype === "compact_boundary";
+}
+
+/**
+ * Index of the entry a paseo message id names, or -1.
+ *
+ * Accepts both spellings a timeline item can carry, the same way the fork
+ * boundary resolver does: history-loaded items use the transcript `uuid`, live
+ * streamed assistant messages use the Anthropic `msg_…` id. A uuid hit wins,
+ * because one API message can span several entries and the LAST of them is the
+ * position meant.
+ */
+function findEntryIndexForMessageId(
+  entries: readonly CompactTranscriptEntry[],
+  messageId: string,
+): number {
+  let apiMatch = -1;
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry?.uuid === messageId) {
+      return index;
+    }
+    if (entry?.message?.id === messageId) {
+      apiMatch = index;
+    }
+  }
+  return apiMatch;
 }
 
 function readEntries(content: string): CompactTranscriptEntry[] {
@@ -72,30 +102,64 @@ function readEntryText(entry: CompactTranscriptEntry): string | null {
 }
 
 /**
- * The summary of the transcript's LAST completed compaction, or `null`.
+ * The summary of the last completed compaction at or before `untilMessageId`,
+ * or `null`.
  *
- * Anchored on the last `compact_boundary` rather than simply the last
+ * Anchored on a `compact_boundary` rather than simply the last
  * `isCompactSummary` entry, so a session compacted twice cannot answer with the
- * older summary: the boundary names its own summary through
+ * wrong summary: the boundary names its own summary through
  * `compactMetadata.preservedMessages.anchorUuid`, and the scan after the
- * boundary is only the fallback for a transcript that omits the anchor.
+ * boundary is only the fallback for a transcript that omits the anchor. That
+ * scan stops at the NEXT boundary, so a compaction whose summary is missing
+ * cannot borrow a later one's.
  *
- * Returns `null` when the session was never compacted, when the boundary is the
- * very last thing in the file (the summary has not been written yet), or when
- * the summary is empty — callers must treat that as "no summary available" and
- * say the pre-compaction history was dropped, never that it was summarized.
+ * `untilMessageId` is the fork point. Without it a bounded fork inherits
+ * whatever the session compacted LAST, which for `A -> fork point -> B` means
+ * carrying B's summary — content from after the fork point, describing turns
+ * the fork does not contain. With it, only compactions at or before the fork
+ * point are eligible. A message id that is not in the transcript answers
+ * `null` rather than falling back to the unbounded read, because an unbounded
+ * read is exactly the leak.
+ *
+ * Returns `null` when the session was never compacted before that point, when
+ * the boundary is the very last thing in the file (the summary has not been
+ * written yet), or when the summary is empty — callers must treat that as "no
+ * summary available" and say the pre-compaction history was dropped, never
+ * that it was summarized.
  */
-export function readClaudeCompactSummary(content: string | null | undefined): string | null {
+export function readClaudeCompactSummary(
+  content: string | null | undefined,
+  options?: { untilMessageId?: string | null },
+): string | null {
   if (!content) {
     return null;
   }
   const entries = readEntries(content);
-  const boundaryIndex = entries.findLastIndex(
-    (entry) => entry.type === "system" && entry.subtype === "compact_boundary",
-  );
+  const until = options?.untilMessageId?.trim() || null;
+  let endIndex = entries.length - 1;
+  if (until) {
+    endIndex = findEntryIndexForMessageId(entries, until);
+    if (endIndex < 0) {
+      return null;
+    }
+  }
+  let boundaryIndex = -1;
+  for (let index = endIndex; index >= 0; index -= 1) {
+    if (isCompactBoundary(entries[index])) {
+      boundaryIndex = index;
+      break;
+    }
+  }
   if (boundaryIndex < 0) {
     return null;
   }
+  return readBoundarySummary(entries, boundaryIndex);
+}
+
+function readBoundarySummary(
+  entries: readonly CompactTranscriptEntry[],
+  boundaryIndex: number,
+): string | null {
   const anchorUuid = entries[boundaryIndex]?.compactMetadata?.preservedMessages?.anchorUuid;
   if (typeof anchorUuid === "string" && anchorUuid.length > 0) {
     const anchored = entries.find((entry) => entry.uuid === anchorUuid);
@@ -103,8 +167,14 @@ export function readClaudeCompactSummary(content: string | null | undefined): st
       return readEntryText(anchored);
     }
   }
+  // Fallback for a transcript with no anchor. Stops at the next boundary: a
+  // compaction whose own summary is missing must answer `null`, not borrow the
+  // summary of a later one.
   for (let index = boundaryIndex + 1; index < entries.length; index += 1) {
     const entry = entries[index];
+    if (isCompactBoundary(entry)) {
+      return null;
+    }
     if (entry?.isCompactSummary) {
       return readEntryText(entry);
     }

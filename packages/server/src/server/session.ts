@@ -7482,7 +7482,12 @@ export class Session {
         compactionSummary: await loadForkCompactionSummary({
           agentId: msg.agentId,
           rows: timeline.rows,
-          read: (agentId) => this.agentManager.readProviderCompactionSummary(agentId),
+          cursorBoundary: msg.boundaryCursor
+            ? { timelineEpoch: timeline.epoch, cursor: msg.boundaryCursor }
+            : null,
+          boundaryMessageId: msg.boundaryMessageId,
+          read: (agentId, options) =>
+            this.agentManager.readProviderCompactionSummary(agentId, options),
           logger: this.sessionLogger,
         }),
       });

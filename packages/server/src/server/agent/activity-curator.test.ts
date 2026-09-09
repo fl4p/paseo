@@ -798,7 +798,104 @@ describe("loadForkCompactionSummary", () => {
     expect(await loadForkCompactionSummary({ agentId: "agent-1", rows: compactedRows, read })).toBe(
       "summary",
     );
-    expect(read).toHaveBeenCalledWith("agent-1");
+    // Unbounded fork: the whole session is in scope, so no bound is passed.
+    expect(read).toHaveBeenCalledWith("agent-1", { untilMessageId: null });
+  });
+
+  it("bounds the read at the fork point so a LATER compaction cannot supply the summary", async () => {
+    // compaction A -> the selected reply -> more conversation -> compaction B.
+    // Reading unbounded answers with B's summary: content from after the fork
+    // point, describing turns the fork does not contain.
+    const rows = [
+      row(1, { type: "user_message", text: "first", messageId: "user-1" }),
+      row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(3, { type: "assistant_message", text: "the selected reply", messageId: "msg_cut" }),
+      row(4, { type: "user_message", text: "later", messageId: "user-2" }),
+      row(5, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(6, { type: "assistant_message", text: "after B", messageId: "msg_after" }),
+    ];
+    const read = vi.fn(async () => "summary A");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        boundaryMessageId: "msg_cut",
+        read,
+      }),
+    ).toBe("summary A");
+    expect(read).toHaveBeenCalledWith("agent-1", { untilMessageId: "msg_cut" });
+  });
+
+  it("keeps content unique to a later compaction out of the attachment", async () => {
+    const rows = [
+      row(1, { type: "user_message", text: "first", messageId: "user-1" }),
+      row(2, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(3, { type: "assistant_message", text: "the selected reply", messageId: "msg_cut" }),
+      row(4, { type: "user_message", text: "later", messageId: "user-2" }),
+      row(5, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(6, { type: "assistant_message", text: "after B", messageId: "msg_after" }),
+    ];
+    // Stands in for the provider transcript: unbounded reads answer with B.
+    const read = async (_agentId: string, options: { untilMessageId: string | null }) =>
+      options.untilMessageId === "msg_cut" ? "Summary A: adapter" : "Summary B: refund flow";
+
+    const attachment = buildAgentForkContextAttachment({
+      rows,
+      boundaryMessageId: "msg_cut",
+      compactionSummary: await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        boundaryMessageId: "msg_cut",
+        read,
+      }),
+    });
+
+    expect(attachment.attachment.text).toContain("Summary A: adapter");
+    expect(attachment.attachment.text).not.toContain("refund flow");
+    expect(attachment.attachment.text).not.toContain("after B");
+    expect(attachment.attachment.text).toContain(
+      "represented by the provider's own compaction summary below",
+    );
+  });
+
+  it("skips the read when no compaction happened at or before the boundary", async () => {
+    // The only compaction is AFTER the fork point, so nothing was summarized
+    // away from what the fork contains.
+    const rows = [
+      row(1, { type: "user_message", text: "first", messageId: "user-1" }),
+      row(2, { type: "assistant_message", text: "the selected reply", messageId: "msg_cut" }),
+      row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(4, { type: "assistant_message", text: "after", messageId: "msg_after" }),
+    ];
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        boundaryMessageId: "msg_cut",
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it("refuses to read unbounded when a boundary names no provider message", async () => {
+    // Falling back to an unbounded read here is exactly the leak; answering
+    // "no summary" is the honest degradation.
+    const rows = [
+      row(1, { type: "compaction", status: "completed", trigger: "auto" }),
+      row(2, { type: "todo", items: [] } as unknown as AgentTimelineItem),
+    ];
+    const read = vi.fn(async () => "summary");
+    expect(
+      await loadForkCompactionSummary({
+        agentId: "agent-1",
+        rows,
+        cursorBoundary: { timelineEpoch: "epoch-1", cursor: { epoch: "epoch-1", seq: 2 } },
+        read,
+      }),
+    ).toBeNull();
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("skips the provider read when nothing was compacted away", async () => {

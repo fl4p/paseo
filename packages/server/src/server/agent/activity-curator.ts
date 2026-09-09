@@ -313,13 +313,22 @@ export function resolveForkBoundaryMessageId(input: {
   if (boundaryIndex === null) {
     return null;
   }
-  for (let index = boundaryIndex; index >= 0; index -= 1) {
-    const row = input.rows[index];
-    if (!row) {
-      continue;
-    }
-    const item = row.item;
+  const messageId = findMessageIdAtOrBefore(input.rows, boundaryIndex);
+  if (!messageId) {
+    throw new Error("Selected timeline position has no provider message to fork from.");
+  }
+  return messageId;
+}
+
+/** The provider message id of the last message row at or before `endIndex`. */
+function findMessageIdAtOrBefore(
+  rows: readonly AgentTimelineRow[],
+  endIndex: number,
+): string | null {
+  for (let index = Math.min(endIndex, rows.length - 1); index >= 0; index -= 1) {
+    const item = rows[index]?.item;
     if (
+      item &&
       (item.type === "assistant_message" || item.type === "user_message") &&
       typeof item.messageId === "string" &&
       item.messageId.length > 0
@@ -327,7 +336,7 @@ export function resolveForkBoundaryMessageId(input: {
       return item.messageId;
     }
   }
-  throw new Error("Selected timeline position has no provider message to fork from.");
+  return null;
 }
 
 /**
@@ -603,11 +612,16 @@ function buildForkContextText(input: {
 /**
  * Fetch the provider's compaction summary for a fork attachment, or `null`.
  *
+ * The boundary is threaded into the read. Without it a fork bounded at a reply
+ * between compaction A and a later compaction B inherited B's summary — content
+ * from AFTER the fork point, describing turns the fork does not contain.
+ *
  * Two failure modes, both of which must degrade to "the earlier history was
  * dropped" rather than to a failed fork or an invented summary:
  *
- * - the source timeline shows no completed compaction, so nothing was skipped
- *   and reading the provider transcript would be pointless work;
+ * - the source timeline shows no completed compaction AT OR BEFORE the fork
+ *   boundary, so nothing was skipped and reading the provider transcript would
+ *   be pointless work;
  * - the read throws (no transcript, an unsupported provider, an I/O error).
  *   The attachment is still worth having, so the error is logged and the header
  *   says the pre-compaction history is gone.
@@ -615,17 +629,28 @@ function buildForkContextText(input: {
 export async function loadForkCompactionSummary(input: {
   agentId: string;
   rows: readonly AgentTimelineRow[];
-  read: (agentId: string) => Promise<string | null>;
+  cursorBoundary?: ForkCursorBoundary | null;
+  boundaryMessageId?: string | null;
+  read: (agentId: string, options: { untilMessageId: string | null }) => Promise<string | null>;
   logger?: Logger | null;
 }): Promise<string | null> {
-  const compacted = input.rows.some(
-    (row) => row.item.type === "compaction" && row.item.status === "completed",
-  );
-  if (!compacted) {
+  const boundaryIndex = findForkBoundaryIndex(input);
+  const endIndex = boundaryIndex ?? input.rows.length - 1;
+  // The same question `selectForkContextRows` asks, so the two cannot disagree
+  // about which compaction the selection started after.
+  if (findLastCompletedCompactionIndex(input.rows, endIndex) < 0) {
+    return null;
+  }
+  const untilMessageId =
+    boundaryIndex === null ? null : findMessageIdAtOrBefore(input.rows, boundaryIndex);
+  if (boundaryIndex !== null && !untilMessageId) {
+    // A boundary was requested but nothing at or before it names a provider
+    // message, so the read cannot be bounded. Reading unbounded is exactly the
+    // leak this bound exists to prevent, so answer "no summary" instead.
     return null;
   }
   try {
-    return await input.read(input.agentId);
+    return await input.read(input.agentId, { untilMessageId });
   } catch (error) {
     input.logger?.warn(
       { err: error, agentId: input.agentId },
@@ -642,8 +667,8 @@ export function buildAgentForkContextAttachment(input: {
   agentTitle?: string | null;
   cwd?: string | null;
   /**
-   * The provider's own summary for the source session's last completed
-   * compaction, when it has one. The selection below starts after that
+   * The provider's own summary for the last completed compaction AT OR BEFORE
+   * the fork boundary, when it has one. The selection below starts after that
    * compaction, so this is the only thing carrying the history it replaced;
    * without it the attachment silently drops that context, and a session whose
    * newest row IS the compaction produces an empty body.
