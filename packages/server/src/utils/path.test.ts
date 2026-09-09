@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -6,8 +6,10 @@ import { describe, expect, test } from "vitest";
 import {
   areEquivalentPaths,
   createPathEquivalenceMatcher,
+  createRealpathAwarePathMatcher,
   getRealpathAwareRelativePath,
   isPathInsideRoot,
+  isSameRealDirectory,
 } from "./path.js";
 
 describe("path equivalence", () => {
@@ -67,4 +69,80 @@ describe("path equivalence", () => {
       }
     },
   );
+});
+
+describe("strict directory identity", () => {
+  const withTempDir = (run: (tempDir: string) => void): void => {
+    const tempDir = realpathSync(mkdtempSync(join(tmpdir(), "paseo-identity-")));
+    try {
+      run(tempDir);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  };
+
+  test.skipIf(process.platform === "win32")(
+    "refuses a path whose real directory escapes through a symlink",
+    () => {
+      withTempDir((tempDir) => {
+        const source = join(tempDir, "source");
+        const other = join(tempDir, "other", "child");
+        mkdirSync(source, { recursive: true });
+        mkdirSync(other, { recursive: true });
+        symlinkSync(other, join(source, "link"), "dir");
+
+        // Built as a string on purpose: `join` would collapse `link/..`
+        // lexically and destroy the case under test.
+        const escaped = `${source}/link/..`;
+        // The permissive matcher used for cwd filtering accepts this, because
+        // the LEXICAL spelling of the candidate normalizes to `source`.
+        expect(createRealpathAwarePathMatcher(source)(escaped)).toBe(true);
+        // Its real directory is `tempDir/other`, so strict identity refuses it.
+        // (`realpathSync.native` is the honest resolver here: node's JS
+        // realpath resolves `path.resolve` first, so it collapses `link/..`
+        // lexically and answers `source` — the same mistake being fixed.)
+        expect(realpathSync.native(escaped)).toBe(join(tempDir, "other"));
+        expect(isSameRealDirectory(source, escaped)).toBe(false);
+      });
+    },
+  );
+
+  test.skipIf(process.platform === "win32")("accepts the spellings that really are equal", () => {
+    withTempDir((tempDir) => {
+      const source = join(tempDir, "source");
+      mkdirSync(source, { recursive: true });
+      const alias = join(tempDir, "alias");
+      symlinkSync(source, alias, "dir");
+
+      expect(isSameRealDirectory(source, `${source}/`)).toBe(true);
+      expect(isSameRealDirectory(source, `${source}/./`)).toBe(true);
+      expect(isSameRealDirectory(source, `${source}/../source`)).toBe(true);
+      expect(isSameRealDirectory(source, alias)).toBe(true);
+
+      const swappedCase = join(tempDir, "SOURCE");
+      if (existsSync(swappedCase)) {
+        // Only meaningful where the filesystem folds case; elsewhere this
+        // really is a different (missing) directory.
+        expect(isSameRealDirectory(source, swappedCase)).toBe(true);
+      }
+    });
+  });
+
+  test("refuses a directory that cannot be resolved, including against itself", () => {
+    withTempDir((tempDir) => {
+      const missing = join(tempDir, "gone");
+      expect(isSameRealDirectory(missing, missing)).toBe(false);
+      expect(isSameRealDirectory(tempDir, missing)).toBe(false);
+    });
+  });
+
+  test.skipIf(process.platform === "win32")("keeps a second worktree distinct", () => {
+    withTempDir((tempDir) => {
+      const main = join(tempDir, "repo");
+      const worktree = join(tempDir, "repo-worktree");
+      mkdirSync(main, { recursive: true });
+      mkdirSync(worktree, { recursive: true });
+      expect(isSameRealDirectory(main, worktree)).toBe(false);
+    });
+  });
 });

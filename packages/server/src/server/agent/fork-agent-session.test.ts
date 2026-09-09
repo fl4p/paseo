@@ -3,6 +3,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -323,6 +324,33 @@ describe("forkAgentSessionNatively", () => {
     mkdirSync(worktree, { recursive: true });
     await expect(forkWithCwd(worktree, "req-worktree")).rejects.toThrow(/same working directory/);
     expect(sdk.recordedForkCalls).toEqual([]);
+  });
+
+  it("refuses a path whose real directory escapes through a symlink", async () => {
+    const { realCwd, importedCwds } = useRealSourceDirectory();
+    // `source/link -> other/child`. Built as a string on purpose: `join` would
+    // collapse `link/..` lexically and destroy the case under test.
+    const other = join(dir, "other", "child");
+    mkdirSync(other, { recursive: true });
+    symlinkSync(other, join(realCwd, "link"), "dir");
+    const escaped = `${realCwd}/link/..`;
+    // Lexically this normalizes to the source directory; the directory it
+    // really names is `<dir>/other`. Importing under `source.cwd` would attach
+    // the fork to a context the user did not ask for.
+    expect(realpathSync.native(escaped)).toBe(realpathSync.native(join(dir, "other")));
+
+    await expect(forkWithCwd(escaped, "req-escape")).rejects.toThrow(/same working directory/);
+    expect(sdk.recordedForkCalls).toEqual([]);
+    expect(importedCwds).toEqual([]);
+  });
+
+  it("refuses a requested directory that does not exist", async () => {
+    const { importedCwds } = useRealSourceDirectory();
+    await expect(forkWithCwd(join(dir, "project-gone"), "req-missing")).rejects.toThrow(
+      /same working directory/,
+    );
+    expect(sdk.recordedForkCalls).toEqual([]);
+    expect(importedCwds).toEqual([]);
   });
 
   it("imports under the source agent's own spelling of the directory", async () => {

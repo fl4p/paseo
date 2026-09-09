@@ -3,7 +3,7 @@ import type { Logger } from "pino";
 import type { AgentProvider, AgentSessionConfig } from "./agent-sdk-types.js";
 import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import { resolveForkBoundaryMessageId } from "./activity-curator.js";
-import { createRealpathAwarePathMatcher } from "../../utils/path.js";
+import { isSameRealDirectory } from "../../utils/path.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
 export interface ForkAgentSessionRequest {
@@ -197,16 +197,25 @@ export function inheritedForkConfig(config: AgentSessionConfig): Partial<AgentSe
  * String equality is the wrong test: `/repo/`, `/repo/./`, a symlinked path and
  * a differently cased path on a case-insensitive filesystem all name the same
  * directory, and rejecting them would force a needless attachment fork with a
- * cold prompt cache. `createRealpathAwarePathMatcher` compares realpath
- * variants as well as the literal strings, so distinct git worktrees — whose
- * real paths genuinely differ — still fall back.
+ * cold prompt cache.
+ *
+ * But the permissive matcher used for cwd FILTERING is the wrong test too. It
+ * matches when any spelling of one side matches any spelling of the other, so
+ * with `source/link -> other/child` the request `source/link/..` — whose real
+ * directory is `other` — matches a source of `source`, and the fork is then
+ * imported under `source.cwd`, silently attached to a context the user did not
+ * ask for. Identity has to be strict: canonicalize BOTH sides the same way and
+ * compare once, and refuse anything that cannot be resolved at all.
+ *
+ * Distinct git worktrees have genuinely different real paths, so they still
+ * fail this and fall back to the attachment fork.
  *
  * This is the authoritative check. The client's `resolveForkMode` runs a
  * cheap lexical version of it as a hint, because the app may be on a different
  * machine and cannot realpath the daemon's filesystem.
  */
 function isSameDirectory(left: string, right: string): boolean {
-  return createRealpathAwarePathMatcher(left)(right);
+  return isSameRealDirectory(left, right);
 }
 
 async function importForkedSession(input: {
