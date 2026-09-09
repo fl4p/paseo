@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildAgentForkContextAttachment, curateAgentActivity } from "./activity-curator.js";
+import {
+  buildAgentForkContextAttachment,
+  curateAgentActivity,
+  resolveForkBoundaryMessageId,
+} from "./activity-curator.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 
@@ -438,5 +442,144 @@ second line'`,
         rows: [row(1, { type: "assistant_message", text: "Done.", messageId: "assistant-1" })],
       }),
     ).toThrow("Selected assistant message is no longer available.");
+  });
+});
+
+describe("fork context budget and compaction boundary", () => {
+  it("starts after the last completed compaction instead of replaying pre-compaction history", () => {
+    // The source session already summarized everything before the boundary;
+    // replaying it is exactly what inflated a <200k-token session into ~700k.
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "assistant_message", text: "ancient answer", messageId: "assistant-1" }),
+        row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+        row(4, { type: "user_message", text: "current task", messageId: "user-2" }),
+        row(5, { type: "assistant_message", text: "current answer", messageId: "assistant-2" }),
+      ],
+    });
+
+    expect(result.attachment.text).not.toContain("ancient task");
+    expect(result.attachment.text).not.toContain("ancient answer");
+    expect(result.attachment.text).toContain("current task");
+    expect(result.attachment.text).toContain("current answer");
+    expect(result.attachment.text).toContain("last compaction omitted");
+    expect(result.itemCount).toBe(2);
+  });
+
+  it("ignores a compaction that has not completed", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "compaction", status: "running", trigger: "auto" }),
+        row(3, { type: "user_message", text: "current task", messageId: "user-2" }),
+      ],
+    });
+
+    expect(result.attachment.text).toContain("ancient task");
+    expect(result.attachment.text).not.toContain("last compaction omitted");
+  });
+
+  it("only skips history before a compaction that precedes the boundary", () => {
+    const result = buildAgentForkContextAttachment({
+      boundaryMessageId: "assistant-1",
+      rows: [
+        row(1, { type: "user_message", text: "early task", messageId: "user-1" }),
+        row(2, { type: "assistant_message", text: "early answer", messageId: "assistant-1" }),
+        row(3, { type: "compaction", status: "completed", trigger: "auto" }),
+        row(4, { type: "user_message", text: "later task", messageId: "user-2" }),
+      ],
+    });
+
+    // The compaction happened after the selected boundary, so it says nothing
+    // about the selected range and must not truncate it.
+    expect(result.attachment.text).toContain("early task");
+    expect(result.attachment.text).not.toContain("later task");
+    expect(result.attachment.text).not.toContain("last compaction omitted");
+  });
+
+  it("truncates to the budget, keeping the opening task and the recent tail", () => {
+    const filler = "x".repeat(400);
+    const rows: AgentTimelineRow[] = [
+      row(1, { type: "user_message", text: "THE ORIGINAL TASK", messageId: "user-1" }),
+    ];
+    for (let index = 0; index < 20; index += 1) {
+      rows.push(
+        row(index + 2, {
+          type: "user_message",
+          text: `middle ${index} ${filler}`,
+          messageId: `user-mid-${index}`,
+        }),
+      );
+    }
+    rows.push(row(100, { type: "user_message", text: "THE LATEST TASK", messageId: "user-last" }));
+
+    const result = buildAgentForkContextAttachment({ rows, maxChars: 2000 });
+
+    expect(result.attachment.text.length).toBeLessThan(3000);
+    expect(result.attachment.text).toContain("THE ORIGINAL TASK");
+    expect(result.attachment.text).toContain("THE LATEST TASK");
+    expect(result.attachment.text).toContain("middle 19");
+    expect(result.attachment.text).not.toContain("middle 0 ");
+    expect(result.attachment.text).toContain("earlier history omitted");
+  });
+
+  it("leaves a within-budget history untouched", () => {
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, { type: "user_message", text: "small task", messageId: "user-1" }),
+        row(2, { type: "assistant_message", text: "small answer", messageId: "assistant-1" }),
+      ],
+      maxChars: 2000,
+    });
+
+    expect(result.attachment.text).not.toContain("earlier history omitted");
+    expect(result.attachment.text).toContain("small task");
+    expect(result.attachment.text).toContain("small answer");
+  });
+});
+
+describe("resolveForkBoundaryMessageId", () => {
+  const rows: AgentTimelineRow[] = [
+    row(1, { type: "user_message", text: "task", messageId: "user-1" }),
+    row(2, { type: "assistant_message", text: "answer", messageId: "assistant-1" }),
+    row(3, { type: "todo", items: [{ text: "step", completed: false }] }),
+  ];
+
+  it("returns null when no boundary was requested", () => {
+    expect(resolveForkBoundaryMessageId({ rows })).toBeNull();
+  });
+
+  it("resolves an assistant message id", () => {
+    expect(resolveForkBoundaryMessageId({ rows, boundaryMessageId: "assistant-1" })).toBe(
+      "assistant-1",
+    );
+  });
+
+  it("walks back from a cursor row that carries no message id", () => {
+    expect(
+      resolveForkBoundaryMessageId({
+        rows,
+        cursorBoundary: { timelineEpoch: "e1", cursor: { epoch: "e1", seq: 3 } },
+      }),
+    ).toBe("assistant-1");
+  });
+
+  it("rejects a stale cursor", () => {
+    expect(() =>
+      resolveForkBoundaryMessageId({
+        rows,
+        cursorBoundary: { timelineEpoch: "e2", cursor: { epoch: "e1", seq: 3 } },
+      }),
+    ).toThrow("Selected timeline position is no longer available.");
+  });
+
+  it("rejects a boundary with no provider message before it", () => {
+    expect(() =>
+      resolveForkBoundaryMessageId({
+        rows: [row(1, { type: "todo", items: [] })],
+        cursorBoundary: { timelineEpoch: "e1", cursor: { epoch: "e1", seq: 1 } },
+      }),
+    ).toThrow("no provider message");
   });
 });
