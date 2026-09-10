@@ -229,7 +229,7 @@ describe("daemon E2E (real codex) - rewind", () => {
     }
   }, 420_000);
 
-  test("rewinds a real Codex conversation to a forked thread while leaving file edits on disk", async () => {
+  test("rewinds a real Codex conversation in place while leaving file edits on disk", async () => {
     const session = await launchCodexRewindSession(harness, "codex-rewind-conversation-real");
 
     try {
@@ -250,12 +250,11 @@ describe("daemon E2E (real codex) - rewind", () => {
       expectThreadId(oldThreadId);
 
       await harness.client.rewindAgent(session.agentId, firstMessageId, "conversation");
-      const newThreadId = await fetchThreadId(harness.client, session.agentId);
+      const rewoundThreadId = await fetchThreadId(harness.client, session.agentId);
       const rewoundTimeline = await fetchTimelineItems(harness.client, session.agentId);
       const fileText = await readScratchFile(session);
 
-      expect(newThreadId).not.toBe(oldThreadId);
-      expectThreadId(newThreadId);
+      expect(rewoundThreadId).toBe(oldThreadId);
       expectTimeline(rewoundTimeline, { userTexts: [], assistantCount: 0 });
       await expectCreatedFiles(session, ["rewind-scratch.txt"]);
       expect(fileText).toBe("BASE\nCODEX_FIRST_MARKER\nCODEX_SECOND_MARKER\n");

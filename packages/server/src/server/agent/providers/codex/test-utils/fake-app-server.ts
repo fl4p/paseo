@@ -186,6 +186,12 @@ export function createFakeCodexAppServer(
         },
       };
     },
+    "thread/revert": (params) => ({
+      thread: { id: toJsonObject(params).threadId, turns: [] },
+      turnsBackwardsCursor: null,
+      itemsBackwardsCursor: null,
+    }),
+    "thread/unsubscribe": () => ({ status: "unsubscribed" }),
     "thread/read": () => ({ thread: { turns: [] } }),
     ...handlers,
   };

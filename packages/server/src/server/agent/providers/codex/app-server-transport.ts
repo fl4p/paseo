@@ -124,6 +124,28 @@ export function parseCodexThreadRollbackResponse(response: unknown): CodexThread
   return CodexThreadRollbackResponseSchema.parse(response);
 }
 
+export interface CodexThreadRevertParams {
+  threadId: string;
+  beforeTurnId: string;
+}
+
+const CodexThreadRevertResponseSchema = z
+  .object({
+    thread: z
+      .object({
+        id: z.string(),
+        sessionId: z.string().optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+export type CodexThreadRevertResponse = z.infer<typeof CodexThreadRevertResponseSchema>;
+
+export function parseCodexThreadRevertResponse(response: unknown): CodexThreadRevertResponse {
+  return CodexThreadRevertResponseSchema.parse(response);
+}
+
 export interface CodexAppServerTraceContext {
   agentId?: string;
   sessionId?: string;
@@ -246,6 +268,10 @@ export class CodexAppServerClient {
 
   async rollbackThread(params: CodexThreadRollbackParams): Promise<CodexThreadRollbackResponse> {
     return parseCodexThreadRollbackResponse(await this.request("thread/rollback", params));
+  }
+
+  async revertThread(params: CodexThreadRevertParams): Promise<CodexThreadRevertResponse> {
+    return parseCodexThreadRevertResponse(await this.request("thread/revert", params));
   }
 
   notify(method: string, params?: unknown): void {

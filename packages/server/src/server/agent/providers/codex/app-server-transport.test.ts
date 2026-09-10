@@ -144,4 +144,29 @@ describe("Codex app-server transport", () => {
     codex.child.stderr.end();
     codex.child.stdin.end();
   });
+
+  test("reverts a paginated Codex thread before a turn", async () => {
+    const codex = createFakeCodexAppServer({
+      "thread/revert": (params) => {
+        expect(params).toEqual({ threadId: "source-thread", beforeTurnId: "turn-second" });
+        return {
+          thread: { id: "source-thread", sessionId: "source-thread", turns: [] },
+          turnsBackwardsCursor: "cursor-first",
+          itemsBackwardsCursor: null,
+        };
+      },
+    });
+    const client = new CodexAppServerClient(codex.child, createTestLogger());
+
+    const reverted = await client.revertThread({
+      threadId: "source-thread",
+      beforeTurnId: "turn-second",
+    });
+
+    expect(reverted.thread.id).toBe("source-thread");
+    codex.assertNoErrors();
+    codex.child.stdout.end();
+    codex.child.stderr.end();
+    codex.child.stdin.end();
+  });
 });

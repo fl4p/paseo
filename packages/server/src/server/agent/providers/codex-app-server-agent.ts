@@ -81,6 +81,8 @@ import {
   parseCodexThreadRollbackResponse,
   type CodexThreadForkParams,
   type CodexThreadForkResponse,
+  type CodexThreadRevertParams,
+  type CodexThreadRevertResponse,
   type CodexThreadRollbackParams,
   type CodexThreadRollbackResponse,
   type CodexAppServerTraceContext,
@@ -248,6 +250,7 @@ interface CodexAppServerClientLike {
   request(method: string, params?: unknown): Promise<unknown>;
   forkThread?(params: CodexThreadForkParams): Promise<CodexThreadForkResponse>;
   rollbackThread?(params: CodexThreadRollbackParams): Promise<CodexThreadRollbackResponse>;
+  revertThread?(params: CodexThreadRevertParams): Promise<CodexThreadRevertResponse>;
   notify(method: string, params?: unknown): void;
   dispose(): Promise<void>;
 }
@@ -4757,7 +4760,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       await this.ensureThread();
     }
 
-    await revertCodexConversation({
+    const { backupThreadId } = await revertCodexConversation({
       client: this.client,
       threadId: this.currentThreadId,
       messageId: input.messageId,
@@ -4765,15 +4768,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       model: this.config.model ?? null,
       serviceTier: this.serviceTier,
       userMessageTurns: this.codexUserMessageTurns(),
-      setThreadId: async (threadId) => {
-        this.currentThreadId = threadId;
-        this.cachedRuntimeInfo = null;
-        this.persistedHistory = [];
-        this.historyPending = false;
-        await this.loadPersistedHistory();
-        this.reconcileAsyncQuestionsAfterRewind();
-      },
     });
+    this.logger.info(
+      { threadId: this.currentThreadId, backupThreadId },
+      "Codex rewind kept the pre-rewind conversation in a backup thread",
+    );
+    this.persistedHistory = [];
+    this.historyPending = false;
+    await this.loadPersistedHistory();
+    this.reconcileAsyncQuestionsAfterRewind();
   }
 
   async interrupt(): Promise<void> {

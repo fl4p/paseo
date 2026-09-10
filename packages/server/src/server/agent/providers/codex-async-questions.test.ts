@@ -95,18 +95,18 @@ async function setupRewind(fail = false) {
       items: [userMessage("rewind-here"), ...records.slice(2).map((r) => r.item)],
     },
   ];
+  let rolledBack = false;
   const appServer = createFakeCodexAppServer({
-    "thread/read": (params) => {
-      const { threadId } = params as { threadId: string };
-      return {
-        thread: { id: threadId, turns: threadId === "thread-1" ? turns : turns.slice(0, 1) },
-      };
+    "thread/read": () => ({
+      thread: { id: "thread-1", turns: rolledBack ? turns.slice(0, 1) : turns },
+    }),
+    "thread/rollback": () => {
+      if (fail) {
+        return { __jsonRpcError: { code: -32000, message: "Rewind failed" } };
+      }
+      rolledBack = true;
+      return { thread: { id: "thread-1", turns: turns.slice(0, 1) } };
     },
-    ...(fail
-      ? {
-          "thread/rollback": () => ({ __jsonRpcError: { code: -32000, message: "Rewind failed" } }),
-        }
-      : {}),
   });
   const session = new CodexAppServerAgentSession(
     { provider: "codex", cwd: tmpdir(), model: "gpt-5.4", modeId: "full-access" },
@@ -214,7 +214,7 @@ test("manager publishes and saves the provider state after rewind", async () => 
     const snapshot = manager.getAgent(agent.id)!;
     expect(Array.from(snapshot.pendingPermissions.keys())).toEqual(["permission-earlier-pending"]);
     expect(snapshot.persistence).toEqual(session.describePersistence());
-    expect(snapshot.persistence?.sessionId).toBe("forked-thread");
+    expect(snapshot.persistence?.sessionId).toBe("thread-1");
   } finally {
     await manager.closeAgent(agent.id);
   }
