@@ -11,6 +11,8 @@ interface FakeDesktopHost {
   emit: (event: string, payload: unknown) => void;
   startCalls: DesktopFindStartInput[];
   stopCalls: DesktopFindStopAction[];
+  /** What the main process answers: whether a browser pane was there to search. */
+  searchable: boolean;
 }
 
 function installFakeHost(): FakeDesktopHost {
@@ -23,6 +25,7 @@ function installFakeHost(): FakeDesktopHost {
     },
     startCalls: [],
     stopCalls: [],
+    searchable: true,
   };
 
   window.paseoDesktop = {
@@ -40,7 +43,7 @@ function installFakeHost(): FakeDesktopHost {
     find: {
       start: (input) => {
         host.startCalls.push(input);
-        return Promise.resolve();
+        return Promise.resolve({ searched: host.searchable });
       },
       stop: (action) => {
         host.stopCalls.push(action ?? "clearSelection");
@@ -167,6 +170,7 @@ describe("FindInPageBar without a transcript", () => {
       { query: "needle", forward: false, findNext: true },
     ]);
 
+    await settle();
     act(() => host.emit("find-result", { activeMatchOrdinal: 2, matches: 7, finalUpdate: true }));
     expect(statusText(container)).toBe("2 of 7");
   });
@@ -187,6 +191,23 @@ describe("FindInPageBar without a transcript", () => {
 
     act(() => host.emit("find-next", {}));
     expect(host.startCalls).toEqual([]);
+  });
+});
+
+describe("FindInPageBar with nothing searchable", () => {
+  it("claims nothing when the window has no transcript and no browser pane", async () => {
+    const host = installFakeHost();
+    host.searchable = false;
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "needle");
+    await settle();
+    act(() => host.emit("find-result", { activeMatchOrdinal: 0, matches: 0, finalUpdate: true }));
+
+    // "No matches" would be a claim about text nobody searched.
+    expect(statusText(container)).toBe("");
   });
 });
 
