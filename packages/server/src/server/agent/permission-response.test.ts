@@ -44,6 +44,10 @@ class FakePermissionAgentManager {
     return this.hasRunInFlight;
   }
 
+  isHoldingPromptsForCompaction(): boolean {
+    return false;
+  }
+
   streamAgent(
     agentId: string,
     prompt: AgentPromptInput,

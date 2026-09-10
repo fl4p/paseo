@@ -18,6 +18,7 @@ export type AgentRunController = Pick<
   | "getAgent"
   | "tryRunOutOfBand"
   | "hasInFlightRun"
+  | "isHoldingPromptsForCompaction"
   | "replaceAgentRun"
   | "steerOrReplaceActiveTurn"
   | "streamAgent"
@@ -31,7 +32,11 @@ export interface StartAgentRunOptions {
   clearPendingPermissions?: boolean;
 }
 
-export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started";
+/**
+ * `held`: a compaction is running, so the prompt waits and is dispatched once it ends. No turn
+ * starts now, so callers must not wait for one.
+ */
+export type PromptDispatchDisposition = "out_of_band" | "steered" | "turn_started" | "held";
 
 async function steerOrReplaceActiveRun(
   agentManager: AgentRunController,
@@ -41,7 +46,7 @@ async function steerOrReplaceActiveRun(
 ): Promise<
   | { disposition: "steered" }
   | {
-      disposition: "turn_started";
+      disposition: "turn_started" | "held";
       iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
     }
   | null
@@ -59,6 +64,9 @@ async function steerOrReplaceActiveRun(
   if (result.status === "replaced") {
     return { disposition: "turn_started", iterator: result.iterator };
   }
+  if (result.status === "held") {
+    return { disposition: "held", iterator: result.iterator };
+  }
   return null;
 }
 
@@ -70,12 +78,15 @@ async function startOrReplaceRun(
 ): Promise<{
   iterator: AsyncGenerator<import("./agent-sdk-types.js").AgentStreamEvent>;
   replaced: boolean;
+  held: boolean;
 }> {
   const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
+  // Read in the same tick replaceAgentRun makes the same decision, so the two cannot disagree.
+  const held = replaced && agentManager.isHoldingPromptsForCompaction(agentId);
   const iterator = replaced
     ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
     : agentManager.streamAgent(agentId, prompt, options?.runOptions);
-  return { iterator, replaced };
+  return { iterator, replaced, held };
 }
 
 export async function startAgentRun(
@@ -108,8 +119,8 @@ export async function startAgentRun(
   if (steered?.disposition === "steered") {
     return steered;
   }
-  const { iterator, replaced } = steered
-    ? { iterator: steered.iterator, replaced: true }
+  const { iterator, replaced, held } = steered
+    ? { iterator: steered.iterator, replaced: true, held: steered.disposition === "held" }
     : await startOrReplaceRun(agentManager, agentId, prompt, options);
   logger.trace(
     {
@@ -146,7 +157,7 @@ export async function startAgentRun(
       logger.error({ err: error, agentId }, "Agent stream failed");
     }
   })();
-  return { disposition: "turn_started" };
+  return { disposition: held ? "held" : "turn_started" };
 }
 
 /**

@@ -27,6 +27,7 @@ import {
   type AgentSlashCommand,
   type AgentStreamEvent,
   type AgentTimelineItem,
+  type CompactionOutcome,
   type ToolCallTimelineItem,
   type AgentUsage,
   type FetchCatalogOptions,
@@ -3364,6 +3365,10 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly userMessageTurnIds: string[] = [];
   private readonly userMessageProviderTurnIds = new Map<string, string>();
   private pendingManualCompactionStarts = 0;
+  /** Counts root `turn/started` notifications; orders manual compaction arms against turns. */
+  private rootTurnStartOrdinal = 0;
+  /** `rootTurnStartOrdinal` when `/compact` last armed `pendingManualCompactionStarts`. */
+  private manualCompactionArmedAtTurnOrdinal = 0;
   private compactionTriggerByItemId = new Map<string, "auto" | "manual">();
   private pendingRootCompactionItemIds = new Set<string>();
   private pendingAnonymousRootCompactions = 0;
@@ -3553,7 +3558,10 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.connected = false;
     const hasActiveRootTurn = this.activeForegroundTurnId !== null || this.currentTurnId !== null;
     this.clearPendingPermissions({ preservePlanApprovals: !hasActiveRootTurn });
+    // A dead app-server finishes no compaction, and delivers no item to consume a manual arm.
+    this.pendingManualCompactionStarts = 0;
     if (hasActiveRootTurn) {
+      this.completePendingRootCompactions("failed");
       this.emitEvent({
         type: "turn_failed",
         provider: CODEX_PROVIDER,
@@ -4954,6 +4962,7 @@ export class CodexAppServerAgentSession implements AgentSession {
         throw new Error("Codex thread is not available");
       }
       this.pendingManualCompactionStarts += 1;
+      this.manualCompactionArmedAtTurnOrdinal = this.rootTurnStartOrdinal;
       try {
         await this.client.request("thread/compact/start", {
           threadId: this.currentThreadId,
@@ -5912,6 +5921,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       return;
     }
     this.currentTurnId = parsed.turnId;
+    this.rootTurnStartOrdinal += 1;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
     if (
       pendingIdentification &&
@@ -5938,7 +5948,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       this.emitSubAgentActivityUpdate(subAgentCallId, status);
       return;
     }
-    this.completePendingRootCompactions();
+    this.completePendingRootCompactions(this.compactionOutcomeForTurnStatus(parsed.status));
     if (parsed.status === "failed") {
       this.emitEvent({
         type: "turn_failed",
@@ -5965,6 +5975,28 @@ export class CodexAppServerAgentSession implements AgentSession {
     this.pendingForegroundTurnIdentification = null;
     this.pendingSubAgentNotificationsByThreadId.clear();
     this.resetTurnTrackingState();
+    this.dropManualCompactionStartsOutlivedByTurn();
+  }
+
+  /**
+   * `thread/compact/start` counts a manual compaction BEFORE its turn starts, and only a compaction
+   * item consumes the count. A turn that ends without that item (interrupted before Codex emitted
+   * it) leaves the count stale, and a stale count labels the NEXT compaction, even an automatic
+   * one, as manual.
+   *
+   * The reset cannot live in `resetTurnTrackingState`: that also runs at turn START, which would
+   * clear the count of the very compaction turn that is starting. And not every turn end qualifies:
+   * `/compact` sent while an older turn is still running is armed during that turn, so its end must
+   * leave the count alone. Only a turn that started after the most recent arm can be the compaction
+   * turn, so only its end drops the count.
+   */
+  private dropManualCompactionStartsOutlivedByTurn(): void {
+    if (
+      this.pendingManualCompactionStarts > 0 &&
+      this.rootTurnStartOrdinal > this.manualCompactionArmedAtTurnOrdinal
+    ) {
+      this.pendingManualCompactionStarts = 0;
+    }
   }
 
   private resetTurnTrackingState(): void {
@@ -6075,21 +6107,30 @@ export class CodexAppServerAgentSession implements AgentSession {
     return undefined;
   }
 
-  private completePendingRootCompactions(): void {
+  /** An interrupted or failed turn cannot have finished the compaction it was running. */
+  private compactionOutcomeForTurnStatus(status: string): CompactionOutcome | undefined {
+    if (status === "interrupted") return "canceled";
+    if (status === "failed") return "failed";
+    return undefined;
+  }
+
+  private completePendingRootCompactions(outcome: CompactionOutcome | undefined): void {
     // Some Codex builds end a turn without completing the contextCompaction
     // item. Close every loading timeline row before emitting the terminal turn.
+    // The row must not claim a compaction the turn never finished: an interrupted
+    // or failed turn closes it with that outcome instead.
     for (const itemId of this.pendingRootCompactionItemIds) {
       this.emitEvent({
         type: "timeline",
         provider: CODEX_PROVIDER,
-        item: this.createContextCompactionTimelineItem("completed", itemId),
+        item: this.createContextCompactionTimelineItem("completed", itemId, outcome),
       });
     }
     for (let index = 0; index < this.pendingAnonymousRootCompactions; index += 1) {
       this.emitEvent({
         type: "timeline",
         provider: CODEX_PROVIDER,
-        item: this.createContextCompactionTimelineItem("completed"),
+        item: this.createContextCompactionTimelineItem("completed", undefined, outcome),
       });
     }
     this.pendingRootCompactionItemIds.clear();
@@ -6099,6 +6140,7 @@ export class CodexAppServerAgentSession implements AgentSession {
   private createContextCompactionTimelineItem(
     status: "loading" | "completed",
     itemId?: string,
+    outcome?: CompactionOutcome,
   ): Extract<AgentTimelineItem, { type: "compaction" }> {
     const trigger = this.resolveContextCompactionTrigger(itemId);
     if (itemId && trigger) {
@@ -6112,6 +6154,7 @@ export class CodexAppServerAgentSession implements AgentSession {
       type: "compaction",
       status,
       ...(trigger ? { trigger } : {}),
+      ...(status === "completed" && outcome ? { outcome } : {}),
     };
   }
 

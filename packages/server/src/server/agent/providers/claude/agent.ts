@@ -117,6 +117,7 @@ import {
   type AgentSession,
   type AgentSessionConfig,
   type AgentSlashCommand,
+  type CompactionOutcome,
   type SteerActiveTurnOptions,
   type SteerResult,
   type AgentStreamEvent,
@@ -1422,6 +1423,30 @@ class TimelineAssembler {
   }
 }
 
+/** Opening sentence of the summary user message the CLI writes after compacting. */
+const CLAUDE_COMPACT_SUMMARY_OPENING =
+  "This session is being continued from a previous conversation that ran out of context.";
+
+function readFirstUserText(record: Record<string, unknown> | null | undefined): string {
+  const content = toObjectRecord(record?.message)?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const first = toObjectRecord(content[0]);
+  return typeof first?.text === "string" ? first.text : "";
+}
+
+/**
+ * A turn that was canceled or failed cannot have finished compacting; a completed turn whose marker
+ * is still open is a compaction that ended without a boundary (e.g. a no-op /compact).
+ */
+function compactionOutcomeForTurnEnd(
+  type: AgentStreamEvent["type"],
+): CompactionOutcome | undefined {
+  if (type === "turn_canceled") return "canceled";
+  if (type === "turn_failed") return "failed";
+  return undefined;
+}
+
 function isSyntheticUserEntry(entry: unknown): boolean {
   const candidate = toObjectRecord(entry);
   if (!candidate) {
@@ -2109,10 +2134,19 @@ class ClaudeAgentSession implements AgentSession {
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
   private lastOptionsModel: string | null = null;
   private lastRuntimeModel: string | null = null;
+  /** A compaction is running: from the CLI's `compacting` status until anything ends it. */
   private compacting = false;
+  /**
+   * A `compact_boundary` arrived and its summary user message may still follow. Only consulted to
+   * recognize a summary that a CLI streams without any flag; see `isStreamedCompactSummary`.
+   */
+  private awaitingCompactSummary = false;
   /** A `compaction`/`loading` marker has been emitted and not yet terminalized. */
   private compactionMarkerOpen = false;
-  /** The open marker was terminalized by something other than a `compact_boundary`. */
+  /**
+   * The open marker was terminalized as a successful compaction by something other than a
+   * `compact_boundary`, so a late boundary must not draw a second separator.
+   */
   private compactionMarkerClosedWithoutBoundary = false;
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
@@ -3085,8 +3119,8 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private rebindConversationSession(sessionId: string): void {
-    // The new session cannot inherit the old one's in-flight compaction.
-    this.notifyCompactionMarkerClosed();
+    // The new session cannot inherit the old one's in-flight compaction, which never finished here.
+    this.notifyCompactionMarkerClosed("canceled");
     const oldSessionId = this.claudeSessionId;
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = null;
@@ -3708,21 +3742,30 @@ class ClaudeAgentSession implements AgentSession {
    * and — worse — a flag left set makes the NEXT real compaction emit no marker at all, so every
    * path that ends a turn has to come through here.
    */
-  private closeCompactionMarker(): Extract<AgentStreamEvent, { type: "timeline" }> | null {
+  private closeCompactionMarker(
+    outcome?: CompactionOutcome,
+  ): Extract<AgentStreamEvent, { type: "timeline" }> | null {
+    // Whatever ends the marker ends the compaction. Left set, `compacting` refuses every later steer
+    // (so each mid-turn prompt replaces the turn instead) until some user message happens by.
+    this.compacting = false;
     if (!this.compactionMarkerOpen) {
       return null;
     }
     this.compactionMarkerOpen = false;
-    this.compactionMarkerClosedWithoutBoundary = true;
+    // A canceled or failed marker said "did not compact". If a boundary still arrives, the
+    // compaction did land after all and deserves its own separator.
+    this.compactionMarkerClosedWithoutBoundary = outcome === undefined;
     return {
       type: "timeline",
       provider: "claude",
-      item: { type: "compaction", status: "completed" },
+      item: { type: "compaction", status: "completed", ...(outcome ? { outcome } : {}) },
     };
   }
 
-  private notifyCompactionMarkerClosed(): void {
-    const closed = this.closeCompactionMarker();
+  /** Terminal paths: a turn that ends cannot leave a compaction, or its summary, pending. */
+  private notifyCompactionMarkerClosed(outcome?: CompactionOutcome): void {
+    this.awaitingCompactSummary = false;
+    const closed = this.closeCompactionMarker(outcome);
     if (closed) {
       this.notifySubscribers(closed);
     }
@@ -3734,7 +3777,7 @@ class ClaudeAgentSession implements AgentSession {
     if (event.type === "turn_failed" || event.type === "turn_canceled") {
       this.flushPendingToolCalls();
     }
-    this.notifyCompactionMarkerClosed();
+    this.notifyCompactionMarkerClosed(compactionOutcomeForTurnEnd(event.type));
     this.notifySubscribers(event);
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
@@ -3748,7 +3791,7 @@ class ClaudeAgentSession implements AgentSession {
     let terminalSeen = false;
     for (const event of events) {
       if (this.isTerminalTurnEvent(event)) {
-        this.notifyCompactionMarkerClosed();
+        this.notifyCompactionMarkerClosed(compactionOutcomeForTurnEnd(event.type));
       }
       this.notifySubscribers(event);
       terminalSeen ||= this.isTerminalTurnEvent(event);
@@ -4428,17 +4471,19 @@ class ClaudeAgentSession implements AgentSession {
       }
     }
     // The compaction's own outcome, reported on a later status message. A failed compaction must
-    // not be reported as a successful one, so the marker closes and the error is stated.
+    // not be reported as a successful one: the marker itself says it failed.
     const compactResult = record?.compact_result;
     if (compactResult !== "success" && compactResult !== "failed") {
       return;
     }
-    const closed = this.closeCompactionMarker();
+    const closed = this.closeCompactionMarker(compactResult === "failed" ? "failed" : undefined);
     if (closed) {
       events.push(closed);
     }
-    if (compactResult === "failed") {
-      const detail = typeof record?.compact_error === "string" ? record.compact_error : null;
+    const detail = typeof record?.compact_error === "string" ? record.compact_error : null;
+    // The marker already says "failed"; a separate error row only earns its place by carrying the
+    // CLI's reason, or by being the only trace when no marker was open to close.
+    if (compactResult === "failed" && (detail || !closed)) {
       events.push({
         type: "timeline",
         provider: "claude",
@@ -4478,6 +4523,8 @@ class ClaudeAgentSession implements AgentSession {
     }
     if (message.subtype === "compact_boundary") {
       const alreadyClosed = this.compactionMarkerClosedWithoutBoundary;
+      this.compacting = false;
+      this.awaitingCompactSummary = true;
       this.compactionMarkerOpen = false;
       this.compactionMarkerClosedWithoutBoundary = false;
       const compactMetadata = readCompactionMetadata(message);
@@ -4566,11 +4613,10 @@ class ClaudeAgentSession implements AgentSession {
       });
       return;
     }
-    if (isSyntheticUserEntry(message)) {
+    if (this.isStreamedCompactSummary(message)) {
       return;
     }
-    if (this.compacting) {
-      this.compacting = false;
+    if (isSyntheticUserEntry(message)) {
       return;
     }
     if (messageId && this.emittedUserMessageIds.has(messageId)) {
@@ -4604,6 +4650,29 @@ class ClaudeAgentSession implements AgentSession {
     if (Array.isArray(content)) {
       this.appendUserContentArrayEvents(content, messageId, events);
     }
+  }
+
+  /**
+   * Whether a streamed user message is the compaction summary, which must not render as a prompt.
+   *
+   * This used to be "the first non-synthetic user message after `compacting`", which never matched
+   * the summary: the CLI streams it with `isSynthetic` set (its SDK serializer derives that from
+   * `isCompactSummary`/`isVisibleInTranscriptOnly`), so `isSyntheticUserEntry` drops it first. The
+   * rule instead swallowed the next REAL user message. Recognize the summary by what identifies it:
+   * `isCompactSummary` (transcripts, replays), or, for a CLI that streams it with no flag at all,
+   * the summary's fixed opening sentence on the first user message after a `compact_boundary`.
+   */
+  private isStreamedCompactSummary(message: Extract<SDKMessage, { type: "user" }>): boolean {
+    const record = toObjectRecord(message);
+    if (record?.isCompactSummary === true) {
+      this.awaitingCompactSummary = false;
+      return true;
+    }
+    if (!this.awaitingCompactSummary || isSyntheticUserEntry(message)) {
+      return false;
+    }
+    this.awaitingCompactSummary = false;
+    return readFirstUserText(record).startsWith(CLAUDE_COMPACT_SUMMARY_OPENING);
   }
 
   private appendUserTaskNotificationEvent(
@@ -4674,7 +4743,10 @@ class ClaudeAgentSession implements AgentSession {
     const usage = this.convertUsage(message, message.modelUsage);
     // A compaction that ends without a `compact_boundary` (failed, interrupted, or a no-op
     // /compact) would otherwise leave the spinner running until something else redraws it.
-    const closedCompaction = this.closeCompactionMarker();
+    // An error result did not compact, so the marker must not say it did.
+    const closedCompaction = this.closeCompactionMarker(
+      message.subtype === "success" ? undefined : "failed",
+    );
     if (closedCompaction) {
       events.push(closedCompaction);
     }

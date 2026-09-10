@@ -316,7 +316,15 @@ export interface AgentManagerOptions {
 
 export type ActiveTurnSteerDispatchResult =
   | { status: "inactive" | "steered" }
-  | { status: "replaced"; iterator: AsyncGenerator<AgentStreamEvent> };
+  | { status: "replaced"; iterator: AsyncGenerator<AgentStreamEvent> }
+  /** A compaction is running: the prompt is dispatched (steer or new turn) once it has ended. */
+  | { status: "held"; iterator: AsyncGenerator<AgentStreamEvent> };
+
+/** A compaction the provider reported as running; prompts wait on `released`. */
+interface CompactionGate {
+  released: Promise<void>;
+  release: () => void;
+}
 
 function stripSteerOptions(options?: AgentSteerOptions): AgentRunOptions | undefined {
   if (!options) return undefined;
@@ -701,6 +709,10 @@ export class AgentManager {
   private readonly sessionEventTails = new Map<string, Promise<void>>();
   private readonly steerEventBarriers = new Map<string, SteerEventBarrier>();
   private readonly foregroundMutationTails = new Map<string, Promise<void>>();
+  /** Agents with a compaction running; see `holdPromptUntilCompactionEnds`. */
+  private readonly compactionGates = new Map<string, CompactionGate>();
+  /** Per agent, the dispatch of the latest prompt held behind a compaction, for FIFO delivery. */
+  private readonly heldPromptTails = new Map<string, Promise<void>>();
   private readonly runs = new AgentRunState();
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
@@ -1660,6 +1672,8 @@ export class AgentManager {
     );
     await this.drainSessionEvents(agentId);
     this.cancelRunningProviderSubagents(agentId);
+    // Held prompts wake up and fail visibly against the closed agent instead of waiting forever.
+    this.releaseCompactionGate(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
     try {
@@ -2600,6 +2614,134 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
+    if (this.isHoldingPromptsForCompaction(agentId)) {
+      return this.holdPromptUntilCompactionEnds(agentId, () =>
+        this.replaceAgentRunNow(agentId, prompt, options),
+      );
+    }
+    return this.replaceAgentRunNow(agentId, prompt, options);
+  }
+
+  /**
+   * Whether a prompt sent now would be held until a running compaction ends, instead of replacing
+   * or steering the turn that runs it.
+   */
+  isHoldingPromptsForCompaction(agentId: string): boolean {
+    if (!this.compactionGates.has(agentId)) {
+      return false;
+    }
+    // A gate outliving every run can only be a provider that never closed its marker. Holding
+    // behind it would strand the prompt on an idle agent.
+    if (!this.hasInFlightRun(agentId)) {
+      this.releaseCompactionGate(agentId);
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * A prompt that arrives while the provider is compacting must not cancel the compaction to take
+   * its place: that threw the compaction away while the timeline still said "compacted". Hold it,
+   * then dispatch it through `dispatch` (the same steer/replace path it arrived on) once the
+   * compaction has ended, in arrival order.
+   *
+   * The caller gets its iterator at once, so a send RPC settles immediately instead of racing the
+   * client's request timeout; the client keeps the message pending until the canonical prompt row
+   * lands. Stop is never held: it ends the compaction, and that releases the prompt.
+   */
+  private holdPromptUntilCompactionEnds(
+    agentId: string,
+    dispatch: () => Promise<AsyncGenerator<AgentStreamEvent> | null>,
+  ): AsyncGenerator<AgentStreamEvent> {
+    const previous = this.heldPromptTails.get(agentId) ?? Promise.resolve();
+    const delivery = previous.then(() => this.waitForCompactionToEnd(agentId)).then(dispatch);
+    const tail = delivery.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.heldPromptTails.set(agentId, tail);
+    void tail.then(() => {
+      if (this.heldPromptTails.get(agentId) === tail) {
+        this.heldPromptTails.delete(agentId);
+      }
+      return undefined;
+    });
+    delivery.catch((error: unknown) => {
+      this.reportHeldPromptFailure(agentId, error);
+    });
+    this.logger.trace({ agentId }, "agent.manager.prompt.held_for_compaction");
+    return (async function* deliverHeldPrompt() {
+      const iterator = await delivery;
+      if (iterator) {
+        yield* iterator;
+      }
+    })();
+  }
+
+  private async waitForCompactionToEnd(agentId: string): Promise<void> {
+    while (this.isHoldingPromptsForCompaction(agentId)) {
+      await this.compactionGates.get(agentId)?.released;
+      // A compaction's end and the end of the turn that ran it arrive back to back. Let output the
+      // provider has already produced land first, so a held prompt does not interrupt a turn that
+      // is finishing anyway. This narrows that window; it does not close it.
+      await this.drainSessionEvents(agentId);
+      await new Promise<void>((resolveTick) => setImmediate(resolveTick));
+      await this.drainSessionEvents(agentId);
+    }
+  }
+
+  private reportHeldPromptFailure(agentId: string, error: unknown): void {
+    this.logger.error({ err: error, agentId }, "Failed to deliver a prompt held for compaction");
+    const agent = this.agents.get(agentId);
+    if (!agent) {
+      return;
+    }
+    const reason = error instanceof Error ? error.message : String(error);
+    void this.appendSystemErrorTimelineMessage(
+      agent,
+      agent.provider,
+      `Could not send the message held while compacting: ${reason}`,
+    ).catch((appendError: unknown) => {
+      this.logger.warn({ err: appendError, agentId }, "Failed to report a held prompt failure");
+    });
+  }
+
+  private trackCompactionGate(agentId: string, item: AgentTimelineItem): void {
+    if (item.type !== "compaction") {
+      return;
+    }
+    if (item.status === "loading") {
+      this.openCompactionGate(agentId);
+      return;
+    }
+    this.releaseCompactionGate(agentId);
+  }
+
+  private openCompactionGate(agentId: string): void {
+    if (this.compactionGates.has(agentId)) {
+      return;
+    }
+    let release!: () => void;
+    const released = new Promise<void>((resolveGate) => {
+      release = resolveGate;
+    });
+    this.compactionGates.set(agentId, { released, release });
+  }
+
+  private releaseCompactionGate(agentId: string): void {
+    const gate = this.compactionGates.get(agentId);
+    if (!gate) {
+      return;
+    }
+    this.compactionGates.delete(agentId);
+    gate.release();
+  }
+
+  private async replaceAgentRunNow(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): Promise<AsyncGenerator<AgentStreamEvent>> {
     const snapshot = this.requireAgent(agentId);
     if (
       snapshot.lifecycle !== "running" &&
@@ -2661,6 +2803,14 @@ export class AgentManager {
     options?: AgentSteerOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
     const agent = this.requireSessionAgent(agentId);
+    if (this.isHoldingPromptsForCompaction(agentId)) {
+      return {
+        status: "held",
+        iterator: this.holdPromptUntilCompactionEnds(agentId, () =>
+          this.dispatchPromptHeldForSteer(agentId, prompt, options),
+        ),
+      };
+    }
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId) {
       return { status: "inactive" };
@@ -2699,6 +2849,26 @@ export class AgentManager {
         stripSteerOptions(options),
       ),
     };
+  }
+
+  /**
+   * Dispatch a steer that waited for a compaction, exactly as it would have been dispatched had it
+   * arrived now. The prompt dispatcher starts a turn when steering finds no steerable turn; so does
+   * this, since the turn that ran the compaction is usually gone by the time it is released.
+   */
+  private async dispatchPromptHeldForSteer(
+    agentId: string,
+    prompt: AgentPromptInput,
+    options?: AgentSteerOptions,
+  ): Promise<AsyncGenerator<AgentStreamEvent> | null> {
+    const result = await this.steerOrReplaceActiveTurn(agentId, prompt, options);
+    if (result.status === "replaced" || result.status === "held") {
+      return result.iterator;
+    }
+    if (result.status === "steered") {
+      return null;
+    }
+    return this.replaceAgentRun(agentId, prompt, stripSteerOptions(options));
   }
 
   private assertSteerAdmissionOwnsTurn(agent: ActiveManagedAgent, expectedTurnId: string): void {
@@ -3007,6 +3177,9 @@ export class AgentManager {
       this.touchUpdatedAt(agent);
       this.emitState(agent);
     }
+    // A settled cancel ended any compaction the run was doing, even on a path that published no
+    // terminal event. Release its held prompts rather than leave them waiting on an idle agent.
+    this.releaseCompactionGate(agentId);
     return { status: "settled" };
   }
 
@@ -4230,6 +4403,9 @@ export class AgentManager {
         if (isForegroundEvent) {
           this.finalizeForegroundTurn(agent, eventTurnId);
         }
+        // No compaction outlives a turn end, whether or not the provider closed its marker.
+        // Released last, so a held prompt sees the run already settled.
+        this.releaseCompactionGate(agent.id);
       }
 
       if (flags.shouldDispatchEvent) {
@@ -4448,6 +4624,7 @@ export class AgentManager {
       return;
     }
 
+    this.trackCompactionGate(agent.id, event.item);
     this.recordAndDispatchTimelineItem(agent.id, event.item, event.provider, event.turnId);
     if (event.item.type === "user_message") {
       agent.lastUserMessageAt = new Date();

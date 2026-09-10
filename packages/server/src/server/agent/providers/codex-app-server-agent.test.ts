@@ -4692,27 +4692,33 @@ describe("Codex app-server provider", () => {
   test.each([
     { status: "failed", terminalType: "turn_failed" },
     { status: "interrupted", terminalType: "turn_canceled" },
-  ])("completes a pending compaction before a $status turn", async ({ status, terminalType }) => {
-    const { appServer, session, events, terminalEvent } = await startCompactionTurnTest();
+  ])(
+    "closes a pending compaction before a $status turn without calling it compacted",
+    async ({ status, terminalType }) => {
+      const { appServer, session, events, terminalEvent } = await startCompactionTurnTest();
 
-    try {
-      appServer.startsCompaction({ threadId: "thread-1", itemId: `compact-${status}` });
-      appServer.completeTurn({
-        status,
-        error: status === "failed" ? { message: "Compaction failed" } : null,
-      });
-      await terminalEvent;
+      try {
+        appServer.startsCompaction({ threadId: "thread-1", itemId: `compact-${status}` });
+        appServer.completeTurn({
+          status,
+          error: status === "failed" ? { message: "Compaction failed" } : null,
+        });
+        await terminalEvent;
 
-      expect(
-        events.map((event) =>
-          event.type === "timeline" ? `${event.item.type}:${event.item.status}` : event.type,
-        ),
-      ).toEqual(["compaction:loading", "compaction:completed", terminalType]);
-      appServer.assertNoErrors();
-    } finally {
-      await session.close();
-    }
-  });
+        const outcome = status === "failed" ? "failed" : "canceled";
+        expect(
+          events.map((event) =>
+            event.type === "timeline" && event.item.type === "compaction"
+              ? `${event.item.type}:${event.item.status}:${event.item.outcome ?? "-"}`
+              : event.type,
+          ),
+        ).toEqual(["compaction:loading:-", `compaction:completed:${outcome}`, terminalType]);
+        appServer.assertNoErrors();
+      } finally {
+        await session.close();
+      }
+    },
+  );
 
   test("emits and dedupes Codex thread/compacted notifications", () => {
     const session = createSession();

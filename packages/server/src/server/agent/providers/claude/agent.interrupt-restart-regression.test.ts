@@ -3,7 +3,9 @@ import { afterEach, expect, test, vi } from "vitest";
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import { ClaudeAgentClient } from "./agent.js";
 import { streamSession } from "../test-utils/session-stream-adapter.js";
-import type { AgentSession, AgentStreamEvent } from "../../agent-sdk-types.js";
+import { AgentManager, type AgentManagerEvent } from "../../agent-manager.js";
+import { startAgentRun } from "../../agent-prompt.js";
+import type { AgentSession, AgentStreamEvent, AgentTimelineItem } from "../../agent-sdk-types.js";
 
 interface QueryMock {
   next: ReturnType<typeof vi.fn>;
@@ -16,6 +18,8 @@ interface QueryMock {
   supportedCommands: ReturnType<typeof vi.fn>;
   rewindFiles: ReturnType<typeof vi.fn>;
   cancelAsyncMessage: ReturnType<typeof vi.fn>;
+  applyFlagSettings: ReturnType<typeof vi.fn>;
+  stopTask: ReturnType<typeof vi.fn>;
   [Symbol.asyncIterator]: () => AsyncIterator<Record<string, unknown>, void>;
 }
 
@@ -141,6 +145,9 @@ function createScriptedQuery(params: {
     supportedCommands: vi.fn(async () => []),
     rewindFiles: vi.fn(async () => ({ canRewind: true })),
     cancelAsyncMessage: vi.fn(async () => true),
+    // The AgentManager path applies session flags on start; the bare session path never does.
+    applyFlagSettings: vi.fn(async () => undefined),
+    stopTask: vi.fn(async () => undefined),
     emit: (message: Record<string, unknown>) => {
       output.push(message);
     },
@@ -1125,3 +1132,399 @@ test("interrupting a compaction closes its marker and leaves the next compaction
   unsubscribe();
   await session.close();
 });
+
+const COMPACT_SUMMARY_TEXT =
+  "This session is being continued from a previous conversation that ran out of context. " +
+  "The summary below covers the earlier portion of the conversation.";
+
+function buildCompactingStatus(sessionId: string) {
+  return { type: "system", subtype: "status", status: "compacting", session_id: sessionId };
+}
+
+function buildCompactBoundary(sessionId: string) {
+  return {
+    type: "system",
+    subtype: "compact_boundary",
+    uuid: "compact-boundary-1",
+    compact_metadata: { trigger: "manual", pre_tokens: 120_000 },
+    session_id: sessionId,
+  };
+}
+
+/** The summary as the CLI streams it: its SDK serializer sets `isSynthetic` for a compact summary. */
+function buildStreamedCompactSummary(sessionId: string) {
+  return {
+    type: "user",
+    uuid: "compact-summary-1",
+    parent_tool_use_id: null,
+    isSynthetic: true,
+    message: { role: "user", content: COMPACT_SUMMARY_TEXT },
+    session_id: sessionId,
+  };
+}
+
+function compactionItems(
+  items: AgentTimelineItem[],
+): Array<Extract<AgentTimelineItem, { type: "compaction" }>> {
+  return items.filter(
+    (item): item is Extract<AgentTimelineItem, { type: "compaction" }> =>
+      item.type === "compaction",
+  );
+}
+
+function userMessageTexts(items: AgentTimelineItem[]): string[] {
+  return items.flatMap((item) => (item.type === "user_message" ? [item.text] : []));
+}
+
+interface ClaudeManagerScenario {
+  manager: AgentManager;
+  agentId: string;
+  query: () => ScriptedQuery;
+  timeline: () => AgentTimelineItem[];
+  cleanup: () => Promise<void>;
+}
+
+/** The real AgentManager and prompt dispatcher driving a Claude session over a scripted query. */
+async function startClaudeManagerScenario(
+  sessionId: string,
+  handlePrompt: PromptHandler,
+): Promise<ClaudeManagerScenario> {
+  let query: ScriptedQuery | null = null;
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    query = createScriptedQuery({ prompt, sessionId, handlePrompt });
+    return query;
+  });
+  const logger = createTestLogger();
+  const manager = new AgentManager({
+    clients: {
+      claude: new ClaudeAgentClient({
+        logger,
+        queryFactory,
+        resolveBinary: async () => "/test/claude/bin",
+      }),
+    },
+    logger,
+  });
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  const agent = await manager.createAgent({ provider: "claude", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  return {
+    manager,
+    agentId: agent.id,
+    query: () => {
+      if (!query) throw new Error("Claude query has not started");
+      return query;
+    },
+    timeline: () =>
+      events.flatMap((event) =>
+        event.type === "agent_stream" && event.event.type === "timeline" ? [event.event.item] : [],
+      ),
+    cleanup: async () => {
+      if (manager.getAgent(agent.id)) {
+        await manager.closeAgent(agent.id);
+      }
+      unsubscribe();
+    },
+  };
+}
+
+function sendClaudePrompt(
+  scenario: ClaudeManagerScenario,
+  text: string,
+  activeTurnBehavior: "interrupt" | "steer",
+): ReturnType<typeof startAgentRun> {
+  return startAgentRun(scenario.manager, scenario.agentId, text, createTestLogger(), {
+    replaceRunning: true,
+    activeTurnBehavior,
+    clearPendingPermissions: true,
+    runOptions: { clientMessageId: `client-${text.replace(/\W/g, "-")}` },
+  });
+}
+
+async function settleClaude(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 25));
+}
+
+/**
+ * Let the session echo the prompt before the scripted CLI answers it. A real CLI's first status
+ * arrives well after that echo; answering synchronously inverts the order, and the old
+ * "first user message after compacting" rule then consumed the /compact echo itself, hiding the
+ * very leak these tests exist for.
+ */
+async function afterPromptEcho(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 5));
+}
+
+test.each(["interrupt", "steer"] as const)(
+  "a %s prompt sent during Claude /compact waits for the compaction and is delivered once",
+  async (activeTurnBehavior) => {
+    const sessionId = `compact-hold-${activeTurnBehavior}`;
+    const scenario = await startClaudeManagerScenario(
+      sessionId,
+      async ({ promptRecord, query }) => {
+        if (promptRecord.text === "/compact") {
+          await afterPromptEcho();
+          query.emit(buildCompactingStatus(sessionId));
+          return;
+        }
+        query.emit({
+          type: "assistant",
+          uuid: `assistant-${promptRecord.text}`,
+          message: { role: "assistant", content: [{ type: "text", text: "done" }] },
+          session_id: sessionId,
+        });
+        query.emit(buildSuccessResult(sessionId));
+      },
+    );
+    try {
+      const compact = await sendClaudePrompt(scenario, "/compact", activeTurnBehavior);
+      expect(compact.disposition).toBe("turn_started");
+      await waitFor(() => scenario.manager.isHoldingPromptsForCompaction(scenario.agentId));
+
+      // Not awaited first: the old dispatcher only returned after canceling the compaction.
+      const followUp = sendClaudePrompt(scenario, "follow up", activeTurnBehavior);
+      await settleClaude();
+      // Not interrupted, and not pushed into the live input either: a prompt pushed during the
+      // compaction is what the old "first user message after compacting" rule would have eaten.
+      expect(scenario.query().interrupt).not.toHaveBeenCalled();
+      expect(scenario.query().prompts.map((prompt) => prompt.text)).toEqual(["/compact"]);
+      expect((await followUp).disposition).toBe("held");
+
+      scenario.query().emit(buildCompactBoundary(sessionId));
+      scenario.query().emit(buildStreamedCompactSummary(sessionId));
+      scenario.query().emit(buildSuccessResult(sessionId));
+
+      await waitFor(() => scenario.query().prompts.length === 2);
+      await waitFor(() => scenario.manager.getAgent(scenario.agentId)?.lifecycle === "idle");
+      await settleClaude();
+
+      expect(scenario.query().prompts.map((prompt) => prompt.text)).toEqual([
+        "/compact",
+        "follow up",
+      ]);
+      expect(scenario.query().interrupt).not.toHaveBeenCalled();
+      expect(userMessageTexts(scenario.timeline()).filter((text) => text === "follow up")).toEqual([
+        "follow up",
+      ]);
+      expect(userMessageTexts(scenario.timeline())).not.toContain(COMPACT_SUMMARY_TEXT);
+      expect(compactionItems(scenario.timeline())).toEqual([
+        { type: "compaction", status: "loading" },
+        expect.objectContaining({ type: "compaction", status: "completed", trigger: "manual" }),
+      ]);
+      expect(compactionItems(scenario.timeline())[1]).not.toHaveProperty("outcome");
+    } finally {
+      await scenario.cleanup();
+    }
+  },
+);
+
+test("Stop during a Claude compaction never presents it as compacted", async () => {
+  const sessionId = "compact-stop";
+  const scenario = await startClaudeManagerScenario(sessionId, async ({ promptRecord, query }) => {
+    if (promptRecord.text === "/compact") {
+      await afterPromptEcho();
+      query.emit(buildCompactingStatus(sessionId));
+    }
+  });
+  try {
+    await sendClaudePrompt(scenario, "/compact", "interrupt");
+    await waitFor(() => scenario.manager.isHoldingPromptsForCompaction(scenario.agentId));
+
+    await expect(scenario.manager.cancelAgentRun(scenario.agentId)).resolves.toEqual({
+      status: "settled",
+    });
+    scenario.query().emit(buildAbortedResult(sessionId));
+    await settleClaude();
+
+    // The spinner terminates, with the honest outcome.
+    expect(compactionItems(scenario.timeline())).toEqual([
+      { type: "compaction", status: "loading" },
+      { type: "compaction", status: "completed", outcome: "canceled" },
+    ]);
+    expect(scenario.manager.isHoldingPromptsForCompaction(scenario.agentId)).toBe(false);
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+test("after a stopped Claude compaction, a steer into the next running turn is not refused", async () => {
+  const sessionId = "compact-stop-then-steer";
+  const scenario = await startClaudeManagerScenario(sessionId, async ({ promptRecord, query }) => {
+    if (promptRecord.text === "/compact") {
+      await afterPromptEcho();
+      query.emit(buildCompactingStatus(sessionId));
+    }
+  });
+  try {
+    await sendClaudePrompt(scenario, "/compact", "interrupt");
+    await waitFor(() => scenario.manager.isHoldingPromptsForCompaction(scenario.agentId));
+    await scenario.manager.cancelAgentRun(scenario.agentId);
+    scenario.query().emit(buildAbortedResult(sessionId));
+    await waitFor(() => scenario.manager.getAgent(scenario.agentId)?.lifecycle === "idle");
+    const interruptsAfterStop = scenario.query().interrupt.mock.calls.length;
+
+    // Claude wakes on its own (a background task finished, say). No paseo prompt started this
+    // turn, so no prompt echo has passed through the old reset: a stuck `compacting` refuses the
+    // steer, and the dispatcher replaces the turn instead.
+    scenario
+      .query()
+      .emit({ type: "assistant", message: { content: "WOKE_UP" }, session_id: sessionId });
+    await waitFor(() => scenario.manager.getAgent(scenario.agentId)?.lifecycle === "running");
+
+    // Not awaited first: a refused steer replaces the turn, and that waits on the interrupt.
+    const steer = sendClaudePrompt(scenario, "mid-turn note", "steer");
+    await settleClaude();
+    expect(scenario.query().interrupt.mock.calls.length).toBe(interruptsAfterStop);
+    expect((await steer).disposition).toBe("steered");
+    await waitFor(() => scenario.query().prompts.some((prompt) => prompt.text === "mid-turn note"));
+
+    scenario.query().emit(buildSuccessResult(sessionId));
+    await waitFor(() => scenario.manager.getAgent(scenario.agentId)?.lifecycle === "idle");
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
+function observedItems(events: AgentStreamEvent[]): AgentTimelineItem[] {
+  return events.flatMap((event) => (event.type === "timeline" ? [event.item] : []));
+}
+
+function observedUserTexts(events: AgentStreamEvent[]): string[] {
+  return userMessageTexts(observedItems(events));
+}
+
+/** `/compact`, stopped or completed, then a new prompt, through one Claude session. */
+async function compactThenPrompt(
+  sessionId: string,
+  ending: "stopped" | "completed",
+  summary: Record<string, unknown> = buildStreamedCompactSummary(sessionId),
+): Promise<AgentStreamEvent[]> {
+  let query: ScriptedQuery | null = null;
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+    query = createScriptedQuery({
+      prompt,
+      sessionId,
+      async handlePrompt({ promptRecord, query: scripted }) {
+        await afterPromptEcho();
+        if (promptRecord.text !== "/compact") {
+          scripted.emit(buildSuccessResult(sessionId));
+          return;
+        }
+        scripted.emit(buildCompactingStatus(sessionId));
+        if (ending === "completed") {
+          scripted.emit(buildCompactBoundary(sessionId));
+          scripted.emit(summary);
+          scripted.emit(buildSuccessResult(sessionId));
+        }
+      },
+    });
+    return query;
+  });
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+  const observed: AgentStreamEvent[] = [];
+  const unsubscribe = session.subscribe((event) => observed.push(event));
+  const compactTurn = streamSession(session, "/compact");
+  if (ending === "stopped") {
+    await compactTurn.next();
+    await waitFor(() => compactionItems(observedItems(observed)).length > 0);
+    await session.interrupt();
+    await collectUntilTerminal(compactTurn);
+    query?.emit(buildAbortedResult(sessionId));
+  } else {
+    await collectUntilTerminal(compactTurn);
+  }
+  await collectUntilTerminal(streamSession(session, "next task"));
+  unsubscribe();
+  await session.close();
+  return observed;
+}
+
+test.each(["stopped", "completed"] as const)(
+  "the next prompt after a %s Claude compaction is not swallowed as its summary",
+  async (ending) => {
+    const observed = await compactThenPrompt(`compact-${ending}-then-prompt`, ending);
+    // The CLI streams the summary flagged synthetic, so the old "first user message after
+    // compacting" rule never saw it and ate this prompt instead.
+    expect(observedUserTexts(observed)).toContain("next task");
+    expect(observedUserTexts(observed)).not.toContain(COMPACT_SUMMARY_TEXT);
+  },
+);
+
+test.each([
+  {
+    name: "flagged isCompactSummary",
+    summary: (sessionId: string) => ({
+      ...buildStreamedCompactSummary(sessionId),
+      isSynthetic: undefined,
+      isCompactSummary: true,
+    }),
+  },
+  {
+    name: "unflagged but opening with the summary sentence",
+    summary: (sessionId: string) => ({
+      ...buildStreamedCompactSummary(sessionId),
+      isSynthetic: undefined,
+    }),
+  },
+])("a compaction summary streamed as $name is still not rendered", async ({ summary }) => {
+  const sessionId = "compact-summary-shapes";
+  const observed = await compactThenPrompt(sessionId, "completed", summary(sessionId));
+  expect(observedUserTexts(observed)).not.toContain(COMPACT_SUMMARY_TEXT);
+  expect(observedUserTexts(observed)).toContain("next task");
+});
+
+test.each([
+  { detail: "prompt is too long", expectedErrors: ["Compaction failed: prompt is too long"] },
+  { detail: undefined, expectedErrors: [] },
+])(
+  "a failed Claude compaction closes its marker as failed (detail: $detail)",
+  async ({ detail, expectedErrors }) => {
+    const sessionId = "compact-result-failed";
+    let query: ScriptedQuery | null = null;
+    queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) => {
+      query = createScriptedQuery({
+        prompt,
+        sessionId,
+        async handlePrompt({ query: scripted }) {
+          await afterPromptEcho();
+          scripted.emit(buildCompactingStatus(sessionId));
+          scripted.emit({
+            type: "system",
+            subtype: "status",
+            status: null,
+            compact_result: "failed",
+            ...(detail ? { compact_error: detail } : {}),
+            session_id: sessionId,
+          });
+          scripted.emit(buildSuccessResult(sessionId));
+        },
+      });
+      return query;
+    });
+    const session = await new ClaudeAgentClient({
+      logger: createTestLogger(),
+      queryFactory,
+      resolveBinary: async () => "/test/claude/bin",
+    }).createSession({ provider: "claude", cwd: process.cwd() });
+    const observed: AgentStreamEvent[] = [];
+    const unsubscribe = session.subscribe((event) => observed.push(event));
+    await collectUntilTerminal(streamSession(session, "/compact"));
+    unsubscribe();
+    await session.close();
+
+    const items = observed.flatMap((event) => (event.type === "timeline" ? [event.item] : []));
+    expect(compactionItems(items)).toEqual([
+      { type: "compaction", status: "loading" },
+      { type: "compaction", status: "completed", outcome: "failed" },
+    ]);
+    expect(items.flatMap((item) => (item.type === "error" ? [item.message] : []))).toEqual(
+      expectedErrors,
+    );
+  },
+);

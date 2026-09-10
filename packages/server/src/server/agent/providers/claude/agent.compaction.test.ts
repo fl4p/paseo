@@ -144,8 +144,9 @@ describe("claude compaction outcomes", () => {
       session.translateMessageToEvents(compactingStatus);
       const items = timelineItems(session.translateMessageToEvents(compactionFailedStatus));
 
+      // The marker itself says it failed; the error row survives only to carry the CLI's reason.
       expect(items).toEqual([
-        { type: "compaction", status: "completed" },
+        { type: "compaction", status: "completed", outcome: "failed" },
         { type: "error", message: "Compaction failed: context too large to summarize" },
       ]);
 
