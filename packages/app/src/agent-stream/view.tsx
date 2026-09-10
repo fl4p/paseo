@@ -101,6 +101,7 @@ import {
 } from "@/workspace/file-open";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useStableEvent } from "@/hooks/use-stable-event";
+import { useTranscriptFindStore } from "@/agent-stream/find/store";
 import { useForkAgent } from "@/hooks/use-fork-agent";
 import { resolveForkMode, resolveForkTargetCwd } from "@/hooks/fork-mode";
 import { ForkModeProvider } from "@/contexts/fork-mode-context";
@@ -679,6 +680,40 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       visibleItemIds: visibleHistoryItemIds,
       revealLoadedItem: revealLoadedHistory,
     });
+
+    // Find searches the stream model, so a hit can land on a row that partial
+    // virtualization has unmounted. Reveal it first, then scroll once it exists
+    // — the same two-step the Chat outline rail uses.
+    const [pendingFindJumpId, setPendingFindJumpId] = useState<string | null>(null);
+    const jumpToStreamItem = useStableEvent((itemId: string) => {
+      if (revealLoadedHistory?.(itemId)) {
+        setPendingFindJumpId(itemId);
+        return;
+      }
+      viewportRef.current?.scrollToMessage?.(itemId);
+    });
+    useEffect(() => {
+      if (pendingFindJumpId === null || !visibleHistoryItemIds.has(pendingFindJumpId)) {
+        return;
+      }
+      viewportRef.current?.scrollToMessage?.(pendingFindJumpId);
+      setPendingFindJumpId(null);
+    }, [pendingFindJumpId, visibleHistoryItemIds]);
+
+    const findableStreamItems = useMemo(
+      () => [...effectiveStreamItems, ...(effectiveStreamHead ?? [])],
+      [effectiveStreamHead, effectiveStreamItems],
+    );
+    // Only the panel the reader is looking at answers Find; a retained
+    // background transcript would otherwise claim it by registering last.
+    useEffect(() => {
+      if (!isActive) {
+        return;
+      }
+      const store = useTranscriptFindStore.getState();
+      store.setSource({ agentId, items: findableStreamItems, jumpToItem: jumpToStreamItem });
+      return () => store.clearSource(agentId);
+    }, [agentId, findableStreamItems, isActive, jumpToStreamItem]);
 
     useImperativeHandle(
       ref,

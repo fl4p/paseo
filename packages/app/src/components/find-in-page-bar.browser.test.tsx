@@ -3,6 +3,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 import { i18n } from "@/i18n/i18next";
 import { FindInPageBar } from "./find-in-page-bar.electron";
+import { useTranscriptFindStore } from "@/agent-stream/find/store";
+import type { StreamItem } from "@/types/stream";
 import type { DesktopFindStartInput, DesktopFindStopAction } from "@/desktop/host";
 
 interface FakeDesktopHost {
@@ -50,6 +52,22 @@ function installFakeHost(): FakeDesktopHost {
   return host;
 }
 
+const timestamp = new Date(0);
+
+function message(id: string, text: string): StreamItem {
+  return { kind: "user_message", id, text, timestamp };
+}
+
+function installTranscript(items: StreamItem[]): string[] {
+  const jumps: string[] = [];
+  useTranscriptFindStore.getState().setSource({
+    agentId: "agent-1",
+    items,
+    jumpToItem: (itemId) => jumps.push(itemId),
+  });
+  return jumps;
+}
+
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
 function mountBar(): HTMLDivElement {
@@ -61,7 +79,6 @@ function mountBar(): HTMLDivElement {
   return container;
 }
 
-/** The listener subscription resolves a promise, so let the microtasks drain. */
 async function settle(): Promise<void> {
   await act(async () => {
     await Promise.resolve();
@@ -69,11 +86,23 @@ async function settle(): Promise<void> {
 }
 
 function findInput(container: HTMLElement): HTMLInputElement {
-  const input = container.querySelector('[data-testid="find-in-page-input"]');
+  const input = container.querySelector(`[aria-label="${i18n.t("paneFind.placeholder")}"]`);
   if (!(input instanceof HTMLInputElement)) {
-    throw new Error("Find bar input is not rendered");
+    throw new Error("Find input is not rendered");
   }
   return input;
+}
+
+function statusText(container: HTMLElement): string {
+  return container.querySelector('[role="status"]')?.textContent ?? "";
+}
+
+function pressButton(container: HTMLElement, label: string): void {
+  const button = container.querySelector(`[aria-label="${label}"]`);
+  if (!(button instanceof HTMLElement)) {
+    throw new Error(`Missing control: ${label}`);
+  }
+  act(() => button.click());
 }
 
 function type(input: HTMLInputElement, text: string): void {
@@ -95,27 +124,22 @@ afterEach(() => {
     act(() => entry.root.unmount());
     entry.container.remove();
   }
+  useTranscriptFindStore.getState().clearSource("agent-1");
   delete window.paseoDesktop;
 });
 
-describe("FindInPageBar", () => {
-  it("renders against the initialized English catalog", () => {
-    expect(i18n.t("desktop.find.placeholder")).toBe("Find");
-  });
-
+describe("FindInPageBar without a transcript", () => {
   it("stays hidden until the desktop shell asks for it", async () => {
     const host = installFakeHost();
     const container = mountBar();
     await settle();
 
     expect(container.querySelector('[data-testid="find-in-page-bar"]')).toBeNull();
-
     act(() => host.emit("find-open", {}));
-
     expect(container.querySelector('[data-testid="find-in-page-bar"]')).not.toBeNull();
   });
 
-  it("searches as the query is typed and advances on Enter", async () => {
+  it("drives Chromium's find and reports what it sends back", async () => {
     const host = installFakeHost();
     const container = mountBar();
     await settle();
@@ -131,24 +155,9 @@ describe("FindInPageBar", () => {
       { query: "needle", forward: true, findNext: true },
       { query: "needle", forward: false, findNext: true },
     ]);
-  });
-
-  it("reports the match count the shell sends back", async () => {
-    const host = installFakeHost();
-    const container = mountBar();
-    await settle();
-    act(() => host.emit("find-open", {}));
-    type(findInput(container), "needle");
 
     act(() => host.emit("find-result", { activeMatchOrdinal: 2, matches: 7, finalUpdate: true }));
-    expect(container.querySelector('[data-testid="find-in-page-counter"]')?.textContent).toBe(
-      "2 of 7",
-    );
-
-    act(() => host.emit("find-result", { activeMatchOrdinal: 0, matches: 0, finalUpdate: true }));
-    expect(container.querySelector('[data-testid="find-in-page-counter"]')?.textContent).toBe(
-      "No results",
-    );
+    expect(statusText(container)).toBe("2 of 7");
   });
 
   it("clears the query and the highlight when Escape closes it", async () => {
@@ -165,22 +174,73 @@ describe("FindInPageBar", () => {
     expect(container.querySelector('[data-testid="find-in-page-bar"]')).toBeNull();
     expect(host.stopCalls).toContain("clearSelection");
 
-    // A stale query would let Find Next keep walking an invisible search.
     act(() => host.emit("find-next", {}));
     expect(host.startCalls).toEqual([]);
   });
+});
 
-  it("stops the search when the window unmounts the bar", async () => {
+describe("FindInPageBar with a transcript", () => {
+  it("finds text in a row the DOM never mounted", async () => {
     const host = installFakeHost();
-    mountBar();
+    // Far more rows than the web transcript mounts, with the hit at the top.
+    const items = [
+      message("old", "the needle is in this very old message"),
+      ...Array.from({ length: 400 }, (_, index) => message(`filler-${index}`, "unrelated chatter")),
+    ];
+    const jumps = installTranscript(items);
+    const container = mountBar();
     await settle();
     act(() => host.emit("find-open", {}));
 
-    for (const entry of mounted.splice(0)) {
-      act(() => entry.root.unmount());
-      entry.container.remove();
-    }
+    type(findInput(container), "needle");
 
-    expect(host.stopCalls).toContain("clearSelection");
+    expect(statusText(container)).toBe("1 of 1");
+    // Chromium's find would have reported nothing for an unmounted row.
+    expect(host.startCalls).toEqual([]);
+    expect(jumps).toContain("old");
+  });
+
+  it("counts every hit and steps through them in order", async () => {
+    const host = installFakeHost();
+    const jumps = installTranscript([
+      message("a", "widget"),
+      message("b", "widget and widget"),
+      message("c", "nothing here"),
+    ]);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    expect(statusText(container)).toBe("1 of 3");
+
+    pressButton(container, i18n.t("paneFind.next"));
+    expect(statusText(container)).toBe("2 of 3");
+
+    pressButton(container, i18n.t("paneFind.next"));
+    expect(statusText(container)).toBe("3 of 3");
+
+    // Wraps back to the first hit rather than dead-ending.
+    pressButton(container, i18n.t("paneFind.next"));
+    expect(statusText(container)).toBe("1 of 3");
+
+    pressButton(container, i18n.t("paneFind.previous"));
+    expect(statusText(container)).toBe("3 of 3");
+
+    // Stepping between two hits in the same row does not re-scroll it.
+    expect(jumps).toEqual(["a", "b", "a", "b"]);
+  });
+
+  it("says so plainly when the transcript has no hit", async () => {
+    const host = installFakeHost();
+    installTranscript([message("a", "widget")]);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "absent");
+
+    expect(statusText(container)).toBe(i18n.t("paneFind.noMatches"));
+    expect(host.startCalls).toEqual([]);
   });
 });
