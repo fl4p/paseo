@@ -12,6 +12,7 @@ export const Activity = StubIcon;
 export const AlertTriangle = StubIcon;
 export const Archive = StubIcon;
 export const ArrowDownUp = StubIcon;
+export const ArrowDown = StubIcon;
 export const ArrowLeft = StubIcon;
 export const ArrowLeftToLine = StubIcon;
 export const ArrowRight = StubIcon;

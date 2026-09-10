@@ -2,6 +2,21 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const es: TranslationResources = {
+  paneFind: {
+    title: "Buscar",
+    placeholder: "Buscar en el panel",
+    close: "Cerrar búsqueda",
+    matches: "Coincidencias",
+    previous: "Coincidencia anterior",
+    next: "Siguiente coincidencia",
+    toggleReplace: "Mostrar reemplazo",
+    replaceWith: "Reemplazar con",
+    replace: "Reemplazar",
+    replaceAll: "Reemplazar todo",
+    noMatches: "Sin coincidencias",
+    position: "{{current}} de {{total}}",
+    total: "{{total}} coincidencias",
+  },
   common: {
     back: "Atrás",
     loading: "Cargando...",
@@ -1309,14 +1324,6 @@ export const es: TranslationResources = {
       maximize: "Maximizar ventana",
       restore: "Restaurar ventana",
       close: "Cerrar ventana",
-    },
-    find: {
-      placeholder: "Buscar",
-      matches: "{{current}} de {{total}}",
-      noMatches: "Sin resultados",
-      previous: "Coincidencia anterior",
-      next: "Coincidencia siguiente",
-      close: "Cerrar la barra de búsqueda",
     },
     quitting: {
       title: "Saliendo dePaseo...",

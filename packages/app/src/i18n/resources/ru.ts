@@ -2,6 +2,21 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ru: TranslationResources = {
+  paneFind: {
+    title: "Найти",
+    placeholder: "Найти в панели",
+    close: "Закрыть поиск",
+    matches: "Совпадения",
+    previous: "Предыдущее совпадение",
+    next: "Следующее совпадение",
+    toggleReplace: "Показать замену",
+    replaceWith: "Заменить на",
+    replace: "Заменить",
+    replaceAll: "Заменить всё",
+    noMatches: "Нет совпадений",
+    position: "{{current}} из {{total}}",
+    total: "Совпадений: {{total}}",
+  },
   common: {
     back: "Назад",
     loading: "Загрузка...",
@@ -1292,14 +1307,6 @@ export const ru: TranslationResources = {
       maximize: "Развернуть окно",
       restore: "Восстановить окно",
       close: "Закрыть окно",
-    },
-    find: {
-      placeholder: "Поиск",
-      matches: "{{current}} из {{total}}",
-      noMatches: "Ничего не найдено",
-      previous: "Предыдущее совпадение",
-      next: "Следующее совпадение",
-      close: "Закрыть панель поиска",
     },
     quitting: {
       title: "Завершение работы Paseo...",

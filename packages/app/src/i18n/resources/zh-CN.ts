@@ -2,6 +2,21 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const zhCN: TranslationResources = {
+  paneFind: {
+    title: "查找",
+    placeholder: "在窗格中查找",
+    close: "关闭查找",
+    matches: "查找结果",
+    previous: "上一个匹配项",
+    next: "下一个匹配项",
+    toggleReplace: "切换替换",
+    replaceWith: "替换为",
+    replace: "替换",
+    replaceAll: "全部替换",
+    noMatches: "无匹配项",
+    position: "{{current}} / {{total}}",
+    total: "{{total}} 个匹配项",
+  },
   common: {
     back: "返回",
     loading: "加载中...",
@@ -1263,14 +1278,6 @@ export const zhCN: TranslationResources = {
       maximize: "最大化窗口",
       restore: "还原窗口",
       close: "关闭窗口",
-    },
-    find: {
-      placeholder: "查找",
-      matches: "第 {{current}} 个，共 {{total}} 个",
-      noMatches: "无结果",
-      previous: "上一个匹配项",
-      next: "下一个匹配项",
-      close: "关闭查找栏",
     },
     quitting: {
       title: "正在退出 Paseo...",

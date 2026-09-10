@@ -2,6 +2,21 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ptBR: TranslationResources = {
+  paneFind: {
+    title: "Buscar",
+    placeholder: "Buscar no painel",
+    close: "Fechar busca",
+    matches: "Correspondências",
+    previous: "Correspondência anterior",
+    next: "Próxima correspondência",
+    toggleReplace: "Mostrar substituição",
+    replaceWith: "Substituir por",
+    replace: "Substituir",
+    replaceAll: "Substituir tudo",
+    noMatches: "Nenhuma correspondência",
+    position: "{{current}} de {{total}}",
+    total: "{{total}} correspondências",
+  },
   common: {
     back: "Voltar",
     loading: "Carregando...",
@@ -1300,14 +1315,6 @@ export const ptBR: TranslationResources = {
       maximize: "Maximizar janela",
       restore: "Restaurar janela",
       close: "Fechar janela",
-    },
-    find: {
-      placeholder: "Localizar",
-      matches: "{{current}} de {{total}}",
-      noMatches: "Sem resultados",
-      previous: "Ocorrência anterior",
-      next: "Próxima ocorrência",
-      close: "Fechar a barra de busca",
     },
     quitting: {
       title: "Saindo do Paseo...",
