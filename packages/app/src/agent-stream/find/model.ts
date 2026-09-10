@@ -10,25 +10,58 @@ import type { StreamItem } from "@/types/stream";
 export interface TranscriptMatch {
   itemId: string;
   itemIndex: number;
-  /** Offset of the hit within this row's searchable text. */
+  /**
+   * Offset into the row's *searchable* text — lowercased and flattened, so it
+   * is not an index into the original body. It identifies a hit; it is not
+   * usable for highlighting the source without recomputing the mapping.
+   */
   start: number;
 }
 
+export interface TranscriptSearchResult {
+  matches: TranscriptMatch[];
+  /** The scan stopped at the limit, so `matches.length` is a floor, not a total. */
+  truncated: boolean;
+}
+
 /**
- * Rows whose body the transcript does not render as plain text — tool output,
- * plugin payloads — contribute only what the collapsed row shows, because a
- * hit the reader cannot be scrolled to is worse than no hit at all.
+ * Message bodies are rendered as Markdown, so the reader sees `hello world`
+ * where the source says `hello **world**`. Searching the source would miss the
+ * phrase they are looking at, so inline markers are flattened first. This is
+ * deliberately not a Markdown parser: it removes the inline syntax that splits
+ * a visible phrase, and leaves everything else alone.
+ */
+export function flattenInlineMarkdown(text: string): string {
+  return text
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/`{1,3}([^`]*)`{1,3}/g, "$1")
+    .replace(/(\*\*\*|___)(.+?)\1/g, "$2")
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/(?<![\w*])([*_])(?!\s)(.+?)(?<!\s)\1(?![\w*])/g, "$2")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/^\s{0,3}>\s?/gm, "");
+}
+
+/**
+ * The text the row actually shows. Rows whose body the transcript keeps
+ * collapsed — tool output, plugin payloads — contribute only their visible
+ * label, because a hit the reader cannot be scrolled to is worse than no hit.
  */
 export function getSearchableText(item: StreamItem): string {
   switch (item.kind) {
     case "user_message":
     case "assistant_message":
     case "thought":
-      return item.text;
+      return flattenInlineMarkdown(item.text);
     case "notification":
       return item.message;
     case "todo_list":
-      return item.items.map((entry) => entry.text).join("\n");
+      // A running task shows its active form in place of its text.
+      return item.items
+        .map((entry) =>
+          entry.status === "in_progress" && entry.activeForm ? entry.activeForm : entry.text,
+        )
+        .join("\n");
     case "tool_call":
       return item.payload.source === "agent" ? item.payload.data.name : item.payload.data.toolName;
     default:
@@ -43,10 +76,10 @@ export function findTranscriptMatches(input: {
   items: readonly StreamItem[];
   query: string;
   limit?: number;
-}): TranscriptMatch[] {
+}): TranscriptSearchResult {
   const query = input.query.toLowerCase();
   if (query.length === 0) {
-    return [];
+    return { matches: [], truncated: false };
   }
 
   const limit = input.limit ?? TRANSCRIPT_MATCH_LIMIT;
@@ -61,7 +94,7 @@ export function findTranscriptMatches(input: {
     while (start >= 0) {
       matches.push({ itemId: item.id, itemIndex, start });
       if (matches.length >= limit) {
-        return matches;
+        return { matches, truncated: true };
       }
       // Overlapping hits ("aa" in "aaa") would otherwise loop forever on an
       // empty advance; a literal search reports non-overlapping occurrences.
@@ -69,7 +102,7 @@ export function findTranscriptMatches(input: {
     }
   }
 
-  return matches;
+  return { matches, truncated: false };
 }
 
 /**

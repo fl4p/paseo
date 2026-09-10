@@ -8,6 +8,7 @@ import {
   preserveActiveMatch,
   stepMatchIndex,
   type TranscriptMatch,
+  type TranscriptSearchResult,
 } from "@/agent-stream/find/model";
 import { useTranscriptFindStore } from "@/agent-stream/find/store";
 import { getDesktopHost, type DesktopFindResult } from "@/desktop/host";
@@ -19,7 +20,7 @@ const EMPTY_RESULT: DesktopFindResult = {
   finalUpdate: true,
 };
 
-const NO_MATCHES: TranscriptMatch[] = [];
+const NO_TRANSCRIPT_RESULT: TranscriptSearchResult = { matches: [], truncated: false };
 
 function isFindResult(value: unknown): value is DesktopFindResult {
   if (typeof value !== "object" || value === null) {
@@ -64,11 +65,17 @@ function useDesktopEvent(event: string, handler: (payload: unknown) => void): vo
 function formatStatus(input: {
   current: number;
   total: number;
+  truncated: boolean;
   hasQuery: boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
 }): string {
   if (input.total > 0) {
-    return input.t("paneFind.position", { current: input.current, total: input.total });
+    return input.t("paneFind.position", {
+      current: input.current,
+      // A capped scan knows a floor, not a total, and says so rather than
+      // presenting the cap as the answer.
+      total: input.truncated ? `${input.total}+` : input.total,
+    });
   }
   return input.hasQuery ? input.t("paneFind.noMatches") : "";
 }
@@ -91,25 +98,24 @@ export function FindInPageBar(): React.ReactElement | null {
   const [visible, setVisible] = useState(false);
   const [query, setQuery] = useState("");
   const [chromiumResult, setChromiumResult] = useState<DesktopFindResult>(EMPTY_RESULT);
-  const [activeMatchIndex, setActiveMatchIndex] = useState(0);
   const findRef = useRef<PaneFindHandle>(null);
   const transcript = useTranscriptFindStore((state) => state.source);
 
-  const matches = useMemo(() => {
+  const { matches, truncated } = useMemo<TranscriptSearchResult>(() => {
     if (!transcript || query.length === 0) {
-      return NO_MATCHES;
+      return NO_TRANSCRIPT_RESULT;
     }
     return findTranscriptMatches({ items: transcript.items, query });
   }, [query, transcript]);
 
-  // A live turn appends rows while the bar is open; hold the reader's place.
-  const activeMatchRef = useRef<TranscriptMatch | null>(null);
-  useEffect(() => {
-    setActiveMatchIndex(() => preserveActiveMatch({ previous: activeMatchRef.current, matches }));
-  }, [matches]);
-  useEffect(() => {
-    activeMatchRef.current = matches[activeMatchIndex] ?? null;
-  }, [activeMatchIndex, matches]);
+  // The selection is an anchor on a hit, not an index. A live turn appends rows
+  // and renumbers the list, and deriving the index here rather than repairing it
+  // in an effect means the bar never renders a count it has to take back.
+  const [anchor, setAnchor] = useState<TranscriptMatch | null>(null);
+  const activeMatchIndex = useMemo(
+    () => preserveActiveMatch({ previous: anchor, matches }),
+    [anchor, matches],
+  );
 
   const searchChromium = useCallback((nextQuery: string, forward: boolean, findNext: boolean) => {
     const find = getDesktopHost()?.find;
@@ -129,16 +135,14 @@ export function FindInPageBar(): React.ReactElement | null {
   const close = useCallback(() => {
     setVisible(false);
     setQuery("");
-    setActiveMatchIndex(0);
-    activeMatchRef.current = null;
+    setAnchor(null);
     stopChromium();
   }, [stopChromium]);
 
   const handleQueryChange = useCallback(
     (nextQuery: string) => {
       setQuery(nextQuery);
-      setActiveMatchIndex(0);
-      activeMatchRef.current = null;
+      setAnchor(null);
       if (transcript) {
         // The jump follows from the recomputed match list, not from here.
         return;
@@ -149,12 +153,17 @@ export function FindInPageBar(): React.ReactElement | null {
   );
 
   // Typing moves the transcript to the first hit; stepping moves it to the next.
+  // The source object is republished on every stream update, so it is read
+  // through a ref: depending on it here would re-scroll the reader back to the
+  // active hit on each update of a live turn.
+  const transcriptRef = useRef(transcript);
+  transcriptRef.current = transcript;
   const jumpTargetId = transcript ? (matches[activeMatchIndex]?.itemId ?? null) : null;
   useEffect(() => {
-    if (visible && jumpTargetId && transcript) {
-      transcript.jumpToItem(jumpTargetId);
+    if (visible && jumpTargetId) {
+      transcriptRef.current?.jumpToItem(jumpTargetId);
     }
-  }, [jumpTargetId, transcript, visible]);
+  }, [jumpTargetId, visible]);
 
   const step = useCallback(
     (forward: boolean) => {
@@ -164,10 +173,9 @@ export function FindInPageBar(): React.ReactElement | null {
           total: matches.length,
           forward,
         });
-        setActiveMatchIndex(next);
-        activeMatchRef.current = matches[next] ?? null;
-        // The jump belongs to the effect below, which owns it for every route
+        // The jump belongs to the effect above, which owns it for every route
         // into a new match — typing, stepping, or the menu's Find Next.
+        setAnchor(matches[next] ?? null);
         return;
       }
       searchChromium(query, forward, true);
@@ -209,14 +217,21 @@ export function FindInPageBar(): React.ReactElement | null {
     };
   }, []);
 
-  // Moving between a transcript and another pane while the bar is open would
-  // otherwise leave the previous backend's highlight behind.
+  // Moving between a transcript and another pane while the bar is open has to
+  // hand the open query over: leaving Chromium's highlight behind, or leaving
+  // the new pane unsearched while the bar still shows a count, both lie.
   const usingTranscript = transcript !== null;
+  const queryRef = useRef(query);
+  queryRef.current = query;
   useEffect(() => {
     if (usingTranscript) {
       stopChromium();
+      return;
     }
-  }, [stopChromium, usingTranscript]);
+    if (queryRef.current.length > 0) {
+      searchChromium(queryRef.current, true, false);
+    }
+  }, [searchChromium, stopChromium, usingTranscript]);
 
   useEffect(() => {
     if (!visible) {
@@ -231,7 +246,13 @@ export function FindInPageBar(): React.ReactElement | null {
 
   const total = transcript ? matches.length : chromiumResult.matches;
   const current = transcript ? activeMatchIndex + 1 : chromiumResult.activeMatchOrdinal;
-  const status = formatStatus({ current, total, hasQuery: query.length > 0, t });
+  const status = formatStatus({
+    current,
+    total,
+    truncated: transcript !== null && truncated,
+    hasQuery: query.length > 0,
+    t,
+  });
 
   return (
     <View style={styles.anchor} testID="find-in-page-bar">

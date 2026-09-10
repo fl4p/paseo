@@ -68,6 +68,17 @@ function installTranscript(items: StreamItem[]): string[] {
   return jumps;
 }
 
+/** A live turn republishes the source object without changing the match. */
+function republishTranscript(items: StreamItem[], jumps: string[]): void {
+  act(() =>
+    useTranscriptFindStore.getState().setSource({
+      agentId: "agent-1",
+      items,
+      jumpToItem: (itemId) => jumps.push(itemId),
+    }),
+  );
+}
+
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
 function mountBar(): HTMLDivElement {
@@ -229,6 +240,75 @@ describe("FindInPageBar with a transcript", () => {
 
     // Stepping between two hits in the same row does not re-scroll it.
     expect(jumps).toEqual(["a", "b", "a", "b"]);
+  });
+
+  it("does not drag the reader back when a live turn republishes the transcript", async () => {
+    const host = installFakeHost();
+    const items = [message("a", "widget"), message("b", "later")];
+    const jumps = installTranscript(items);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    expect(jumps).toEqual(["a"]);
+
+    republishTranscript([...items, message("c", "a new row arrives")], jumps);
+    republishTranscript([...items, message("c", "a new row arrives")], jumps);
+
+    // Same hit, same place: the reader keeps their scroll position.
+    expect(jumps).toEqual(["a"]);
+    expect(statusText(container)).toBe("1 of 1");
+  });
+
+  it("never shows a count it has to take back when rows disappear", async () => {
+    const host = installFakeHost();
+    const jumps = installTranscript([
+      message("a", "widget"),
+      message("b", "widget"),
+      message("c", "widget"),
+    ]);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    pressButton(container, i18n.t("paneFind.next"));
+    pressButton(container, i18n.t("paneFind.next"));
+    expect(statusText(container)).toBe("3 of 3");
+
+    republishTranscript([message("b", "widget"), message("c", "widget")], jumps);
+
+    // The anchored hit is still row c, now second of two — never "3 of 2".
+    expect(statusText(container)).toBe("2 of 2");
+  });
+
+  it("marks a capped count as a floor rather than a total", async () => {
+    const host = installFakeHost();
+    installTranscript([message("a", "z".repeat(6000))]);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "z");
+
+    expect(statusText(container)).toBe("1 of 5000+");
+  });
+
+  it("hands the open query to Chromium when the transcript goes away", async () => {
+    const host = installFakeHost();
+    installTranscript([message("a", "widget")]);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    expect(host.startCalls).toEqual([]);
+
+    act(() => useTranscriptFindStore.getState().clearSource("agent-1"));
+
+    // The bar still shows the query, so the new pane has to be searched for it.
+    expect(host.startCalls).toEqual([{ query: "widget", forward: true, findNext: false }]);
   });
 
   it("says so plainly when the transcript has no hit", async () => {
