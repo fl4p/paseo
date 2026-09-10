@@ -186,7 +186,7 @@ function curateProjectedActivityEntries(
         break;
       case "compaction":
         flushBuffers(entries, buffers, options);
-        entries.push(activityEntry("[Compacted]"));
+        entries.push(activityEntry(compactionActivityText(item)));
         break;
     }
   }
@@ -194,6 +194,12 @@ function curateProjectedActivityEntries(
   flushBuffers(entries, buffers, options);
 
   return entries;
+}
+
+function compactionActivityText(item: Extract<AgentTimelineItem, { type: "compaction" }>): string {
+  if (item.outcome === "canceled") return "[Compaction canceled]";
+  if (item.outcome === "failed") return "[Compaction failed]";
+  return "[Compacted]";
 }
 
 function curateAgentActivityEntries(
@@ -352,7 +358,8 @@ function findLastCompletedCompactionIndex(
 ): number {
   for (let index = Math.min(endIndex, rows.length - 1); index >= 0; index -= 1) {
     const item = rows[index]?.item;
-    if (item?.type === "compaction" && item.status === "completed") {
+    // A canceled or failed compaction summarized nothing away; it is not a boundary.
+    if (item?.type === "compaction" && item.status === "completed" && !item.outcome) {
       return index;
     }
   }

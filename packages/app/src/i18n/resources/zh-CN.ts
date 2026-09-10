@@ -361,6 +361,8 @@ export const zhCN: TranslationResources = {
       manual: "上下文已手动压缩",
       withTokens: "上下文已压缩（{{tokens}}K tokens）",
       completed: "上下文已压缩",
+      canceled: "上下文压缩已取消",
+      failed: "上下文压缩失败",
     },
     peer: {
       from: "来自 {{sender}}",

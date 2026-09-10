@@ -471,6 +471,26 @@ describe("fork context budget and compaction boundary", () => {
     expect(result.itemCount).toBe(2);
   });
 
+  it.each(["canceled", "failed"] as const)(
+    "does not treat a %s compaction as a boundary or report it as compacted",
+    (outcome) => {
+      const rows = [
+        row(1, { type: "user_message", text: "ancient task", messageId: "user-1" }),
+        row(2, { type: "compaction", status: "completed", trigger: "manual", outcome }),
+        row(3, { type: "user_message", text: "current task", messageId: "user-2" }),
+      ];
+      const result = buildAgentForkContextAttachment({ rows });
+
+      // Nothing was summarized away, so the history before the marker is still live context.
+      expect(result.attachment.text).toContain("ancient task");
+      expect(result.attachment.text).not.toContain("The source session was compacted");
+
+      const activity = curateAgentActivity(rows.map((entry) => entry.item));
+      expect(activity).toContain(`[Compaction ${outcome}]`);
+      expect(activity).not.toContain("[Compacted]");
+    },
+  );
+
   it("ignores a compaction that has not completed", () => {
     const result = buildAgentForkContextAttachment({
       rows: [

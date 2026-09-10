@@ -18,6 +18,18 @@ describe("getCompactionMarkerLabel", () => {
     expect(getCompactionMarkerLabel({ status: "completed" })).toBe("Context compacted");
   });
 
+  it("never says compacted for a compaction that was canceled or failed", () => {
+    expect(
+      getCompactionMarkerLabel({ status: "completed", trigger: "manual", outcome: "canceled" }),
+    ).toBe("Compaction canceled");
+    expect(
+      getCompactionMarkerLabel({ status: "completed", trigger: "auto", outcome: "failed" }),
+    ).toBe("Compaction failed");
+    expect(
+      getCompactionMarkerLabel({ status: "completed", preTokens: 12_345, outcome: "canceled" }),
+    ).toBe("Compaction canceled");
+  });
+
   it("renders labels in the active app language", async () => {
     await i18n.changeLanguage("zh-CN");
     try {

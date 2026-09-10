@@ -509,6 +509,7 @@ function mergeRetainedLifecycleItem(tail: StreamItem[], retained: StreamItem): S
       status: "completed",
       trigger: retained.trigger ?? existing.trigger,
       preTokens: retained.preTokens ?? existing.preTokens,
+      ...(retained.outcome ? { outcome: retained.outcome } : {}),
     };
     return next;
   }
@@ -809,7 +810,11 @@ export interface CompactionItem {
   status: "loading" | "completed";
   trigger?: "auto" | "manual";
   preTokens?: number;
+  /** A `completed` marker whose compaction did not compact. Absent means it succeeded. */
+  outcome?: CompactionOutcome;
 }
+
+export type CompactionOutcome = "canceled" | "failed";
 
 export interface PluginTimelineStreamItem {
   kind: "plugin";
@@ -1499,6 +1504,7 @@ function reduceTimelineCompaction(
         status: "completed",
         trigger: item.trigger ?? existing.trigger,
         preTokens: item.preTokens ?? existing.preTokens,
+        ...(item.outcome ? { outcome: item.outcome } : {}),
       };
       const next = [...state.slice(0, loadingIdx), updated, ...state.slice(loadingIdx + 1)];
       // Drop stragglers from a stream that still carried duplicate loading markers.
@@ -1518,6 +1524,7 @@ function reduceTimelineCompaction(
     status: item.status,
     trigger: item.trigger,
     preTokens: item.preTokens,
+    ...(item.status === "completed" && item.outcome ? { outcome: item.outcome } : {}),
   };
   return [...state, compaction];
 }
@@ -1612,13 +1619,30 @@ function reduceTimelineEvent(
   }
 }
 
-function terminalizeLoadingCompaction(state: StreamItem[]): StreamItem[] {
+/**
+ * The outcome a still-open compaction marker gets when its turn ends. A turn that was canceled or
+ * failed cannot have finished compacting, so saying "compacted" there would be a lie. A completed
+ * turn with the marker still open is a provider that never reported the end (e.g. a no-op
+ * `/compact`); that keeps the plain completed label.
+ */
+function compactionOutcomeForTurnEnd(
+  type: "turn_completed" | "turn_failed" | "turn_canceled",
+): CompactionOutcome | undefined {
+  if (type === "turn_canceled") return "canceled";
+  if (type === "turn_failed") return "failed";
+  return undefined;
+}
+
+function terminalizeLoadingCompaction(
+  state: StreamItem[],
+  outcome: CompactionOutcome | undefined,
+): StreamItem[] {
   if (!state.some((item) => item.kind === "compaction" && item.status === "loading")) {
     return state;
   }
   return state.map((item) =>
     item.kind === "compaction" && item.status === "loading"
-      ? { ...item, status: "completed" as const }
+      ? { ...item, status: "completed" as const, ...(outcome ? { outcome } : {}) }
       : item,
   );
 }
@@ -1651,7 +1675,9 @@ export function reduceStreamUpdate(
     case "turn_canceled":
       // A turn cannot outlive a compaction it triggered: whatever the provider did or did not
       // report, an open marker at turn end is stale and must not keep spinning.
-      return finalizeActiveThoughts(terminalizeLoadingCompaction(state));
+      return finalizeActiveThoughts(
+        terminalizeLoadingCompaction(state, compactionOutcomeForTurnEnd(event.type)),
+      );
     case "thread_started":
     case "turn_started":
     case "permission_requested":

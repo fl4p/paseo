@@ -318,6 +318,59 @@ test("0.8 timeline and setup capabilities remain optional in the hello", () => {
   ).toEqual({ plugin_timeline_items: true, workspace_setup_blocked: true });
 });
 
+describe("compaction outcome compatibility", () => {
+  // Copied from the schema before `outcome` existed. A plain `z.object` strips unknown keys, which
+  // is exactly what a client built before the outcome shipped does with it.
+  const LegacyCompactionItemSchema = z.object({
+    type: z.literal("compaction"),
+    status: z.enum(["loading", "completed"]),
+    trigger: z.enum(["auto", "manual"]).optional(),
+    preTokens: z.number().optional(),
+  });
+
+  test.each(["canceled", "failed"] as const)(
+    "a %s compaction still parses for an old client, which drops the outcome",
+    (outcome) => {
+      const item = { type: "compaction", status: "completed", trigger: "manual", outcome } as const;
+      expect(AgentTimelineItemPayloadSchema.parse(item)).toEqual(item);
+
+      const legacy = LegacyCompactionItemSchema.safeParse(item);
+      expect(legacy.success).toBe(true);
+      // No new status value: the old client sees a terminal marker it already understands.
+      expect(legacy.data).toEqual({ type: "compaction", status: "completed", trigger: "manual" });
+
+      const entry = {
+        provider: "codex",
+        item,
+        timestamp: "2026-09-10T00:00:00.000Z",
+        seqStart: 1,
+        seqEnd: 1,
+        sourceSeqRanges: [{ startSeq: 1, endSeq: 1 }],
+        collapsed: [],
+      };
+      expect(AgentTimelineEntryPayloadSchema.parse(entry).item).toEqual(item);
+    },
+  );
+
+  test("an old daemon's compaction without an outcome keeps its meaning", () => {
+    const item = { type: "compaction", status: "completed", trigger: "auto", preTokens: 10 };
+    expect(AgentTimelineItemPayloadSchema.parse(item)).toEqual(item);
+  });
+
+  test("the outcome is a closed set and status did not widen", () => {
+    expect(
+      AgentTimelineItemPayloadSchema.safeParse({
+        type: "compaction",
+        status: "completed",
+        outcome: "partial",
+      }).success,
+    ).toBe(false);
+    expect(
+      AgentTimelineItemPayloadSchema.safeParse({ type: "compaction", status: "canceled" }).success,
+    ).toBe(false);
+  });
+});
+
 test("plugin rows and identity merges require a capable receiver", () => {
   const item = {
     type: "plugin",

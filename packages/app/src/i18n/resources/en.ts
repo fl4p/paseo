@@ -360,6 +360,8 @@ export const en = {
       manual: "Context manually compacted",
       withTokens: "Context compacted ({{tokens}}K tokens)",
       completed: "Context compacted",
+      canceled: "Compaction canceled",
+      failed: "Compaction failed",
     },
     peer: {
       from: "From {{sender}}",

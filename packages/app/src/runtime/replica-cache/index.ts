@@ -160,6 +160,7 @@ const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
     status: z.enum(["loading", "completed"]),
     trigger: z.enum(["auto", "manual"]).optional(),
     preTokens: z.number().nonnegative().optional(),
+    outcome: z.enum(["canceled", "failed"]).optional(),
   }),
   z.strictObject({
     ...TimelineItemBaseShape,
@@ -425,6 +426,24 @@ function serializeAgentToolCall(data: AgentToolCallData): StoredToolCall {
   }
 }
 
+interface CompactionDetailFields {
+  trigger?: "auto" | "manual";
+  preTokens?: number;
+  outcome?: "canceled" | "failed";
+}
+
+/**
+ * The optional compaction fields, carried both ways. Dropping `outcome` here would turn a reloaded
+ * "Compaction canceled" back into "Context compacted".
+ */
+function compactionDetailFields(item: CompactionDetailFields): CompactionDetailFields {
+  return {
+    ...(item.trigger ? { trigger: item.trigger } : {}),
+    ...(item.preTokens !== undefined ? { preTokens: item.preTokens } : {}),
+    ...(item.outcome ? { outcome: item.outcome } : {}),
+  };
+}
+
 function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {
   const base = timelineBase(item);
   switch (item.kind) {
@@ -469,8 +488,7 @@ function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {
         ...base,
         kind: item.kind,
         status: item.status,
-        ...(item.trigger ? { trigger: item.trigger } : {}),
-        ...(item.preTokens !== undefined ? { preTokens: item.preTokens } : {}),
+        ...compactionDetailFields(item),
       };
     case "tool_call":
       if (item.payload.source !== "agent") return null;
@@ -562,8 +580,7 @@ function deserializeBuiltinTimelineItem(
         ...base,
         kind: item.kind,
         status: item.status,
-        ...(item.trigger ? { trigger: item.trigger } : {}),
-        ...(item.preTokens !== undefined ? { preTokens: item.preTokens } : {}),
+        ...compactionDetailFields(item),
       };
     case "tool_call": {
       const tool = item.item;

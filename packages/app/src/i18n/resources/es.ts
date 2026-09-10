@@ -365,6 +365,8 @@ export const es: TranslationResources = {
       manual: "Contexto compactado manualmente",
       withTokens: "Contexto compactado (tokens{{tokens}}K)",
       completed: "Contexto compactado",
+      canceled: "Compactación cancelada",
+      failed: "La compactación falló",
     },
     peer: {
       from: "De {{sender}}",

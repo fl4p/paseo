@@ -4,14 +4,19 @@ export interface CompactionMarkerLabelInput {
   status: "loading" | "completed";
   trigger?: "auto" | "manual";
   preTokens?: number;
+  outcome?: "canceled" | "failed";
 }
 
 export function getCompactionMarkerLabel({
   status,
   trigger,
   preTokens,
+  outcome,
 }: CompactionMarkerLabelInput): string {
   if (status === "loading") return i18n.t("message.compaction.loading");
+  // A compaction that was canceled or failed did not compact; never fall through to "compacted".
+  if (outcome === "canceled") return i18n.t("message.compaction.canceled");
+  if (outcome === "failed") return i18n.t("message.compaction.failed");
   if (trigger === "auto") return i18n.t("message.compaction.auto");
   if (trigger === "manual") return i18n.t("message.compaction.manual");
   if (preTokens) {

@@ -365,6 +365,8 @@ export const ptBR: TranslationResources = {
       manual: "Contexto compactado manualmente",
       withTokens: "Contexto compactado ({{tokens}}K tokens)",
       completed: "Contexto compactado",
+      canceled: "Compactação cancelada",
+      failed: "Falha na compactação",
     },
     peer: {
       from: "De {{sender}}",

@@ -757,6 +757,9 @@ export const AgentTimelineItemPayloadSchema: z.ZodType<AgentTimelineItem, unknow
     status: z.enum(["loading", "completed"]),
     trigger: z.enum(["auto", "manual"]).optional(),
     preTokens: z.number().optional(),
+    // A terminal marker for a compaction that did NOT compact. It rides on `status: "completed"`
+    // because widening `status` breaks older clients; they drop this key and keep the old label.
+    outcome: z.enum(["canceled", "failed"]).optional(),
   }),
   z.object({
     type: z.literal("plugin"),

@@ -364,6 +364,8 @@ export const ru: TranslationResources = {
       manual: "Контекст сжат вручную",
       withTokens: "Контекст сжат ({{tokens}} тыс. токенов)",
       completed: "Контекст сжат",
+      canceled: "Сжатие контекста отменено",
+      failed: "Не удалось сжать контекст",
     },
     peer: {
       from: "От {{sender}}",

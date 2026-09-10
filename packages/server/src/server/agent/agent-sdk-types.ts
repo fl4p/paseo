@@ -398,7 +398,12 @@ export interface CompactionTimelineItem {
   status: "loading" | "completed";
   trigger?: "auto" | "manual";
   preTokens?: number;
+  /** Set when a terminal (`completed`) marker closed a compaction that did not compact. */
+  outcome?: CompactionOutcome;
 }
+
+/** Why a compaction ended without compacting. Absent on a compaction that succeeded. */
+export type CompactionOutcome = "canceled" | "failed";
 
 export interface PluginTimelineItem {
   type: "plugin";

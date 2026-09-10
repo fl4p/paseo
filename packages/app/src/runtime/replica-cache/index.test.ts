@@ -505,6 +505,33 @@ describe("ReplicaCache", () => {
     expect((await reader.readTimeline(SERVER_ID, "agent-1"))?.items).toEqual([peerItem]);
   });
 
+  it.each(["canceled", "failed"] as const)(
+    "round-trips a %s compaction so a reload does not call it compacted",
+    async (outcome) => {
+      const storage = new MemoryStorage();
+      const writer = createCache(storage);
+      const compaction: StreamItem = {
+        kind: "compaction",
+        id: `compaction-${outcome}`,
+        timestamp: new Date("2026-09-10T08:00:00.000Z"),
+        timelineCursor: { epoch: "epoch-1", seq: 3 },
+        status: "completed",
+        trigger: "manual",
+        outcome,
+      };
+      writer.commitTimeline(SERVER_ID, "agent-1", {
+        agentId: "agent-1",
+        items: [compaction],
+        range: { epoch: "epoch-1", startSeq: 3, endSeq: 3 },
+        hasOlder: false,
+      });
+      await writer.flush();
+
+      const reader = createCache(storage);
+      expect((await reader.readTimeline(SERVER_ID, "agent-1"))?.items).toEqual([compaction]);
+    },
+  );
+
   it("drops cached plugin timeline items without a plugin-local id", async () => {
     const storage = new MemoryStorage();
     const writer = createCache(storage);

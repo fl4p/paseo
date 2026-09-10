@@ -1475,6 +1475,69 @@ describe("stream reducer canonical tool calls", () => {
     assert.strictEqual(compactions.length, 1);
     assert.strictEqual(compactions[0].status, "completed");
     assert.strictEqual(compactions[0].trigger, "manual");
+    assert.strictEqual(compactions[0].outcome, undefined);
+  });
+
+  it.each([
+    {
+      name: "canceled",
+      terminal: { type: "turn_canceled", provider: "codex", reason: "interrupted" },
+      outcome: "canceled",
+    },
+    {
+      name: "failed",
+      terminal: { type: "turn_failed", provider: "codex", error: "boom" },
+      outcome: "failed",
+    },
+  ] as const)(
+    "never calls a compaction compacted when its turn is $name",
+    ({ terminal, outcome }) => {
+      const state = hydrateStreamState([
+        {
+          event: compactionTimeline("loading", "manual"),
+          timestamp: new Date("2025-01-01T10:50:00Z"),
+        },
+        { event: terminal, timestamp: new Date("2025-01-01T10:50:05Z") },
+      ]);
+
+      const compactions = state.filter(
+        (item): item is Extract<StreamItem, { kind: "compaction" }> => item.kind === "compaction",
+      );
+      expect(compactions).toHaveLength(1);
+      // The spinner still terminates, but with the honest outcome.
+      expect(compactions[0]).toMatchObject({ status: "completed", trigger: "manual", outcome });
+    },
+  );
+
+  it("resolves the loading marker with a provider-reported outcome and keeps it at turn end", () => {
+    const state = hydrateStreamState([
+      {
+        event: compactionTimeline("loading", "manual"),
+        timestamp: new Date("2025-01-01T10:50:00Z"),
+      },
+      {
+        event: {
+          type: "timeline",
+          provider: "codex",
+          item: { type: "compaction", status: "completed", outcome: "canceled" },
+        },
+        timestamp: new Date("2025-01-01T10:50:04Z"),
+      },
+      {
+        event: { type: "turn_canceled", provider: "codex", reason: "interrupted" },
+        timestamp: new Date("2025-01-01T10:50:05Z"),
+      },
+    ]);
+
+    const compactions = state.filter(
+      (item): item is Extract<StreamItem, { kind: "compaction" }> => item.kind === "compaction",
+    );
+    expect(compactions).toHaveLength(1);
+    expect(compactions[0]).toMatchObject({
+      status: "completed",
+      trigger: "manual",
+      outcome: "canceled",
+    });
   });
 
   it("renders Claude TodoWrite as todo_list and suppresses tool call badge", () => {
