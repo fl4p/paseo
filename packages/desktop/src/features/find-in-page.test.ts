@@ -15,10 +15,12 @@ interface FindCall {
   newSession: boolean;
 }
 
+type FoundListener = (event: unknown, result: FoundInPageResult) => void;
+
 class FakeContents implements FindInPageContents {
   public readonly findCalls: FindCall[] = [];
   public readonly stopCalls: string[] = [];
-  public readonly listeners = new Set<(event: unknown, result: FoundInPageResult) => void>();
+  public readonly listeners = new Set<FoundListener>();
   public readonly destroyListeners: Array<() => void> = [];
   private destroyed = false;
 
@@ -51,10 +53,7 @@ class FakeContents implements FindInPageContents {
     this.stopCalls.push(action);
   }
 
-  public on(
-    _event: "found-in-page",
-    listener: (event: unknown, result: FoundInPageResult) => void,
-  ) {
+  public on(_event: "found-in-page", listener: FoundListener) {
     this.listeners.add(listener);
     return this;
   }
@@ -66,7 +65,7 @@ class FakeContents implements FindInPageContents {
 
   public removeListener(
     event: "found-in-page" | "destroyed",
-    listener: ((event: unknown, result: FoundInPageResult) => void) & (() => void),
+    listener: FoundListener & (() => void),
   ) {
     if (event === "destroyed") {
       const index = this.destroyListeners.indexOf(listener);
@@ -94,56 +93,83 @@ class FakeHostContents extends FakeContents {
   }
 }
 
-function setup(target?: FindInPageContents) {
+const ZERO_RESULT = {
+  channel: FIND_RESULT_CHANNEL,
+  payload: { activeMatchOrdinal: 0, matches: 0, finalUpdate: true },
+};
+
+/** A window with an active browser pane — the only thing Find may search. */
+function setup() {
   const host = new FakeHostContents(1);
-  const controller = new FindInPageController(() => target ?? host);
-  return { controller, host };
+  const browser = new FakeContents(42);
+  let target: FindInPageContents | null = browser;
+  const controller = new FindInPageController(() => target);
+  return {
+    controller,
+    host,
+    browser,
+    setTarget: (next: FindInPageContents | null) => {
+      target = next;
+    },
+  };
 }
 
 describe("FindInPageController", () => {
-  it("searches the window itself when no browser pane is active", () => {
-    const { controller, host } = setup();
+  it("searches the active browser pane", () => {
+    const { controller, host, browser } = setup();
 
-    controller.start(host, { query: "needle" });
+    expect(controller.start(host, { query: "needle" })).toEqual({ searched: true });
 
-    expect(host.findCalls).toEqual([{ text: "needle", forward: true, newSession: true }]);
+    expect(browser.findCalls).toEqual([{ text: "needle", forward: true, newSession: true }]);
+    expect(host.findCalls).toEqual([]);
   });
 
-  it("searches the active browser pane instead of the window", () => {
-    const browser = new FakeContents(42);
-    const { controller, host } = setup(browser);
+  it("never searches the page that contains the find bar", () => {
+    // Measured on Electron 44: searching the host counts the query in the bar's
+    // own input (3 matches for 2) and moves focus out of it to BODY.
+    const { controller, host, setTarget } = setup();
+    setTarget(host);
 
-    controller.start(host, { query: "needle" });
+    expect(controller.start(host, { query: "needle" })).toEqual({ searched: false });
 
-    expect(browser.findCalls).toHaveLength(1);
-    expect(host.findCalls).toHaveLength(0);
+    expect(host.findCalls).toEqual([]);
+    expect(host.sent).toEqual([ZERO_RESULT]);
+  });
+
+  it("says nothing was searched when there is no browser pane", () => {
+    const { controller, host, setTarget } = setup();
+    setTarget(null);
+
+    expect(controller.start(host, { query: "needle" })).toEqual({ searched: false });
+
+    expect(host.sent).toEqual([ZERO_RESULT]);
   });
 
   it("opens a new Chromium session unless it is advancing the query Chromium holds", () => {
-    const { controller, host } = setup();
+    const { controller, host, browser } = setup();
 
     controller.start(host, { query: "needle" });
     controller.start(host, { query: "needle", findNext: true });
     controller.start(host, { query: "haystack", findNext: true });
 
     // Electron's `findNext` is "begin a new session": true first, false to continue.
-    expect(host.findCalls.map((call) => call.newSession)).toEqual([true, false, true]);
+    expect(browser.findCalls.map((call) => call.newSession)).toEqual([true, false, true]);
   });
 
   it("searches backwards when asked", () => {
-    const { controller, host } = setup();
+    const { controller, host, browser } = setup();
 
     controller.start(host, { query: "needle" });
     controller.start(host, { query: "needle", findNext: true, forward: false });
 
-    expect(host.findCalls[1]).toEqual({ text: "needle", forward: false, newSession: false });
+    expect(browser.findCalls[1]).toEqual({ text: "needle", forward: false, newSession: false });
   });
 
   it("forwards match counts to the window that owns the find bar", () => {
-    const { controller, host } = setup();
+    const { controller, host, browser } = setup();
 
     controller.start(host, { query: "needle" });
-    host.emitFound({ activeMatchOrdinal: 2, matches: 7, finalUpdate: true });
+    browser.emitFound({ activeMatchOrdinal: 2, matches: 7, finalUpdate: true });
 
     expect(host.sent).toEqual([
       {
@@ -154,71 +180,66 @@ describe("FindInPageController", () => {
   });
 
   it("reports zero matches for an empty query and clears the highlight", () => {
-    const { controller, host } = setup();
+    const { controller, host, browser } = setup();
 
     controller.start(host, { query: "needle" });
     host.sent.length = 0;
-    controller.start(host, { query: "" });
 
-    expect(host.stopCalls).toEqual(["clearSelection"]);
-    expect(host.sent).toEqual([
-      {
-        channel: FIND_RESULT_CHANNEL,
-        payload: { activeMatchOrdinal: 0, matches: 0, finalUpdate: true },
-      },
-    ]);
+    expect(controller.start(host, { query: "" })).toEqual({ searched: false });
+    expect(browser.stopCalls).toEqual(["clearSelection"]);
+    expect(host.sent).toEqual([ZERO_RESULT]);
   });
 
   it("stops listening once the find bar closes", () => {
-    const { controller, host } = setup();
+    const { controller, host, browser } = setup();
 
     controller.start(host, { query: "needle" });
     controller.stop(host, "clearSelection");
 
-    expect(host.stopCalls).toEqual(["clearSelection"]);
-    expect(host.listeners.size).toBe(0);
+    expect(browser.stopCalls).toEqual(["clearSelection"]);
+    expect(browser.listeners.size).toBe(0);
   });
 
-  it("hands the search over when the find target changes mid-session", () => {
-    const browser = new FakeContents(42);
-    const host = new FakeHostContents(1);
-    let target: FindInPageContents = host;
-    const controller = new FindInPageController(() => target);
+  it("hands the search over when the active pane changes mid-session", () => {
+    const { controller, host, browser, setTarget } = setup();
+    const other = new FakeContents(43);
 
     controller.start(host, { query: "needle" });
-    target = browser;
+    setTarget(other);
     controller.start(host, { query: "needle", findNext: true });
 
-    expect(host.listeners.size).toBe(0);
-    // The new target has not run this query yet, so it starts from the top.
-    expect(browser.findCalls).toEqual([{ text: "needle", forward: true, newSession: true }]);
+    expect(browser.listeners.size).toBe(0);
+    // The new pane has not run this query yet, so it starts from the top...
+    expect(other.findCalls).toEqual([{ text: "needle", forward: true, newSession: true }]);
     // ...and the pane being left does not keep its highlight.
-    expect(host.stopCalls).toEqual(["clearSelection"]);
+    expect(browser.stopCalls).toEqual(["clearSelection"]);
   });
 
-  it("invalidates the session and zeroes the count when the target is destroyed", () => {
-    const browser = new FakeContents(42);
-    const { controller, host } = setup(browser);
+  it("invalidates the session and zeroes the count when the pane is destroyed", () => {
+    const { controller, host, browser } = setup();
 
     controller.start(host, { query: "needle" });
     host.sent.length = 0;
     browser.destroy();
 
-    expect(host.sent).toEqual([
-      {
-        channel: FIND_RESULT_CHANNEL,
-        payload: { activeMatchOrdinal: 0, matches: 0, finalUpdate: true },
-      },
-    ]);
-
-    // A destroyed target must not be stopped or searched afterwards.
+    expect(host.sent).toEqual([ZERO_RESULT]);
+    // A destroyed pane must not be stopped or searched afterwards.
     controller.stop(host, "clearSelection");
     expect(browser.stopCalls).toEqual([]);
   });
 
-  it("clears a guest pane that outlives the window searching it", () => {
-    const browser = new FakeContents(42);
-    const { controller, host } = setup(browser);
+  it("reports nothing searched when the pane is already gone", () => {
+    const { controller, host, browser } = setup();
+
+    browser.destroy();
+
+    expect(controller.start(host, { query: "needle" })).toEqual({ searched: false });
+    expect(browser.findCalls).toHaveLength(0);
+    expect(host.sent).toEqual([ZERO_RESULT]);
+  });
+
+  it("clears a pane that outlives the window searching it", () => {
+    const { controller, host, browser } = setup();
 
     controller.start(host, { query: "needle" });
     controller.releaseHost(host.id);
@@ -226,31 +247,6 @@ describe("FindInPageController", () => {
     expect(browser.stopCalls).toEqual(["clearSelection"]);
     expect(browser.listeners.size).toBe(0);
     expect(browser.destroyListeners).toHaveLength(0);
-  });
-
-  it("reports no matches when the target is gone", () => {
-    const browser = new FakeContents(42);
-    const { controller, host } = setup(browser);
-
-    browser.destroy();
-    controller.start(host, { query: "needle" });
-
-    expect(browser.findCalls).toHaveLength(0);
-    expect(host.sent).toEqual([
-      {
-        channel: FIND_RESULT_CHANNEL,
-        payload: { activeMatchOrdinal: 0, matches: 0, finalUpdate: true },
-      },
-    ]);
-  });
-
-  it("drops the session for a closed window", () => {
-    const { controller, host } = setup();
-
-    controller.start(host, { query: "needle" });
-    controller.releaseHost(host.id);
-
-    expect(host.listeners.size).toBe(0);
   });
 });
 

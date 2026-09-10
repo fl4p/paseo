@@ -98,6 +98,8 @@ export function FindInPageBar(): React.ReactElement | null {
   const [visible, setVisible] = useState(false);
   const [query, setQuery] = useState("");
   const [chromiumResult, setChromiumResult] = useState<DesktopFindResult>(EMPTY_RESULT);
+  // Unknown until the main process answers whether it had a browser pane to search.
+  const [chromiumSearchable, setChromiumSearchable] = useState<boolean | null>(null);
   const findRef = useRef<PaneFindHandle>(null);
   const transcript = useTranscriptFindStore((state) => state.source);
 
@@ -124,11 +126,18 @@ export function FindInPageBar(): React.ReactElement | null {
       void find?.stop?.("clearSelection");
       return;
     }
-    void find?.start?.({ query: nextQuery, forward, findNext });
+    void find
+      ?.start?.({ query: nextQuery, forward, findNext })
+      ?.then((result) => {
+        setChromiumSearchable(result?.searched !== false);
+        return undefined;
+      })
+      .catch(() => undefined);
   }, []);
 
   const stopChromium = useCallback(() => {
     setChromiumResult(EMPTY_RESULT);
+    setChromiumSearchable(null);
     void getDesktopHost()?.find?.stop?.("clearSelection");
   }, []);
 
@@ -244,13 +253,23 @@ export function FindInPageBar(): React.ReactElement | null {
     return null;
   }
 
-  const total = transcript ? matches.length : chromiumResult.matches;
-  const current = transcript ? activeMatchIndex + 1 : chromiumResult.activeMatchOrdinal;
+  // With neither a transcript nor a browser pane there is nothing Find may
+  // search, and "No matches" there would be a claim about text nobody read.
+  const searchable = transcript !== null || chromiumSearchable === true;
+  let total = 0;
+  let current = 0;
+  if (transcript) {
+    total = matches.length;
+    current = activeMatchIndex + 1;
+  } else if (searchable) {
+    total = chromiumResult.matches;
+    current = chromiumResult.activeMatchOrdinal;
+  }
   const status = formatStatus({
     current,
     total,
     truncated: transcript !== null && truncated,
-    hasQuery: query.length > 0,
+    hasQuery: searchable && query.length > 0,
     t,
   });
 

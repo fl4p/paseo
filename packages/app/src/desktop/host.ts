@@ -104,8 +104,13 @@ export interface DesktopFindResult {
   finalUpdate: boolean;
 }
 
+export interface DesktopFindStartResult {
+  /** False when the window had nothing Chromium may search, so there is no count. */
+  searched: boolean;
+}
+
 export interface DesktopFindBridge {
-  start?: (input: DesktopFindStartInput) => Promise<void>;
+  start?: (input: DesktopFindStartInput) => Promise<DesktopFindStartResult | undefined>;
   stop?: (action?: DesktopFindStopAction) => Promise<void>;
 }
 
