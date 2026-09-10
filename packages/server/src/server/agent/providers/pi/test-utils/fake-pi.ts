@@ -12,6 +12,7 @@ import type {
   PiRuntimeEvent,
   PiSessionState,
   PiSessionStats,
+  PiStreamingBehavior,
 } from "../rpc-types.js";
 import { buildPiLaunch } from "../runtime.js";
 
@@ -93,7 +94,11 @@ export class FakePi implements PiRuntime {
 }
 
 export class FakePiSession implements PiRuntimeSession {
-  readonly prompts: Array<{ message: string; imageCount: number }> = [];
+  readonly prompts: Array<{
+    message: string;
+    imageCount: number;
+    streamingBehavior?: PiStreamingBehavior;
+  }> = [];
   readonly steerCalls: Array<{ message: string; imageCount: number }> = [];
   steerError: Error | null = null;
   readonly controlRequests: string[] = [];
@@ -165,8 +170,13 @@ export class FakePiSession implements PiRuntimeSession {
   async prompt(
     message: string,
     images?: Array<{ type: "image"; data: string; mimeType: string }>,
+    options?: { streamingBehavior?: PiStreamingBehavior },
   ): Promise<PiPromptAck> {
-    this.prompts.push({ message, imageCount: images?.length ?? 0 });
+    this.prompts.push({
+      message,
+      imageCount: images?.length ?? 0,
+      ...(options?.streamingBehavior ? { streamingBehavior: options.streamingBehavior } : {}),
+    });
     const heldPrompt = this.nextHeldPrompt;
     if (heldPrompt) {
       this.nextHeldPrompt = null;

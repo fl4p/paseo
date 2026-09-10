@@ -1341,13 +1341,12 @@ export class PiRpcAgentSession implements AgentSession {
 
     void (async () => {
       try {
-        // Paseo's own guard above only knows about turns Paseo started; pi can still
-        // be streaming one Paseo thinks has ended (an in-flight extension command, a
-        // just-aborted turn). Queue in that case instead of surfacing pi's
-        // "Agent is already processing" as a turn_failed system error.
-        const ack = await this.runtimeSession.prompt(payload.text, payload.images, {
-          streamingBehavior: "followUp",
-        });
+        // Deliberately no streamingBehavior. activeTurnId was claimed above, and every
+        // pi event is attributed to it (currentTurnIdForEvent), so a prompt queued with
+        // "followUp" behind a turn pi is still streaming would hand the old turn's
+        // output to this one. If pi is busy, fail fast: the catch below releases the
+        // turn and reports turn_failed. Queueing needs pending-vs-executing tracking.
+        const ack = await this.runtimeSession.prompt(payload.text, payload.images);
         this.activePromptRequestId = ack.requestId ?? null;
         const correlatedResult = ack.requestId
           ? this.pendingPromptResults.get(ack.requestId)
@@ -1639,9 +1638,10 @@ export class PiRpcAgentSession implements AgentSession {
     const requestId = randomUUID();
     const resultPromise = this.waitForExtensionResult(requestId);
     const payload = Buffer.from(JSON.stringify({ targetId, requestId })).toString("base64url");
-    // Control-plane traffic, not user input: queue it behind any live turn rather
-    // than steering the model with a base64 slash command — and never fail with
-    // "Agent is already processing" just because a turn happened to be streaming.
+    // pi runs a registered extension command immediately, even mid-turn, before it
+    // checks for streaming — so this normally never queues. "followUp" only matters
+    // if the extension is not registered and the text falls through to a prompt:
+    // then it must wait for the turn, never steer the model with a base64 command.
     await this.runtimeSession.prompt(`/${PASEO_PI_TREE_EXTENSION_COMMAND} ${payload}`, undefined, {
       streamingBehavior: "followUp",
     });
@@ -1940,7 +1940,7 @@ export class PiRpcAgentSession implements AgentSession {
     const requestId = randomUUID();
     const resultPromise = this.waitForExtensionResult(requestId);
     const payload = Buffer.from(JSON.stringify({ requestId, reason })).toString("base64url");
-    // Control-plane traffic — see runPiTreeExtensionCommand.
+    // See runPiTreeExtensionCommand for why "followUp" is only a fallthrough guard.
     await this.runtimeSession.prompt(
       `/${PASEO_PI_CAPTURE_EXTENSION_COMMAND} ${payload}`,
       undefined,

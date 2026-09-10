@@ -1006,6 +1006,19 @@ describe("PiRpcAgentSession", () => {
     );
   });
 
+  test("never queues a user turn behind a turn Pi is still streaming", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+
+    await session.startTurn("hello");
+
+    // startTurn claims activeTurnId before prompting, and every Pi event is attributed
+    // to it. "followUp" would let a busy Pi accept the prompt while still streaming the
+    // previous turn, so that turn's output would be reported under this turn's id.
+    expect(fakeSession.prompts).toHaveLength(1);
+    expect(fakeSession.prompts[0]).not.toHaveProperty("streamingBehavior");
+  });
+
   test("treats Pi's aborted terminal response as cancellation after an interrupt", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
