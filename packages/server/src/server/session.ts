@@ -1197,64 +1197,101 @@ export class Session {
     return source ? this.supportsForSource(capability, source) : this.supports(capability);
   }
 
+  /**
+   * A discarded prompt is addressed to the composer, not to a timeline: the client has to retire
+   * the pending submission for that clientMessageId even while it is looking at another agent, or
+   * at none. Nothing else will — the canonical timeline never contains the discarded prompt, so a
+   * reconnect cannot clear it either. `attention_required` is exempted from the same gate for the
+   * same reason.
+   */
+  private ignoresViewedTimeline(
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+  ): boolean {
+    return serializedEvent.type === "prompt_discarded";
+  }
+
+  private buildAttentionRequiredMessage(
+    agentId: string,
+    serializedEvent: Extract<
+      Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+      { type: "attention_required" }
+    >,
+  ): Extract<SessionOutboundMessage, { type: "agent_attention_required" }> {
+    return {
+      type: "agent_attention_required",
+      payload: {
+        agentId,
+        reason: serializedEvent.reason,
+        timestamp: serializedEvent.timestamp,
+        shouldNotify: serializedEvent.shouldNotify,
+        ...(serializedEvent.notification ? { notification: serializedEvent.notification } : {}),
+      },
+    };
+  }
+
   private forwardAgentStream(
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
   ): void {
     if (this.clientCapabilitiesBySource.size === 0 || !this.onMessageToSource) {
-      if (serializedEvent.type === "timeline" && !this.supportsTimelineItem(serializedEvent.item))
-        return;
-      if (this.usesSelectiveTimelineDelivery() && serializedEvent.type === "attention_required") {
-        this.emit({
-          type: "agent_attention_required",
-          payload: {
-            agentId: event.agentId,
-            reason: serializedEvent.reason,
-            timestamp: serializedEvent.timestamp,
-            shouldNotify: serializedEvent.shouldNotify,
-            ...(serializedEvent.notification ? { notification: serializedEvent.notification } : {}),
-          },
-        });
-      } else if (
-        !this.usesSelectiveTimelineDelivery() ||
-        this.viewedTimelineAgentIds.has(event.agentId)
-      ) {
-        this.emit({
-          type: "agent_stream",
-          payload: this.buildAgentStreamPayload(event, serializedEvent),
-        });
-      }
+      this.forwardAgentStreamToSession(event, serializedEvent);
       return;
     }
+    this.forwardAgentStreamToSources(event, serializedEvent);
+  }
 
+  private forwardAgentStreamToSession(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+  ): void {
+    if (serializedEvent.type === "timeline" && !this.supportsTimelineItem(serializedEvent.item)) {
+      return;
+    }
+    if (this.usesSelectiveTimelineDelivery() && serializedEvent.type === "attention_required") {
+      this.emit(this.buildAttentionRequiredMessage(event.agentId, serializedEvent));
+      return;
+    }
+    if (
+      this.usesSelectiveTimelineDelivery() &&
+      !this.ignoresViewedTimeline(serializedEvent) &&
+      !this.viewedTimelineAgentIds.has(event.agentId)
+    ) {
+      return;
+    }
+    this.emit({
+      type: "agent_stream",
+      payload: this.buildAgentStreamPayload(event, serializedEvent),
+    });
+  }
+
+  private forwardAgentStreamToSources(
+    event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+  ): void {
     for (const [source, capabilities] of this.clientCapabilitiesBySource) {
       if (
         serializedEvent.type === "timeline" &&
         !this.supportsTimelineItem(serializedEvent.item, source)
-      )
+      ) {
         continue;
+      }
       const supportsSelectiveDelivery = capabilities.has(CLIENT_CAPS.selectiveAgentTimeline);
       if (supportsSelectiveDelivery && serializedEvent.type === "attention_required") {
         if (!this.wantsEvent("agent_attention_required", source)) continue;
-        this.onMessageToSource(source, {
-          type: "agent_attention_required",
-          payload: {
-            agentId: event.agentId,
-            reason: serializedEvent.reason,
-            timestamp: serializedEvent.timestamp,
-            shouldNotify: serializedEvent.shouldNotify,
-            ...(serializedEvent.notification ? { notification: serializedEvent.notification } : {}),
-          },
-        });
+        this.onMessageToSource?.(
+          source,
+          this.buildAttentionRequiredMessage(event.agentId, serializedEvent),
+        );
         continue;
       }
       if (
         supportsSelectiveDelivery &&
+        !this.ignoresViewedTimeline(serializedEvent) &&
         !this.viewedTimelineAgentIdsBySource.get(source)?.has(event.agentId)
       ) {
         continue;
       }
-      this.onMessageToSource(source, {
+      this.onMessageToSource?.(source, {
         type: "agent_stream",
         payload: this.buildAgentStreamPayload(event, serializedEvent),
       });

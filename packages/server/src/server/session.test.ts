@@ -5332,6 +5332,126 @@ test("acknowledges a timeline subscription only to its socket source", async () 
   ]);
 });
 
+/**
+ * A discarded prompt is the only signal that retires the pending submission the composer is still
+ * showing (see `packages/app/src/composer/submission/model.ts`), and the canonical timeline never
+ * contains the discarded prompt, so a reconnect cannot clear it either. Selective timeline
+ * delivery must not swallow it just because the user is looking elsewhere.
+ */
+test("delivers a discarded prompt to a single-source client that is not viewing the agent", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  session.updateClientCapabilities({ selective_agent_timeline: true });
+  await session.handleMessage({
+    type: "agent.timeline.set_subscription.request",
+    agentIds: ["agent-viewed"],
+    requestId: "timeline-subscription-discarded-single",
+  });
+  messages.length = 0;
+
+  if (agentEventListeners.length === 0) throw new Error("Agent event listener was not installed");
+  for (const listener of agentEventListeners) {
+    // A timeline row for the same unviewed agent stays gated...
+    listener({
+      type: "agent_stream",
+      agentId: "agent-elsewhere",
+      event: {
+        type: "timeline",
+        provider: "mock",
+        item: { type: "assistant_message", messageId: "message-elsewhere", text: "elsewhere" },
+      },
+    });
+    // ...while the discard reaches the client anyway.
+    listener({
+      type: "agent_stream",
+      agentId: "agent-elsewhere",
+      event: {
+        type: "prompt_discarded",
+        provider: "mock",
+        clientMessageId: "client-message-1",
+        reason: "Message not sent: the agent was closed",
+      },
+    });
+  }
+
+  const forwarded = messages.filter((message) => message.type === "agent_stream");
+  expect(forwarded).toHaveLength(1);
+  expect(forwarded[0]).toMatchObject({
+    type: "agent_stream",
+    payload: {
+      agentId: "agent-elsewhere",
+      event: { type: "prompt_discarded", clientMessageId: "client-message-1" },
+    },
+  });
+});
+
+test("delivers a discarded prompt to every socket source, viewing that agent or not", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    messages,
+    targetedMessages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  const viewingSocket = {};
+  const elsewhereSocket = {};
+  session.updateClientCapabilities({ selective_agent_timeline: true }, viewingSocket);
+  session.updateClientCapabilities({ selective_agent_timeline: true }, elsewhereSocket);
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agent-discarded"],
+      requestId: "timeline-subscription-discarded-viewing",
+    },
+    viewingSocket,
+  );
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agent-other"],
+      requestId: "timeline-subscription-discarded-elsewhere",
+    },
+    elsewhereSocket,
+  );
+  targetedMessages.length = 0;
+
+  if (agentEventListeners.length === 0) throw new Error("Agent event listener was not installed");
+  for (const listener of agentEventListeners) {
+    listener({
+      type: "agent_stream",
+      agentId: "agent-discarded",
+      event: {
+        type: "prompt_discarded",
+        provider: "mock",
+        clientMessageId: "client-message-2",
+        reason: "Message not sent: you stopped the agent",
+      },
+    });
+  }
+
+  const discards = targetedMessages.filter(
+    (entry) =>
+      entry.message.type === "agent_stream" &&
+      entry.message.payload.event.type === "prompt_discarded",
+  );
+  expect(discards.map((entry) => entry.source)).toEqual([viewingSocket, elsewhereSocket]);
+});
+
 test("unions viewed timelines across socket sources and removes detached sources", async () => {
   const messages: SessionOutboundMessage[] = [];
   const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
