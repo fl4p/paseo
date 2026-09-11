@@ -48,7 +48,7 @@ interface StopRealtimeVoiceContext {
 
 interface SendActionContext {
   defaultSendBehavior: SendBehavior;
-  isAgentRunning: boolean;
+  isQueueBusy: boolean;
   onQueue: ((payload: MessagePayload) => void) | undefined;
   handleSendMessage: () => void;
   handleQueueMessage: () => void;
@@ -57,7 +57,7 @@ interface SendActionContext {
 interface DictationTranscriptContext {
   value: string;
   defaultSendBehavior: SendBehavior;
-  isAgentRunning: boolean;
+  isQueueBusy: boolean;
   onQueue: ((payload: MessagePayload) => void) | undefined;
   onSubmit: (payload: MessagePayload) => void;
   replaceText: (text: string) => void;
@@ -78,7 +78,7 @@ export function applyDictationTranscript(text: string, ctx: DictationTranscriptC
 
   ctx.replaceText(nextValue);
 
-  if (ctx.defaultSendBehavior === "queue" && ctx.isAgentRunning && ctx.onQueue) {
+  if (ctx.defaultSendBehavior === "queue" && ctx.isQueueBusy && ctx.onQueue) {
     ctx.onQueue({ text: nextValue, attachments: ctx.attachments, cwd: ctx.cwd });
     ctx.replaceText("");
     return;
@@ -88,7 +88,7 @@ export function applyDictationTranscript(text: string, ctx: DictationTranscriptC
     text: nextValue,
     attachments: ctx.attachments,
     cwd: ctx.cwd,
-    forceSend: ctx.isAgentRunning || undefined,
+    forceSend: ctx.isQueueBusy || undefined,
   });
 }
 
@@ -118,7 +118,7 @@ export function computeCanStartDictation(input: {
 }
 
 export function runDefaultSendAction(ctx: SendActionContext): void {
-  if (ctx.defaultSendBehavior === "queue" && ctx.isAgentRunning && ctx.onQueue) {
+  if (ctx.defaultSendBehavior === "queue" && ctx.isQueueBusy && ctx.onQueue) {
     ctx.handleQueueMessage();
     return;
   }
@@ -130,7 +130,7 @@ export function runAlternateSendAction(ctx: SendActionContext): void {
     ctx.handleSendMessage();
     return;
   }
-  if (ctx.isAgentRunning && ctx.onQueue) {
+  if (ctx.isQueueBusy && ctx.onQueue) {
     ctx.handleQueueMessage();
   }
 }

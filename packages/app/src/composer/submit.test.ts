@@ -31,7 +31,7 @@ describe("submitAgentInput", () => {
     const submitPromise = submitAgentInput({
       message: "  hello world  ",
       attachments: [],
-      isAgentRunning: false,
+      isQueueBusy: false,
       canSubmit: true,
       queueMessage,
       submitMessage,
@@ -76,7 +76,7 @@ describe("submitAgentInput", () => {
       message: "  keep me  ",
       attachments,
       submitBehavior: "preserve-and-lock",
-      isAgentRunning: false,
+      isQueueBusy: false,
       canSubmit: true,
       queueMessage,
       submitMessage,
@@ -117,7 +117,7 @@ describe("submitAgentInput", () => {
       submitAgentInput({
         message: "  queued message  ",
         attachments: [{ id: "img-1" }],
-        isAgentRunning: true,
+        isQueueBusy: true,
         canSubmit: true,
         queueMessage,
         submitMessage,
@@ -159,7 +159,7 @@ describe("submitAgentInput", () => {
       submitAgentInput({
         message: "  hello world  ",
         attachments,
-        isAgentRunning: false,
+        isQueueBusy: false,
         canSubmit: true,
         queueMessage,
         submitMessage,
@@ -196,7 +196,7 @@ describe("submitAgentInput", () => {
         message: "  steer this turn  ",
         attachments: [{ id: "img-1" }],
         forceSend: true,
-        isAgentRunning: true,
+        isQueueBusy: true,
         canSubmit: true,
         queueMessage: vi.fn(),
         submitMessage: async () => {
@@ -231,7 +231,7 @@ describe("submitAgentInput", () => {
         message: "   ",
         attachments: [],
         allowEmptySubmit: true,
-        isAgentRunning: false,
+        isQueueBusy: false,
         canSubmit: true,
         queueMessage,
         submitMessage,
