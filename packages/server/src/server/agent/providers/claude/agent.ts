@@ -4432,7 +4432,7 @@ class ClaudeAgentSession implements AgentSession {
     clientMessageId?: string,
   ): void {
     const events: AgentStreamEvent[] = [];
-    this.appendUserMessageEvents(message, events);
+    this.appendUserMessageEvents(message, events, { clientSubmitted: true });
     if (events.length === 0) {
       return;
     }
@@ -4592,6 +4592,7 @@ class ClaudeAgentSession implements AgentSession {
   private appendUserMessageEvents(
     message: Extract<SDKMessage, { type: "user" }>,
     events: AgentStreamEvent[],
+    options?: { clientSubmitted?: boolean },
   ): void {
     const messageId =
       typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
@@ -4613,7 +4614,7 @@ class ClaudeAgentSession implements AgentSession {
       });
       return;
     }
-    if (this.isStreamedCompactSummary(message)) {
+    if (this.isStreamedCompactSummary(message, options?.clientSubmitted === true)) {
       return;
     }
     if (isSyntheticUserEntry(message)) {
@@ -4662,16 +4663,31 @@ class ClaudeAgentSession implements AgentSession {
    * `isCompactSummary` (transcripts, replays), or, for a CLI that streams it with no flag at all,
    * the summary's fixed opening sentence on the first user message after a `compact_boundary`.
    */
-  private isStreamedCompactSummary(message: Extract<SDKMessage, { type: "user" }>): boolean {
+  private isStreamedCompactSummary(
+    message: Extract<SDKMessage, { type: "user" }>,
+    clientSubmitted: boolean,
+  ): boolean {
     const record = toObjectRecord(message);
     if (record?.isCompactSummary === true) {
       this.awaitingCompactSummary = false;
       return true;
     }
-    if (!this.awaitingCompactSummary || isSyntheticUserEntry(message)) {
+    if (!this.awaitingCompactSummary) {
       return false;
     }
+    // A prompt this daemon just submitted for the user is never the CLI's summary, whatever it
+    // says. It carries a clientMessageId the manager has already recorded, and swallowing it
+    // would lose the user's message. Leave the fallback armed for the summary still to come.
+    if (clientSubmitted) {
+      return false;
+    }
+    // Only the FIRST user message after the boundary can be the summary. Whatever arrives first
+    // disarms the fallback — including the synthetic message the CLI streams the summary as —
+    // so a later real prompt that happens to open with the same sentence is never eaten.
     this.awaitingCompactSummary = false;
+    if (isSyntheticUserEntry(message)) {
+      return false;
+    }
     return readFirstUserText(record).startsWith(CLAUDE_COMPACT_SUMMARY_OPENING);
   }
 

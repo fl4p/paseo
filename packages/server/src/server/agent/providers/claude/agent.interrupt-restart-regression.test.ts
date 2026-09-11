@@ -1528,3 +1528,56 @@ test.each([
     );
   },
 );
+
+/** A genuine user message that happens to open with the summary's fixed sentence. */
+function buildSummaryLookalikeUserMessage(sessionId: string, text: string) {
+  return {
+    type: "user",
+    uuid: "lookalike-user-1",
+    parent_tool_use_id: null,
+    message: { role: "user", content: text },
+    session_id: sessionId,
+  };
+}
+
+test("a real user message opening with the summary sentence survives the synthetic summary", async () => {
+  const sessionId = "compact-summary-lookalike";
+  const lookalike = `${COMPACT_SUMMARY_TEXT} Now please review the diff.`;
+  queryFactory.mockImplementation(({ prompt }: { prompt: AsyncIterable<unknown> }) =>
+    createScriptedQuery({
+      prompt,
+      sessionId,
+      async handlePrompt({ promptRecord, query: scripted }) {
+        await afterPromptEcho();
+        if (promptRecord.text !== "/compact") {
+          scripted.emit(buildSuccessResult(sessionId));
+          return;
+        }
+        scripted.emit(buildCompactingStatus(sessionId));
+        scripted.emit(buildCompactBoundary(sessionId));
+        // The CLI's own summary, streamed synthetic. It must disarm the text fallback...
+        scripted.emit(buildStreamedCompactSummary(sessionId));
+        // ...so this real message, which merely opens the same way, is still rendered.
+        scripted.emit(buildSummaryLookalikeUserMessage(sessionId, lookalike));
+        scripted.emit(buildSuccessResult(sessionId));
+      },
+    }),
+  );
+  const session = await new ClaudeAgentClient({
+    logger: createTestLogger(),
+    queryFactory,
+    resolveBinary: async () => "/test/claude/bin",
+  }).createSession({ provider: "claude", cwd: process.cwd() });
+  const observed: AgentStreamEvent[] = [];
+  const unsubscribe = session.subscribe((event) => observed.push(event));
+  try {
+    await collectUntilTerminal(streamSession(session, "/compact"));
+    await waitFor(() => observedUserTexts(observed).includes(lookalike));
+
+    expect(observedUserTexts(observed)).toContain(lookalike);
+    expect(observedUserTexts(observed)).not.toContain(COMPACT_SUMMARY_TEXT);
+  } finally {
+    unsubscribe();
+    await session.close();
+  }
+});
