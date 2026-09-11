@@ -11,6 +11,7 @@ import {
   type TranscriptSearchResult,
 } from "@/agent-stream/find/model";
 import { useTranscriptFindStore } from "@/agent-stream/find/store";
+import { useTerminalFindStore, type TerminalFindSource } from "@/terminal/find/store";
 import {
   afterRowSettles,
   applyTranscriptHighlights,
@@ -92,23 +93,26 @@ function activeHitFor(
 
 /**
  * Chromium's find painted its matches; the transcript search paints its own
- * (see agent-stream/find/highlight.web.ts). Kept out of FindInPageBar so the bar
- * stays a router between backends.
+ * (see agent-stream/find/highlight.web.ts). It paints only while the transcript
+ * owns Find: a focused terminal outranks it, and transcript hits painted behind
+ * the terminal would mark text the reader is not searching. Kept out of
+ * FindInPageBar so the bar stays a router between backends.
  */
 function useTranscriptHighlights(input: {
-  enabled: boolean;
+  visible: boolean;
+  owned: boolean;
   query: string;
   matches: readonly TranscriptMatch[];
   activeMatchIndex: number;
 }): void {
-  const { enabled, query, matches, activeMatchIndex } = input;
+  const { visible, owned, query, matches, activeMatchIndex } = input;
   const activeHit = useMemo(
     () => activeHitFor(matches, activeMatchIndex),
     [activeMatchIndex, matches],
   );
   const activeHitRef = useRef(activeHit);
   activeHitRef.current = activeHit;
-  const highlightQuery = enabled ? query : "";
+  const highlightQuery = visible && owned ? query : "";
 
   useEffect(() => {
     if (highlightQuery.length === 0) {
@@ -168,6 +172,14 @@ function formatStatus(input: {
   t: (key: string, options?: Record<string, unknown>) => string;
 }): string {
   if (input.total > 0) {
+    if (input.current <= 0) {
+      // No active match to point at — the terminal's search addon stops
+      // tracking the active index once its highlight limit is exceeded — so
+      // the bar states the count it knows, as a floor rather than a total.
+      return input.t("paneFind.total", {
+        total: input.truncated ? `${input.total}+` : `${input.total}`,
+      });
+    }
     return input.t("paneFind.position", {
       current: input.current,
       // A capped scan knows a floor, not a total, and says so rather than
@@ -181,15 +193,15 @@ function formatStatus(input: {
 /**
  * The desktop Find bar.
  *
- * It searches whichever of two things the window is showing. An agent
+ * It searches whichever of three things the window is showing. An agent
  * transcript is searched through its own stream model, because the web
  * transcript only mounts its recent rows and Chromium's find would report a
- * confident "No matches" for text that is plainly in the conversation. Anything
- * else — settings, an embedded browser pane — is searched with Chromium's
- * find-in-page from the main process.
- *
- * Terminal panes are in neither camp: xterm paints its scrollback to a canvas,
- * so that text is not searchable by either backend.
+ * confident "No matches" for text that is plainly in the conversation. A
+ * focused terminal pane is searched through its own xterm search addon — the
+ * canvas renderer keeps the scrollback out of the DOM, so no other backend
+ * can see it — and claims Find ahead of a merely-presented transcript, since
+ * the reader clicked into it. Anything else — settings, an embedded browser
+ * pane — is searched with Chromium's find-in-page from the main process.
  */
 export function FindInPageBar(): React.ReactElement | null {
   const { t } = useTranslation();
@@ -200,8 +212,14 @@ export function FindInPageBar(): React.ReactElement | null {
   const [chromiumSearchable, setChromiumSearchable] = useState<boolean | null>(null);
   const findRef = useRef<PaneFindHandle>(null);
   const transcript = useTranscriptFindStore((state) => state.source);
+  const terminal = useTerminalFindStore((state) => state.source);
+  const terminalResult = useTerminalFindStore((state) => state.result);
+  // A focused terminal pane is the pane the reader clicked into; it answers
+  // Find ahead of a transcript panel that merely sits in the active tab.
+  const usingTerminal = terminal !== null;
+  const usingTranscript = !usingTerminal && transcript !== null;
 
-  const { matches, truncated } = useMemo<TranscriptSearchResult>(() => {
+  const { matches, truncated: truncatedMatches } = useMemo<TranscriptSearchResult>(() => {
     if (!transcript || query.length === 0) {
       return NO_TRANSCRIPT_RESULT;
     }
@@ -239,24 +257,39 @@ export function FindInPageBar(): React.ReactElement | null {
     void getDesktopHost()?.find?.stop?.("clearSelection");
   }, []);
 
+  const stopTerminal = useCallback(() => {
+    useTerminalFindStore.getState().source?.clear();
+  }, []);
+
   const close = useCallback(() => {
     setVisible(false);
     setQuery("");
     setAnchor(null);
     stopChromium();
-  }, [stopChromium]);
+    stopTerminal();
+  }, [stopChromium, stopTerminal]);
 
   const handleQueryChange = useCallback(
     (nextQuery: string) => {
       setQuery(nextQuery);
       setAnchor(null);
+      if (usingTerminal) {
+        if (nextQuery.length === 0) {
+          terminal?.clear();
+        } else {
+          // Incremental: typing keeps the current match selected when it still
+          // fits the longer query, instead of jumping back to the first hit.
+          terminal?.find({ query: nextQuery, forward: true, incremental: true });
+        }
+        return;
+      }
       if (transcript) {
         // The jump follows from the recomputed match list, not from here.
         return;
       }
       searchChromium(nextQuery, true, false);
     },
-    [searchChromium, transcript],
+    [searchChromium, terminal, transcript, usingTerminal],
   );
 
   // Typing moves the transcript to the first hit; stepping moves it to the next.
@@ -265,7 +298,10 @@ export function FindInPageBar(): React.ReactElement | null {
   // active hit on each update of a live turn.
   const transcriptRef = useRef(transcript);
   transcriptRef.current = transcript;
-  const jumpTargetId = transcript ? (matches[activeMatchIndex]?.itemId ?? null) : null;
+  // Only a transcript that actually answers Find may jump the reader: a
+  // focused terminal pane outranks it, and jumping behind the terminal's own
+  // scroll would move text the reader is not looking at.
+  const jumpTargetId = usingTranscript ? (matches[activeMatchIndex]?.itemId ?? null) : null;
   useEffect(() => {
     if (visible && jumpTargetId) {
       transcriptRef.current?.jumpToItem(jumpTargetId);
@@ -273,7 +309,8 @@ export function FindInPageBar(): React.ReactElement | null {
   }, [jumpTargetId, visible]);
 
   useTranscriptHighlights({
-    enabled: visible && transcript !== null,
+    visible,
+    owned: usingTranscript,
     query,
     matches,
     activeMatchIndex,
@@ -281,6 +318,10 @@ export function FindInPageBar(): React.ReactElement | null {
 
   const step = useCallback(
     (forward: boolean) => {
+      if (usingTerminal) {
+        terminal?.find({ query, forward, incremental: false });
+        return;
+      }
       if (transcript) {
         const next = stepMatchIndex({
           current: activeMatchIndex,
@@ -294,7 +335,7 @@ export function FindInPageBar(): React.ReactElement | null {
       }
       searchChromium(query, forward, true);
     },
-    [activeMatchIndex, matches, query, searchChromium, transcript],
+    [activeMatchIndex, matches, query, searchChromium, terminal, transcript, usingTerminal],
   );
 
   const onNext = useCallback(() => step(true), [step]);
@@ -331,13 +372,27 @@ export function FindInPageBar(): React.ReactElement | null {
     };
   }, []);
 
-  // Moving between a transcript and another pane while the bar is open has to
-  // hand the open query over: leaving Chromium's highlight behind, or leaving
-  // the new pane unsearched while the bar still shows a count, both lie.
-  const usingTranscript = transcript !== null;
+  // Moving between panes while the bar is open has to hand the open query
+  // over: leaving a backend's highlight behind, or leaving the new pane
+  // unsearched while the bar still shows a count, both lie.
   const queryRef = useRef(query);
   queryRef.current = query;
+  // The terminal that last claimed Find, kept so its highlights can be
+  // cleared when the claim moves on — the store has already forgotten it by
+  // the time the effect below runs.
+  const lastTerminalRef = useRef<TerminalFindSource | null>(null);
+  if (terminal) {
+    lastTerminalRef.current = terminal;
+  }
   useEffect(() => {
+    if (usingTerminal) {
+      stopChromium();
+      if (queryRef.current.length > 0) {
+        terminal?.find({ query: queryRef.current, forward: true, incremental: false });
+      }
+      return;
+    }
+    lastTerminalRef.current?.clear();
     if (usingTranscript) {
       stopChromium();
       return;
@@ -345,7 +400,7 @@ export function FindInPageBar(): React.ReactElement | null {
     if (queryRef.current.length > 0) {
       searchChromium(queryRef.current, true, false);
     }
-  }, [searchChromium, stopChromium, usingTranscript]);
+  }, [searchChromium, stopChromium, terminal, usingTerminal, usingTranscript]);
 
   useEffect(() => {
     if (!visible) {
@@ -358,14 +413,24 @@ export function FindInPageBar(): React.ReactElement | null {
     return null;
   }
 
-  // With neither a transcript nor a browser pane there is nothing Find may
-  // search, and "No matches" there would be a claim about text nobody read.
-  const searchable = transcript !== null || chromiumSearchable === true;
+  // With none of a terminal, a transcript, or a browser pane there is nothing
+  // Find may search, and "No matches" there would be a claim about text
+  // nobody read.
+  const searchable = usingTerminal || usingTranscript || chromiumSearchable === true;
   let total = 0;
   let current = 0;
-  if (transcript) {
+  let truncated = false;
+  if (usingTerminal) {
+    total = terminalResult?.resultCount ?? 0;
+    current =
+      terminalResult && terminalResult.resultIndex >= 0 ? terminalResult.resultIndex + 1 : 0;
+    // The addon reports index -1 once its highlight limit is exceeded: the
+    // count is then a floor, and the bar says so instead of pinning it.
+    truncated = total > 0 && (terminalResult?.resultIndex ?? -1) < 0;
+  } else if (usingTranscript) {
     total = matches.length;
     current = activeMatchIndex + 1;
+    truncated = truncatedMatches;
   } else if (searchable) {
     total = chromiumResult.matches;
     current = chromiumResult.activeMatchOrdinal;
@@ -373,7 +438,7 @@ export function FindInPageBar(): React.ReactElement | null {
   const status = formatStatus({
     current,
     total,
-    truncated: transcript !== null && truncated,
+    truncated,
     hasQuery: searchable && query.length > 0,
     t,
   });

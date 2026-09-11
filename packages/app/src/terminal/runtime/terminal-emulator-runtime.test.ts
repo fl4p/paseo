@@ -24,9 +24,37 @@ vi.mock("@xterm/addon-ligatures/lib/addon-ligatures.mjs", () => ({
   },
 }));
 
+const searchAddonInstances = vi.hoisted(() => ({
+  instances: [] as Array<{
+    nextCalls: Array<{ query: string; options?: unknown }>;
+    previousCalls: Array<{ query: string; options?: unknown }>;
+    clearCalls: number;
+  }>,
+}));
+
 vi.mock("@xterm/addon-search", () => ({
   SearchAddon: class SearchAddon {
+    nextCalls: Array<{ query: string; options?: unknown }> = [];
+    previousCalls: Array<{ query: string; options?: unknown }> = [];
+    clearCalls = 0;
+    onDidChangeResults(): () => void {
+      return () => undefined;
+    }
+    findNext(query: string, options?: unknown): boolean {
+      this.nextCalls.push({ query, options });
+      return true;
+    }
+    findPrevious(query: string, options?: unknown): boolean {
+      this.previousCalls.push({ query, options });
+      return true;
+    }
+    clearDecorations(): void {
+      this.clearCalls += 1;
+    }
     dispose(): void {}
+    constructor() {
+      searchAddonInstances.instances.push(this);
+    }
   },
 }));
 
@@ -83,6 +111,18 @@ import {
   encodeTerminalOutput,
   TerminalEmulatorRuntime,
 } from "./terminal-emulator-runtime";
+import { SearchAddon } from "@xterm/addon-search";
+
+/** The SearchAddon mock's call log, unreachable through the real typing. */
+interface SearchAddonProbe {
+  nextCalls: Array<{ query: string; options?: unknown }>;
+  previousCalls: Array<{ query: string; options?: unknown }>;
+  clearCalls: number;
+}
+
+function createSearchAddonProbe(): SearchAddonProbe {
+  return new SearchAddon() as unknown as SearchAddonProbe;
+}
 
 interface StubTerminal {
   write: (data: string | Uint8Array, callback?: () => void) => void;
@@ -185,6 +225,7 @@ describe("terminal-emulator-runtime", () => {
       __paseoTerminal: undefined,
     };
     terminalConstructorOptions.values = [];
+    searchAddonInstances.instances.length = 0;
   });
 
   afterEach(() => {
@@ -636,5 +677,55 @@ describe("terminal-emulator-runtime", () => {
     ).handleVisibilityRestore();
 
     expect(fitAndEmitResize).not.toHaveBeenCalled();
+  });
+
+  it("steps the search addon through the pane's buffer with highlight decorations", () => {
+    const runtime = new TerminalEmulatorRuntime();
+    const addon = createSearchAddonProbe();
+    (runtime as unknown as { searchAddon: unknown }).searchAddon = addon;
+
+    expect(runtime.search({ query: "needle", forward: true, incremental: true })).toBe(true);
+    expect(runtime.search({ query: "needle", forward: false, incremental: false })).toBe(true);
+
+    expect(addon.nextCalls).toEqual([
+      {
+        query: "needle",
+        options: {
+          incremental: true,
+          decorations: expect.objectContaining({
+            activeMatchBackground: expect.any(String),
+            matchOverviewRuler: expect.any(String),
+          }),
+        },
+      },
+    ]);
+    expect(addon.previousCalls).toEqual([
+      {
+        query: "needle",
+        options: {
+          incremental: false,
+          decorations: expect.objectContaining({
+            activeMatchColorOverviewRuler: expect.any(String),
+          }),
+        },
+      },
+    ]);
+  });
+
+  it("refuses to search an empty query and drops the highlights on clear", () => {
+    const runtime = new TerminalEmulatorRuntime();
+    const addon = createSearchAddonProbe();
+    (runtime as unknown as { searchAddon: unknown }).searchAddon = addon;
+
+    expect(runtime.search({ query: "", forward: true, incremental: true })).toBe(false);
+    expect(addon.nextCalls).toEqual([]);
+
+    runtime.clearSearch();
+    expect(addon.clearCalls).toBe(1);
+
+    // Without a mounted addon there is nothing to search or clear; both no-op.
+    const bare = new TerminalEmulatorRuntime();
+    expect(bare.search({ query: "needle", forward: true, incremental: false })).toBe(false);
+    bare.clearSearch();
   });
 });

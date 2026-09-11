@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { i18n } from "@/i18n/i18next";
 import { FindInPageBar } from "./find-in-page-bar.electron";
 import { useTranscriptFindStore } from "@/agent-stream/find/store";
+import { useTerminalFindStore } from "@/terminal/find/store";
 import type { StreamItem } from "@/types/stream";
 import type { DesktopFindStartInput, DesktopFindStopAction } from "@/desktop/host";
 
@@ -82,6 +83,31 @@ function republishTranscript(items: StreamItem[], jumps: string[]): void {
   );
 }
 
+interface FakeTerminalSource {
+  findCalls: Array<{ query: string; forward: boolean; incremental: boolean }>;
+  clearCalls: number;
+}
+
+/** The focused terminal pane's find source, as the terminal pane publishes it. */
+function installTerminal(): FakeTerminalSource {
+  const source: FakeTerminalSource = { findCalls: [], clearCalls: 0 };
+  useTerminalFindStore.getState().setSource({
+    terminalId: "term-1",
+    find: (input) => {
+      source.findCalls.push(input);
+    },
+    clear: () => {
+      source.clearCalls += 1;
+    },
+  });
+  return source;
+}
+
+/** The search addon answers asynchronously; the pane reports what it said. */
+function reportTerminalResult(resultIndex: number, resultCount: number): void {
+  act(() => useTerminalFindStore.getState().reportResult("term-1", { resultIndex, resultCount }));
+}
+
 const mounted: Array<{ root: Root; container: HTMLDivElement }> = [];
 
 function mountBar(): HTMLDivElement {
@@ -139,6 +165,7 @@ afterEach(() => {
     entry.container.remove();
   }
   useTranscriptFindStore.getState().clearSource("agent-1");
+  useTerminalFindStore.getState().clearSource("term-1");
   delete window.paseoDesktop;
 });
 
@@ -370,5 +397,123 @@ describe("FindInPageBar with a transcript", () => {
 
     expect(statusText(container)).toBe(i18n.t("paneFind.noMatches"));
     expect(host.startCalls).toEqual([]);
+  });
+});
+
+describe("FindInPageBar with a focused terminal pane", () => {
+  it("does not paint transcript hits behind the terminal that owns Find", async () => {
+    const host = installFakeHost();
+    installTranscript([message("a", "the needle sits here")]);
+    const rows = document.createElement("div");
+    rows.innerHTML = '<div data-history-row-id="a">the needle sits here</div>';
+    document.body.appendChild(rows);
+    installTerminal();
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "needle");
+
+    // The reader is searching the terminal; marking transcript text would lie.
+    expect(CSS.highlights.has("paseo-find")).toBe(false);
+    rows.remove();
+  });
+
+  it("searches the terminal's own buffer and reports the addon's count", async () => {
+    const host = installFakeHost();
+    const terminal = installTerminal();
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "needle");
+
+    // The canvas renderer keeps the scrollback out of the DOM, so neither
+    // Chromium nor the transcript model may answer for it.
+    expect(terminal.findCalls).toEqual([{ query: "needle", forward: true, incremental: true }]);
+    expect(host.startCalls).toEqual([]);
+
+    reportTerminalResult(1, 5);
+    expect(statusText(container)).toBe("2 of 5");
+  });
+
+  it("steps forward and backward through the terminal's matches", async () => {
+    const host = installFakeHost();
+    const terminal = installTerminal();
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    const input = findInput(container);
+    type(input, "needle");
+    pressKey(input, "Enter");
+    pressKey(input, "Enter", true);
+
+    expect(terminal.findCalls.slice(1)).toEqual([
+      { query: "needle", forward: true, incremental: false },
+      { query: "needle", forward: false, incremental: false },
+    ]);
+  });
+
+  it("clears the terminal's highlights when Escape closes it", async () => {
+    const host = installFakeHost();
+    const terminal = installTerminal();
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "needle");
+    pressKey(findInput(container), "Escape");
+
+    expect(container.querySelector('[data-testid="find-in-page-bar"]')).toBeNull();
+    expect(terminal.clearCalls).toBe(1);
+    expect(host.stopCalls).toContain("clearSelection");
+  });
+
+  it("claims Find ahead of the transcript panel behind it", async () => {
+    const host = installFakeHost();
+    // A transcript is registered too: the terminal pane is focused, so it wins.
+    const jumps = installTranscript([message("a", "the needle sits here")]);
+    const terminal = installTerminal();
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "needle");
+
+    expect(terminal.findCalls).toEqual([{ query: "needle", forward: true, incremental: true }]);
+    expect(jumps).toEqual([]);
+    expect(host.startCalls).toEqual([]);
+  });
+
+  it("hands the open query to Chromium when the terminal pane stops being focused", async () => {
+    const host = installFakeHost();
+    const terminal = installTerminal();
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "needle");
+    act(() => useTerminalFindStore.getState().clearSource("term-1"));
+    await settle();
+
+    // The pane the reader left keeps its highlight until it is told to stop.
+    expect(terminal.clearCalls).toBe(1);
+    // The bar still shows the query, so the remaining pane has to be searched.
+    expect(host.startCalls).toEqual([{ query: "needle", forward: true, findNext: false }]);
+  });
+
+  it("marks a count past the addon's highlight limit as a floor", async () => {
+    const host = installFakeHost();
+    installTerminal();
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "e");
+    // resultIndex -1 is the addon's word for "more matches than I may highlight".
+    reportTerminalResult(-1, 20_000);
+
+    expect(statusText(container)).toBe(i18n.t("paneFind.total", { total: "20000+" }));
   });
 });
