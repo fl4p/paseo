@@ -1,7 +1,7 @@
 import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { FitAddon } from "@xterm/addon-fit";
 import { ImageAddon } from "@xterm/addon-image";
-import { SearchAddon } from "@xterm/addon-search";
+import { SearchAddon, type ISearchOptions } from "@xterm/addon-search";
 import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { WebglAddon } from "@xterm/addon-webgl";
@@ -30,7 +30,34 @@ import {
 } from "../local-links/terminal-local-link-provider";
 import { resolveTerminalFontFamily, resolveTerminalFontSize } from "./terminal-font";
 
+/**
+ * The search addon's match highlights. Amber on both light and dark terminal
+ * themes; the active hit also carries the selection, so it reads on its own.
+ */
+const TERMINAL_SEARCH_DECORATIONS = {
+  matchBackground: "#6b5300",
+  matchBorder: "#8a7400",
+  matchOverviewRuler: "#8a7400",
+  activeMatchBackground: "#c08a00",
+  activeMatchBorder: "#ffd24d",
+  activeMatchColorOverviewRuler: "#ffd24d",
+} as const satisfies ISearchOptions["decorations"];
+
 export type TerminalOutputData = Uint8Array;
+
+export interface TerminalSearchInput {
+  query: string;
+  /** Direction of the step; typing always searches forward. */
+  forward: boolean;
+  /** True while the reader is still typing: keep the current match if it still fits. */
+  incremental: boolean;
+}
+
+export interface TerminalSearchResult {
+  /** Index of the active match, -1 once the highlight limit is exceeded. */
+  resultIndex: number;
+  resultCount: number;
+}
 
 export interface TerminalEmulatorRuntimeMountInput {
   root: HTMLDivElement;
@@ -62,6 +89,7 @@ export interface TerminalEmulatorRuntimeCallbacks {
     disposition: "main" | "side",
   ) => Promise<void> | void;
   onInputModeChange?: (state: TerminalInputModeState) => Promise<void> | void;
+  onSearchResults?: (result: TerminalSearchResult) => Promise<void> | void;
 }
 
 export interface TerminalResizeEvent {
@@ -173,6 +201,7 @@ export class TerminalEmulatorRuntime {
   };
   private terminal: Terminal | null = null;
   private fitAddon: FitAddon | null = null;
+  private searchAddon: SearchAddon | null = null;
   private fitAndEmitResize: ((input?: TerminalResizeRequest) => void) | null = null;
   private lastSize: { rows: number; cols: number } | null = null;
   private cleanup: (() => void) | null = null;
@@ -267,7 +296,14 @@ export class TerminalEmulatorRuntime {
         },
       }),
     );
-    terminal.loadAddon(new SearchAddon({ highlightLimit: 20_000 }));
+    const searchAddon = new SearchAddon({ highlightLimit: 20_000 });
+    searchAddon.onDidChangeResults((result) => {
+      this.callbacks.onSearchResults?.({
+        resultIndex: result.resultIndex,
+        resultCount: result.resultCount,
+      });
+    });
+    terminal.loadAddon(searchAddon);
     terminal.loadAddon(new ClipboardAddon());
     try {
       terminal.loadAddon(new LigaturesAddon());
@@ -356,6 +392,7 @@ export class TerminalEmulatorRuntime {
 
     this.terminal = terminal;
     this.fitAddon = fitAddon;
+    this.searchAddon = searchAddon;
     window.__paseoTerminal = terminal;
 
     const fitAndEmitResize = (resizeInput?: TerminalResizeRequest): void => {
@@ -741,6 +778,32 @@ export class TerminalEmulatorRuntime {
     this.terminal?.blur();
   }
 
+  /**
+   * Steps the xterm search addon through this pane's own scrollback. The
+   * canvas renderer paints that text outside the DOM, so this — not the
+   * window's Chromium find — is the only backend that can see it. Results
+   * arrive through `onSearchResults`.
+   */
+  search(input: TerminalSearchInput): boolean {
+    const searchAddon = this.searchAddon;
+    if (!searchAddon || input.query.length === 0) {
+      return false;
+    }
+    const options: ISearchOptions = {
+      // The addon applies incremental only to findNext; ask for it on every
+      // typing step and let the addon ignore it where it does not apply.
+      incremental: input.incremental,
+      decorations: TERMINAL_SEARCH_DECORATIONS,
+    };
+    return input.forward
+      ? searchAddon.findNext(input.query, options)
+      : searchAddon.findPrevious(input.query, options);
+  }
+
+  clearSearch(): void {
+    this.searchAddon?.clearDecorations();
+  }
+
   private refreshVisibleRows(): void {
     const terminal = this.terminal;
     if (!terminal || terminal.rows <= 0) {
@@ -797,6 +860,7 @@ export class TerminalEmulatorRuntime {
     }
     this.terminal = null;
     this.fitAddon = null;
+    this.searchAddon = null;
     this.fitAndEmitResize = null;
     this.lastSize = null;
     this.themeBackgroundElements = [];

@@ -17,6 +17,10 @@ import { useDOMImperativeHandle, type DOMImperativeFactory } from "expo/dom";
 import "@xterm/xterm/css/xterm.css";
 import type { ITheme } from "@xterm/xterm";
 import type { TerminalState } from "@getpaseo/protocol/messages";
+import type {
+  TerminalSearchInput,
+  TerminalSearchResult,
+} from "@/terminal/runtime/terminal-emulator-runtime";
 import type { TerminalInputModeState } from "@getpaseo/protocol/terminal-input-mode";
 import type { PendingTerminalModifiers } from "../utils/terminal-keys";
 import {
@@ -50,6 +54,8 @@ export interface TerminalEmulatorHandle {
   claimSize: () => void;
   showKeyboard: () => void;
   blur: () => void;
+  search: (input: TerminalSearchInput) => void;
+  clearSearch: () => void;
 }
 
 const HOST_DIV_STYLE: CSSProperties = {
@@ -128,6 +134,7 @@ interface TerminalEmulatorProps {
   }) => Promise<void> | void;
   onPendingModifiersConsumed?: () => Promise<void> | void;
   onInputModeChange?: (state: TerminalInputModeState) => Promise<void> | void;
+  onSearchResults?: (result: TerminalSearchResult) => void;
   onSelectionChange?: (hasSelection: boolean) => void;
   onResolveLocalFileLink?: (
     source: TerminalLocalFileLinkSource,
@@ -178,6 +185,7 @@ export default function TerminalEmulator({
   onTerminalKey,
   onPendingModifiersConsumed,
   onInputModeChange,
+  onSearchResults,
   onResolveLocalFileLink,
   onOpenLocalFileLink,
   onRendererReadyChange,
@@ -206,6 +214,7 @@ export default function TerminalEmulator({
     onTerminalKey,
     onPendingModifiersConsumed,
     onInputModeChange,
+    onSearchResults,
     onResolveLocalFileLink,
     onOpenLocalFileLink,
   });
@@ -215,6 +224,7 @@ export default function TerminalEmulator({
     onTerminalKey,
     onPendingModifiersConsumed,
     onInputModeChange,
+    onSearchResults,
     onResolveLocalFileLink,
     onOpenLocalFileLink,
   };
@@ -277,6 +287,15 @@ export default function TerminalEmulator({
       blur: () => {
         runtimeRef.current?.blur();
       },
+      search: (...args) => {
+        const input = args[0] as unknown as TerminalSearchInput | undefined;
+        if (input && typeof input.query === "string") {
+          runtimeRef.current?.search(input);
+        }
+      },
+      clearSearch: () => {
+        runtimeRef.current?.clearSearch();
+      },
     }),
     [pasteText],
   );
@@ -308,6 +327,12 @@ export default function TerminalEmulator({
       },
       blur: () => {
         runtimeRef.current?.blur();
+      },
+      search: (input) => {
+        runtimeRef.current?.search(input);
+      },
+      clearSearch: () => {
+        runtimeRef.current?.clearSearch();
       },
     }),
     [pasteText],
@@ -483,6 +508,7 @@ export default function TerminalEmulator({
         onTerminalKey,
         onPendingModifiersConsumed,
         onInputModeChange,
+        onSearchResults,
         onResolveLocalFileLink,
         onOpenLocalFileLink,
         onOpenExternalUrl: openExternalUrl,
@@ -495,6 +521,7 @@ export default function TerminalEmulator({
     onPendingModifiersConsumed,
     onResolveLocalFileLink,
     onResize,
+    onSearchResults,
     onTerminalKey,
   ]);
 

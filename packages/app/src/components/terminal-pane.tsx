@@ -36,6 +36,7 @@ import {
 } from "@/terminal/runtime/terminal-virtual-keyboard";
 import { pasteTerminalClipboard } from "@/terminal/runtime/terminal-paste";
 import { getWorkspaceTerminalSession } from "@/terminal/runtime/workspace-terminal-session";
+import { useTerminalFindStore } from "@/terminal/find/store";
 import {
   EMPTY_FOCUS_CLAIM_STATE,
   canRequestFocusClaim,
@@ -437,6 +438,34 @@ export function TerminalPane({
   useEffect(() => {
     return () => clearKeyboardRefitTimeouts();
   }, [clearKeyboardRefitTimeouts]);
+
+  // Find: a focused terminal pane claims Cmd/Ctrl+F ahead of the agent
+  // transcript — the reader clicked into it, while a transcript panel merely
+  // sits in the active tab. Pane focus, not presentation, is the gate, so a
+  // split view's focused terminal outranks the transcript panel beside it.
+  const claimsTerminalFind = isTerminalPresented && isPaneFocused;
+  const handleTerminalSearchResults = useStableEvent(
+    (result: { resultIndex: number; resultCount: number }) => {
+      useTerminalFindStore.getState().reportResult(terminalId, result);
+    },
+  );
+  useEffect(() => {
+    if (!claimsTerminalFind) {
+      return;
+    }
+    useTerminalFindStore.getState().setSource({
+      terminalId,
+      find: (input) => {
+        emulatorRef.current?.search(input);
+      },
+      clear: () => {
+        emulatorRef.current?.clearSearch();
+      },
+    });
+    return () => {
+      useTerminalFindStore.getState().clearSource(terminalId);
+    };
+  }, [claimsTerminalFind, terminalId]);
 
   useAnimatedReaction(
     () => Math.round(keyboardShift.value),
@@ -1065,6 +1094,7 @@ export function TerminalPane({
             onResize={handleTerminalResize}
             onTerminalKey={handleTerminalKey}
             onInputModeChange={handleInputModeChange}
+            onSearchResults={handleTerminalSearchResults}
             onSelectionChange={handleSelectionChange}
             onResolveLocalFileLink={handleResolveLocalFileLink}
             onOpenLocalFileLink={handleOpenLocalFileLink}
