@@ -1,41 +1,26 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactElement,
-  type ReactNode,
-} from "react";
-import {
-  Pressable,
-  Text,
-  View,
-  type NativeSyntheticEvent,
-  type TextInputKeyPressEventData,
-} from "react-native";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { View } from "react-native";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronUp, X } from "lucide-react-native";
-import { StyleSheet, withUnistyles } from "react-native-unistyles";
-import { iconButtonChromeStyle, mutedIconColorMapping } from "@/components/ui/icon-button-chrome";
-import { EditingTextInput, type EditingTextInputHandle } from "@/components/ui/text-input";
+import { StyleSheet } from "react-native-unistyles";
+import { PaneFind, type PaneFindHandle } from "@/pane-find";
+import {
+  findTranscriptMatches,
+  preserveActiveMatch,
+  stepMatchIndex,
+  type TranscriptMatch,
+  type TranscriptSearchResult,
+} from "@/agent-stream/find/model";
+import { useTranscriptFindStore } from "@/agent-stream/find/store";
 import { getDesktopHost, type DesktopFindResult } from "@/desktop/host";
 import { listenToDesktopEvent } from "@/desktop/electron/events";
-import type { Theme } from "@/styles/theme";
-
-const ThemedChevronUp = withUnistyles(ChevronUp);
-const ThemedChevronDown = withUnistyles(ChevronDown);
-const ThemedX = withUnistyles(X);
-const ThemedTextInput = withUnistyles(EditingTextInput, (theme: Theme) => ({
-  placeholderTextColor: theme.colors.foregroundMuted,
-  selectionColor: theme.colors.foreground,
-}));
 
 const EMPTY_RESULT: DesktopFindResult = {
   activeMatchOrdinal: 0,
   matches: 0,
   finalUpdate: true,
 };
+
+const NO_TRANSCRIPT_RESULT: TranscriptSearchResult = { matches: [], truncated: false };
 
 function isFindResult(value: unknown): value is DesktopFindResult {
   if (typeof value !== "object" || value === null) {
@@ -77,126 +62,161 @@ function useDesktopEvent(event: string, handler: (payload: unknown) => void): vo
   }, [event]);
 }
 
-interface FindBarButtonProps {
-  accessibilityLabel: string;
-  children: ReactNode;
-  disabled?: boolean;
-  onPress: () => void;
-  testID: string;
-}
-
-function FindBarButton({
-  accessibilityLabel,
-  children,
-  disabled = false,
-  onPress,
-  testID,
-}: FindBarButtonProps): ReactElement {
-  const style = useMemo(
-    () =>
-      ({ hovered, pressed }: { hovered?: boolean; pressed: boolean }) =>
-        iconButtonChromeStyle({
-          size: "small",
-          state: { hovered: Boolean(hovered), pressed },
-          disabled,
-        }),
-    [disabled],
-  );
-
-  return (
-    <Pressable
-      accessibilityLabel={accessibilityLabel}
-      disabled={disabled}
-      onPress={onPress}
-      style={style}
-      testID={testID}
-    >
-      {children}
-    </Pressable>
-  );
-}
-
-function formatCounter(input: {
-  hasMatches: boolean;
+function formatStatus(input: {
+  current: number;
+  total: number;
+  truncated: boolean;
   hasQuery: boolean;
-  result: DesktopFindResult;
   t: (key: string, options?: Record<string, unknown>) => string;
 }): string {
-  if (input.hasMatches) {
-    return input.t("desktop.find.matches", {
-      current: input.result.activeMatchOrdinal,
-      total: input.result.matches,
+  if (input.total > 0) {
+    return input.t("paneFind.position", {
+      current: input.current,
+      // A capped scan knows a floor, not a total, and says so rather than
+      // presenting the cap as the answer.
+      total: input.truncated ? `${input.total}+` : input.total,
     });
   }
-  return input.hasQuery ? input.t("desktop.find.noMatches") : "";
+  return input.hasQuery ? input.t("paneFind.noMatches") : "";
 }
 
 /**
- * The desktop find bar. It drives Chromium's own find-in-page in the main
- * process, which searches the active browser pane when there is one and the
- * Paseo window itself otherwise. Terminal panes draw their scrollback to a
- * canvas, so their text is not part of that search.
+ * The desktop Find bar.
+ *
+ * It searches whichever of two things the window is showing. An agent
+ * transcript is searched through its own stream model, because the web
+ * transcript only mounts its recent rows and Chromium's find would report a
+ * confident "No matches" for text that is plainly in the conversation. Anything
+ * else — settings, an embedded browser pane — is searched with Chromium's
+ * find-in-page from the main process.
+ *
+ * Terminal panes are in neither camp: xterm paints its scrollback to a canvas,
+ * so that text is not searchable by either backend.
  */
-export function FindInPageBar(): ReactElement | null {
+export function FindInPageBar(): React.ReactElement | null {
   const { t } = useTranslation();
   const [visible, setVisible] = useState(false);
-  const [result, setResult] = useState<DesktopFindResult>(EMPTY_RESULT);
-  const [hasQuery, setHasQuery] = useState(false);
-  const inputRef = useRef<EditingTextInputHandle>(null);
-  const queryRef = useRef("");
+  const [query, setQuery] = useState("");
+  const [chromiumResult, setChromiumResult] = useState<DesktopFindResult>(EMPTY_RESULT);
+  // Unknown until the main process answers whether it had a browser pane to search.
+  const [chromiumSearchable, setChromiumSearchable] = useState<boolean | null>(null);
+  const findRef = useRef<PaneFindHandle>(null);
+  const transcript = useTranscriptFindStore((state) => state.source);
 
-  const runFind = useCallback((forward: boolean, findNext: boolean) => {
-    const query = queryRef.current;
+  const { matches, truncated } = useMemo<TranscriptSearchResult>(() => {
+    if (!transcript || query.length === 0) {
+      return NO_TRANSCRIPT_RESULT;
+    }
+    return findTranscriptMatches({ items: transcript.items, query });
+  }, [query, transcript]);
+
+  // The selection is an anchor on a hit, not an index. A live turn appends rows
+  // and renumbers the list, and deriving the index here rather than repairing it
+  // in an effect means the bar never renders a count it has to take back.
+  const [anchor, setAnchor] = useState<TranscriptMatch | null>(null);
+  const activeMatchIndex = useMemo(
+    () => preserveActiveMatch({ previous: anchor, matches }),
+    [anchor, matches],
+  );
+
+  const searchChromium = useCallback((nextQuery: string, forward: boolean, findNext: boolean) => {
     const find = getDesktopHost()?.find;
-    if (query.length === 0) {
-      setResult(EMPTY_RESULT);
+    if (nextQuery.length === 0) {
+      setChromiumResult(EMPTY_RESULT);
       void find?.stop?.("clearSelection");
       return;
     }
-    void find?.start?.({ query, forward, findNext });
+    void find
+      ?.start?.({ query: nextQuery, forward, findNext })
+      ?.then((result) => {
+        setChromiumSearchable(result?.searched !== false);
+        return undefined;
+      })
+      .catch(() => undefined);
   }, []);
 
-  const focusInput = useCallback(() => {
-    const input = inputRef.current;
-    input?.focus();
-    const node = input?.getNativeRef?.() as { select?: () => void } | null | undefined;
-    node?.select?.();
+  const stopChromium = useCallback(() => {
+    setChromiumResult(EMPTY_RESULT);
+    setChromiumSearchable(null);
+    void getDesktopHost()?.find?.stop?.("clearSelection");
   }, []);
 
   const close = useCallback(() => {
     setVisible(false);
-    setResult(EMPTY_RESULT);
-    // The input unmounts with the bar, so the query has to go with it or
-    // Find Next would keep advancing a search the user can no longer see.
-    queryRef.current = "";
-    setHasQuery(false);
-    void getDesktopHost()?.find?.stop?.("clearSelection");
-  }, []);
+    setQuery("");
+    setAnchor(null);
+    stopChromium();
+  }, [stopChromium]);
+
+  const handleQueryChange = useCallback(
+    (nextQuery: string) => {
+      setQuery(nextQuery);
+      setAnchor(null);
+      if (transcript) {
+        // The jump follows from the recomputed match list, not from here.
+        return;
+      }
+      searchChromium(nextQuery, true, false);
+    },
+    [searchChromium, transcript],
+  );
+
+  // Typing moves the transcript to the first hit; stepping moves it to the next.
+  // The source object is republished on every stream update, so it is read
+  // through a ref: depending on it here would re-scroll the reader back to the
+  // active hit on each update of a live turn.
+  const transcriptRef = useRef(transcript);
+  transcriptRef.current = transcript;
+  const jumpTargetId = transcript ? (matches[activeMatchIndex]?.itemId ?? null) : null;
+  useEffect(() => {
+    if (visible && jumpTargetId) {
+      transcriptRef.current?.jumpToItem(jumpTargetId);
+    }
+  }, [jumpTargetId, visible]);
+
+  const step = useCallback(
+    (forward: boolean) => {
+      if (transcript) {
+        const next = stepMatchIndex({
+          current: activeMatchIndex,
+          total: matches.length,
+          forward,
+        });
+        // The jump belongs to the effect above, which owns it for every route
+        // into a new match — typing, stepping, or the menu's Find Next.
+        setAnchor(matches[next] ?? null);
+        return;
+      }
+      searchChromium(query, forward, true);
+    },
+    [activeMatchIndex, matches, query, searchChromium, transcript],
+  );
+
+  const onNext = useCallback(() => step(true), [step]);
+  const onPrevious = useCallback(() => step(false), [step]);
 
   useDesktopEvent("find-open", () => {
     setVisible(true);
-    // Reopening over an existing query selects it, so the next keystroke
-    // replaces the search the way every other find bar behaves.
-    requestAnimationFrame(focusInput);
+    findRef.current?.focus();
   });
 
   useDesktopEvent("find-next", () => {
-    if (queryRef.current.length > 0) {
+    if (query.length > 0) {
       setVisible(true);
-      runFind(true, true);
+      onNext();
     }
   });
 
   useDesktopEvent("find-previous", () => {
-    if (queryRef.current.length > 0) {
+    if (query.length > 0) {
       setVisible(true);
-      runFind(false, true);
+      onPrevious();
     }
   });
 
   useDesktopEvent("find-result", (payload) => {
     if (isFindResult(payload)) {
-      setResult(payload);
+      setChromiumResult(payload);
     }
   });
 
@@ -206,122 +226,74 @@ export function FindInPageBar(): ReactElement | null {
     };
   }, []);
 
-  const handleChangeText = useCallback(
-    (text: string) => {
-      queryRef.current = text;
-      setHasQuery(text.length > 0);
-      runFind(true, false);
-    },
-    [runFind],
-  );
+  // Moving between a transcript and another pane while the bar is open has to
+  // hand the open query over: leaving Chromium's highlight behind, or leaving
+  // the new pane unsearched while the bar still shows a count, both lie.
+  const usingTranscript = transcript !== null;
+  const queryRef = useRef(query);
+  queryRef.current = query;
+  useEffect(() => {
+    if (usingTranscript) {
+      stopChromium();
+      return;
+    }
+    if (queryRef.current.length > 0) {
+      searchChromium(queryRef.current, true, false);
+    }
+  }, [searchChromium, stopChromium, usingTranscript]);
 
-  const handleKeyPress = useCallback(
-    (event: NativeSyntheticEvent<TextInputKeyPressEventData>) => {
-      const key = event.nativeEvent.key;
-      if (key === "Escape") {
-        close();
-        return;
-      }
-      if (key !== "Enter") {
-        return;
-      }
-      const shiftHeld = (event as unknown as { shiftKey?: boolean }).shiftKey === true;
-      runFind(!shiftHeld, true);
-    },
-    [close, runFind],
-  );
-
-  const findNextMatch = useCallback(() => {
-    focusInput();
-    runFind(true, true);
-  }, [focusInput, runFind]);
-
-  const findPreviousMatch = useCallback(() => {
-    focusInput();
-    runFind(false, true);
-  }, [focusInput, runFind]);
+  useEffect(() => {
+    if (!visible) {
+      return;
+    }
+    findRef.current?.focus();
+  }, [visible]);
 
   if (!visible) {
     return null;
   }
 
-  const hasMatches = result.matches > 0;
-  const counter = formatCounter({ hasMatches, hasQuery, result, t });
+  // With neither a transcript nor a browser pane there is nothing Find may
+  // search, and "No matches" there would be a claim about text nobody read.
+  const searchable = transcript !== null || chromiumSearchable === true;
+  let total = 0;
+  let current = 0;
+  if (transcript) {
+    total = matches.length;
+    current = activeMatchIndex + 1;
+  } else if (searchable) {
+    total = chromiumResult.matches;
+    current = chromiumResult.activeMatchOrdinal;
+  }
+  const status = formatStatus({
+    current,
+    total,
+    truncated: transcript !== null && truncated,
+    hasQuery: searchable && query.length > 0,
+    t,
+  });
 
   return (
-    <View style={styles.bar} testID="find-in-page-bar">
-      <ThemedTextInput
-        ref={inputRef}
-        autoFocus
-        blurOnSubmit={false}
-        initialValue=""
-        onChangeText={handleChangeText}
-        onKeyPress={handleKeyPress}
-        placeholder={t("desktop.find.placeholder")}
-        accessibilityLabel={t("desktop.find.placeholder")}
-        autoCapitalize="none"
-        autoCorrect={false}
-        style={styles.input}
-        testID="find-in-page-input"
+    <View style={styles.anchor} testID="find-in-page-bar">
+      <PaneFind
+        ref={findRef}
+        query={query}
+        status={status}
+        canNavigate={total > 0}
+        onQueryChange={handleQueryChange}
+        onNext={onNext}
+        onPrevious={onPrevious}
+        onClose={close}
       />
-      <Text style={styles.counter} testID="find-in-page-counter">
-        {counter}
-      </Text>
-      <FindBarButton
-        accessibilityLabel={t("desktop.find.previous")}
-        disabled={!hasMatches}
-        onPress={findPreviousMatch}
-        testID="find-in-page-previous"
-      >
-        <ThemedChevronUp size={14} uniProps={mutedIconColorMapping} />
-      </FindBarButton>
-      <FindBarButton
-        accessibilityLabel={t("desktop.find.next")}
-        disabled={!hasMatches}
-        onPress={findNextMatch}
-        testID="find-in-page-next"
-      >
-        <ThemedChevronDown size={14} uniProps={mutedIconColorMapping} />
-      </FindBarButton>
-      <FindBarButton
-        accessibilityLabel={t("desktop.find.close")}
-        onPress={close}
-        testID="find-in-page-close"
-      >
-        <ThemedX size={14} uniProps={mutedIconColorMapping} />
-      </FindBarButton>
     </View>
   );
 }
 
 const styles = StyleSheet.create((theme) => ({
-  bar: {
+  anchor: {
     position: "absolute",
     top: theme.spacing[2],
     right: theme.spacing[3],
-    flexDirection: "row",
-    alignItems: "center",
-    gap: theme.spacing[1],
-    paddingLeft: theme.spacing[3],
-    paddingRight: theme.spacing[1],
-    paddingVertical: theme.spacing[1],
-    backgroundColor: theme.colors.surface2,
-    borderWidth: theme.borderWidth[1],
-    borderColor: theme.colors.border,
-    borderRadius: theme.borderRadius.lg,
     zIndex: 1000,
-  },
-  input: {
-    width: 180,
-    color: theme.colors.foreground,
-    fontSize: theme.fontSize.base,
-    fontFamily: theme.fontFamily.ui,
-    paddingVertical: theme.spacing[1],
-  },
-  counter: {
-    minWidth: 56,
-    textAlign: "right",
-    color: theme.colors.foregroundMuted,
-    fontSize: theme.fontSize.sm,
   },
 }));

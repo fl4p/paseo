@@ -2,6 +2,21 @@ import { en, type TranslationResources } from "./en";
 import { pluginSettings } from "./plugin-settings";
 
 export const ja: TranslationResources = {
+  paneFind: {
+    title: "検索",
+    placeholder: "ペイン内を検索",
+    close: "検索を閉じる",
+    matches: "検索結果",
+    previous: "前の一致",
+    next: "次の一致",
+    toggleReplace: "置換を切り替え",
+    replaceWith: "置換後の文字列",
+    replace: "置換",
+    replaceAll: "すべて置換",
+    noMatches: "一致なし",
+    position: "{{current}} / {{total}}",
+    total: "{{total}} 件の一致",
+  },
   common: {
     back: "戻る",
     loading: "読み込み中...",
@@ -1289,14 +1304,6 @@ export const ja: TranslationResources = {
       maximize: "ウィンドウを最大化",
       restore: "ウィンドウを元に戻す",
       close: "ウィンドウを閉じる",
-    },
-    find: {
-      placeholder: "検索",
-      matches: "{{total}} 件中 {{current}} 件目",
-      noMatches: "結果なし",
-      previous: "前の一致",
-      next: "次の一致",
-      close: "検索バーを閉じる",
     },
     quitting: {
       title: "Paseoを終了中...",

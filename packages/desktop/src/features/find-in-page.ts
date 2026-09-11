@@ -36,6 +36,11 @@ export interface FindInPageHostContents extends FindInPageContents {
   send(channel: string, payload: unknown): void;
 }
 
+export interface FindInPageStartResult {
+  /** False when the window had nothing Chromium may search, so there is no count. */
+  searched: boolean;
+}
+
 export interface FindInPageStartInput {
   query: string;
   /** Search direction; defaults to forward. */
@@ -79,9 +84,12 @@ export function parseFindInPageStopAction(value: unknown): FindInPageStopAction 
 /**
  * Runs Chromium's find-in-page for each window's find bar.
  *
- * A find bar searches whatever the window is showing: an embedded browser pane
- * when one is active, otherwise the Paseo UI itself. That is the same target
- * choice the Reload menu item makes, so the two stay consistent.
+ * Only an embedded browser pane is ever searched, never the window's own page.
+ * That page contains the find bar, and Chromium's find both counts the query in
+ * the bar's input as a match and moves focus out of it — measured on Electron
+ * 44: 3 matches for 2, focus to BODY, and refocusing loses it again on the next
+ * search. A browser pane is a separate webContents, where neither happens, and
+ * the transcript is searched through its stream model in the renderer.
  */
 export class FindInPageController {
   private readonly sessionsByHostId = new Map<number, FindSession>();
@@ -90,18 +98,19 @@ export class FindInPageController {
     private readonly resolveTarget: (host: FindInPageHostContents) => FindInPageContents | null,
   ) {}
 
-  public start(host: FindInPageHostContents, input: FindInPageStartInput): void {
+  public start(host: FindInPageHostContents, input: FindInPageStartInput): FindInPageStartResult {
     if (input.query.length === 0) {
       this.stop(host, "clearSelection");
       this.sendResult(host, { activeMatchOrdinal: 0, matches: 0, finalUpdate: true });
-      return;
+      return { searched: false };
     }
 
     const target = this.resolveTarget(host);
-    if (!target || target.isDestroyed()) {
+    // Refuse the host even if a resolver offers it; see the class comment.
+    if (!target || target.id === host.id || target.isDestroyed()) {
       this.endSession(host.id, null);
       this.sendResult(host, { activeMatchOrdinal: 0, matches: 0, finalUpdate: true });
-      return;
+      return { searched: false };
     }
 
     const existing = this.sessionsByHostId.get(host.id);
@@ -121,6 +130,7 @@ export class FindInPageController {
       forward: input.forward !== false,
       findNext: !advances,
     });
+    return { searched: true };
   }
 
   public stop(host: FindInPageHostContents, action: FindInPageStopAction): void {
@@ -181,16 +191,16 @@ export class FindInPageController {
 }
 
 export function registerFindInPageHandlers(): FindInPageController {
-  const controller = new FindInPageController(
-    (host) => getActivePaseoBrowserWebContentsForHostWindow(host.id) ?? host,
+  const controller = new FindInPageController((host) =>
+    getActivePaseoBrowserWebContentsForHostWindow(host.id),
   );
 
   ipcMain.handle("paseo:find:start", (event, rawInput: unknown) => {
     const input = parseFindInPageStartInput(rawInput);
     if (!input) {
-      return;
+      return { searched: false } satisfies FindInPageStartResult;
     }
-    controller.start(event.sender, input);
+    return controller.start(event.sender, input);
   });
 
   ipcMain.handle("paseo:find:stop", (event, rawAction: unknown) => {
