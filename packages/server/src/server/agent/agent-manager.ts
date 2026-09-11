@@ -354,7 +354,7 @@ interface CompactionArm {
  * Longest a compaction gate may hold prompts with no state change at all. Only a provider that
  * emits no terminal marker, ends no turn and never answers its own `/compact` reaches it.
  */
-const COMPACTION_GATE_BACKSTOP_MS = 5 * 60_000;
+export const COMPACTION_GATE_BACKSTOP_MS = 5 * 60_000;
 
 /** A prompt waiting for a compaction to end, in arrival order. */
 interface HeldPrompt {

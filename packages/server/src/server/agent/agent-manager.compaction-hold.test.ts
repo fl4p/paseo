@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../test-utils/test-logger.js";
-import { AgentManager } from "./agent-manager.js";
+import { AgentManager, COMPACTION_GATE_BACKSTOP_MS } from "./agent-manager.js";
 import { cancelAgentRunCommand } from "./lifecycle-command.js";
 import { startAgentRun } from "./agent-prompt.js";
 import type {
@@ -437,6 +437,47 @@ test("Stop discards the prompts held for the agent instead of starting them", as
     expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
   } finally {
     unsubscribe();
+    await manager.closeAgent(agent.id);
+  }
+});
+
+test("a compaction gate whose provider never marks an end or finishes a turn releases on the backstop", async () => {
+  const logger = createTestLogger();
+  const client = new OutOfBandCompactClient();
+  const manager = new AgentManager({ clients: { pi: client }, logger });
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const session = client.sessions[0]!;
+  try {
+    vi.useFakeTimers();
+    try {
+      await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+      await vi.advanceTimersByTimeAsync(1);
+      // A `loading` marker the provider never terminalizes, on an out-of-band compaction that
+      // runs with no turn at all — so neither a turn end nor the "no run in flight" valve can
+      // ever release this gate. Only the backstop can.
+      session.startCompaction();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(true);
+
+      const held = await startAgentRun(manager, agent.id, "follow up", logger, {
+        replaceRunning: true,
+        activeTurnBehavior: "interrupt",
+      });
+      expect(held.disposition).toBe("held");
+
+      await vi.advanceTimersByTimeAsync(COMPACTION_GATE_BACKSTOP_MS - 1_000);
+      expect(session.prompts).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+      // Released, not stranded: the prompt reached the provider.
+      expect(session.prompts).toEqual(["follow up"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  } finally {
     await manager.closeAgent(agent.id);
   }
 });
