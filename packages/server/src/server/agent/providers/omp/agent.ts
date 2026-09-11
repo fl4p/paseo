@@ -1414,6 +1414,8 @@ export class OmpAgentSession implements AgentSession {
             type: "compaction",
             status: "completed",
             trigger: "manual",
+            // It did not compact. Without this the separator claims a compaction that failed.
+            outcome: "failed",
           },
         });
       }

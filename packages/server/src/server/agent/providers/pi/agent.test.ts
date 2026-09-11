@@ -2531,7 +2531,9 @@ describe("PiRpcAgentClient", () => {
       {
         type: "timeline",
         provider: "pi",
-        item: { type: "compaction", status: "completed", trigger: "manual" },
+        // The compaction FAILED. Without the outcome the separator claims a compaction that
+        // never happened, exactly as Codex and Claude used to.
+        item: { type: "compaction", status: "completed", trigger: "manual", outcome: "failed" },
       },
       {
         type: "timeline",
