@@ -172,7 +172,7 @@ describe("dictation transcript behavior", () => {
     applyDictationTranscript("spoken prompt", {
       value: "typed context",
       defaultSendBehavior: "interrupt",
-      isAgentRunning: false,
+      isQueueBusy: false,
       onQueue: undefined,
       replaceText: (text) => actions.push(`replace:${text}`),
       onSubmit: (payload) => actions.push(`submit:${payload.text}`),
@@ -209,7 +209,7 @@ describe("composer send behavior", () => {
     const defaultAction = actions();
     runDefaultSendAction({
       defaultSendBehavior: "interrupt",
-      isAgentRunning: true,
+      isQueueBusy: true,
       onQueue: defaultAction.onQueue,
       handleSendMessage: defaultAction.handleSendMessage,
       handleQueueMessage: defaultAction.handleQueueMessage,
@@ -218,7 +218,7 @@ describe("composer send behavior", () => {
     const alternateAction = actions();
     runAlternateSendAction({
       defaultSendBehavior: "interrupt",
-      isAgentRunning: true,
+      isQueueBusy: true,
       onQueue: alternateAction.onQueue,
       handleSendMessage: alternateAction.handleSendMessage,
       handleQueueMessage: alternateAction.handleQueueMessage,
@@ -232,7 +232,7 @@ describe("composer send behavior", () => {
     const defaultAction = actions();
     runDefaultSendAction({
       defaultSendBehavior: "steer",
-      isAgentRunning: true,
+      isQueueBusy: true,
       onQueue: defaultAction.onQueue,
       handleSendMessage: defaultAction.handleSendMessage,
       handleQueueMessage: defaultAction.handleQueueMessage,
@@ -241,7 +241,7 @@ describe("composer send behavior", () => {
     const alternateAction = actions();
     runAlternateSendAction({
       defaultSendBehavior: "steer",
-      isAgentRunning: true,
+      isQueueBusy: true,
       onQueue: alternateAction.onQueue,
       handleSendMessage: alternateAction.handleSendMessage,
       handleQueueMessage: alternateAction.handleQueueMessage,
@@ -255,7 +255,7 @@ describe("composer send behavior", () => {
     const defaultAction = actions();
     runDefaultSendAction({
       defaultSendBehavior: "queue",
-      isAgentRunning: true,
+      isQueueBusy: true,
       onQueue: defaultAction.onQueue,
       handleSendMessage: defaultAction.handleSendMessage,
       handleQueueMessage: defaultAction.handleQueueMessage,
@@ -264,7 +264,7 @@ describe("composer send behavior", () => {
     const alternateAction = actions();
     runAlternateSendAction({
       defaultSendBehavior: "queue",
-      isAgentRunning: true,
+      isQueueBusy: true,
       onQueue: alternateAction.onQueue,
       handleSendMessage: alternateAction.handleSendMessage,
       handleQueueMessage: alternateAction.handleQueueMessage,

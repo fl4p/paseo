@@ -147,6 +147,9 @@ export interface MessageInputProps {
   voiceAgentId?: string;
   /** When true and there's sendable content, calls onQueue instead of onSubmit */
   isAgentRunning?: boolean;
+  /** Whether a send in queue mode queues instead. Defaults to isAgentRunning; the agent composer
+   *  also counts a compaction, which can run with no turn. */
+  isQueueBusy?: boolean;
   /** Controls what the default send action (Enter, send button, dictation) does when the agent is
    *  running. "interrupt" and "steer" send immediately, "queue" queues. Required so the default
    *  lives only in DEFAULT_CLIENT_SETTINGS. */
@@ -384,7 +387,7 @@ interface DesktopKeyPressContext {
   onKeyPressCallback: ((event: ComposerKeyPressEvent) => boolean) | undefined;
   input: ComposerKeyPressEvent["input"];
   submitOnEnter: boolean;
-  isAgentRunning: boolean;
+  isQueueBusy: boolean;
   onQueue: ((payload: MessagePayload) => void) | undefined;
   isSubmitDisabled: boolean;
   isSubmitLoading: boolean;
@@ -414,7 +417,7 @@ function handleDesktopKeyPressImpl(
   if (!ctx.submitOnEnter) return;
   if (shiftKey) return;
 
-  if ((metaKey || ctrlKey) && ctx.isAgentRunning && ctx.onQueue) {
+  if ((metaKey || ctrlKey) && ctx.isQueueBusy && ctx.onQueue) {
     if (ctx.isSubmitDisabled || ctx.isSubmitLoading || ctx.disabled) return;
     event.preventDefault();
     ctx.handleAlternateSendAction();
@@ -911,7 +914,7 @@ interface SendMessageContext {
   hasExternalContent: boolean;
   allowEmptySubmit: boolean;
   cwd: string;
-  isAgentRunning: boolean;
+  isQueueBusy: boolean;
   onSubmit: (payload: MessagePayload) => void;
   onMinimizeHeight: () => void;
   preserveHeightOnSubmit: boolean;
@@ -931,7 +934,7 @@ function sendMessageImpl(ctx: SendMessageContext): void {
     text: trimmed,
     attachments: ctx.attachments,
     cwd: ctx.cwd,
-    forceSend: ctx.isAgentRunning || undefined,
+    forceSend: ctx.isQueueBusy || undefined,
   });
   // When the host preserves and locks the composer (e.g. new-workspace creation),
   // the text stays put — collapsing the height would clip it. Keep it grown.
@@ -1021,7 +1024,7 @@ interface SendButtonStateInput {
   isSubmitLoading: boolean;
   onSubmitLoadingPress: (() => void) | undefined;
   defaultSendBehavior: "interrupt" | "steer" | "queue";
-  isAgentRunning: boolean;
+  isQueueBusy: boolean;
 }
 
 interface SendButtonStateOutput {
@@ -1035,7 +1038,7 @@ function computeSendButtonState(input: SendButtonStateInput): SendButtonStateOut
     input.isSubmitLoading && typeof input.onSubmitLoadingPress === "function";
   const isSendButtonDisabled =
     input.disabled || (!canPressLoadingButton && (input.isSubmitDisabled || input.isSubmitLoading));
-  const defaultActionQueues = input.defaultSendBehavior === "queue" && input.isAgentRunning;
+  const defaultActionQueues = input.defaultSendBehavior === "queue" && input.isQueueBusy;
   return { canPressLoadingButton, isSendButtonDisabled, defaultActionQueues };
 }
 
@@ -1070,6 +1073,7 @@ interface ResolvedMessageInputProps {
   voiceServerId: string | undefined;
   voiceAgentId: string | undefined;
   isAgentRunning: boolean;
+  isQueueBusy: boolean;
   defaultSendBehavior: "interrupt" | "steer" | "queue";
   onQueue: ((payload: MessagePayload) => void) | undefined;
   onSubmitLoadingPress: (() => void) | undefined;
@@ -1117,6 +1121,7 @@ function resolveMessageInputProps(props: MessageInputProps): ResolvedMessageInpu
     voiceServerId: props.voiceServerId,
     voiceAgentId: props.voiceAgentId,
     isAgentRunning: props.isAgentRunning ?? false,
+    isQueueBusy: props.isQueueBusy ?? props.isAgentRunning ?? false,
     defaultSendBehavior: props.defaultSendBehavior,
     onQueue: props.onQueue,
     onSubmitLoadingPress: props.onSubmitLoadingPress,
@@ -1172,6 +1177,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       voiceServerId,
       voiceAgentId,
       isAgentRunning,
+      isQueueBusy,
       defaultSendBehavior,
       onQueue,
       onSubmitLoadingPress,
@@ -1316,7 +1322,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         applyDictationTranscript(text, {
           value: valueRef.current,
           defaultSendBehavior,
-          isAgentRunning,
+          isQueueBusy,
           onQueue,
           onSubmit,
           replaceText,
@@ -1325,7 +1331,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
           autoSend,
         });
       },
-      [replaceText, onSubmit, onQueue, attachments, cwd, isAgentRunning, defaultSendBehavior],
+      [replaceText, onSubmit, onQueue, attachments, cwd, isQueueBusy, defaultSendBehavior],
     );
 
     const handleDictationError = useCallback(
@@ -1512,7 +1518,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         hasExternalContent,
         allowEmptySubmit,
         cwd,
-        isAgentRunning,
+        isQueueBusy,
         onSubmit,
         onMinimizeHeight: minimizeInputHeight,
         preserveHeightOnSubmit,
@@ -1522,7 +1528,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
       attachments,
       cwd,
       onSubmit,
-      isAgentRunning,
+      isQueueBusy,
       hasExternalContent,
       minimizeInputHeight,
       preserveHeightOnSubmit,
@@ -1545,22 +1551,22 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
     const handleDefaultSendAction = useCallback(() => {
       runDefaultSendAction({
         defaultSendBehavior,
-        isAgentRunning,
+        isQueueBusy,
         onQueue,
         handleSendMessage,
         handleQueueMessage,
       });
-    }, [defaultSendBehavior, isAgentRunning, onQueue, handleQueueMessage, handleSendMessage]);
+    }, [defaultSendBehavior, isQueueBusy, onQueue, handleQueueMessage, handleSendMessage]);
 
     const handleAlternateSendAction = useCallback(() => {
       runAlternateSendAction({
         defaultSendBehavior,
-        isAgentRunning,
+        isQueueBusy,
         onQueue,
         handleSendMessage,
         handleQueueMessage,
       });
-    }, [defaultSendBehavior, isAgentRunning, handleSendMessage, handleQueueMessage, onQueue]);
+    }, [defaultSendBehavior, isQueueBusy, handleSendMessage, handleQueueMessage, onQueue]);
 
     const getWebTextArea = useCallback(
       (): TextAreaHandle | null => getWebTextAreaImpl(textInputRef.current),
@@ -1605,7 +1611,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
           selectionRef.current,
         ),
         submitOnEnter: shouldSubmitOnEnter,
-        isAgentRunning,
+        isQueueBusy,
         onQueue,
         isSubmitDisabled,
         isSubmitLoading,
@@ -1632,7 +1638,7 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         isSubmitLoading,
         onSubmitLoadingPress,
         defaultSendBehavior,
-        isAgentRunning,
+        isQueueBusy,
       });
     useIosHardwareKeyboardSubmit({
       isEnabled: isInputFocused && !isSendButtonDisabled,

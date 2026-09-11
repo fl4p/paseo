@@ -44,7 +44,11 @@ import {
 import { ContextWindowMeter } from "@/components/context-window-meter";
 import { KeyboardTranslateView } from "@/components/keyboard-translate-view";
 import { useImageAttachmentPicker } from "@/hooks/use-image-attachment-picker";
-import { selectAgentTurnPresentation, useSessionStore } from "@/stores/session-store";
+import {
+  selectAgentQueueBusy,
+  selectAgentTurnPresentation,
+  useSessionStore,
+} from "@/stores/session-store";
 import { useFilePicker } from "@/hooks/use-file-picker";
 import { useFileDrop } from "@/components/file-drop/use-file-drop";
 import type { DroppedItem } from "@/components/file-drop/types";
@@ -1508,7 +1512,12 @@ function ComposerContentImpl({
   const isCancellingAgent = useSessionStore(
     (state) => selectAgentTurnPresentation(state.sessions[serverId], agentId).isCancelling,
   );
+  // Stop, steer, voice and the context meter follow the turn. Queue decisions also wait for a
+  // compaction, which for Codex, pi and OMP runs without any turn.
   const isAgentRunning = hasActiveTurn;
+  const isQueueBusy = useSessionStore((state) =>
+    selectAgentQueueBusy(state.sessions[serverId], agentId, "composer"),
+  );
   // Queueing behind a permission prompt would strand the message: the turn is
   // parked until the request is answered.
   const hasPendingPermission = useSessionStore((state) => {
@@ -1571,7 +1580,7 @@ function ComposerContentImpl({
         allowEmptySubmit,
         forceSend,
         submitBehavior,
-        isAgentRunning,
+        isQueueBusy,
         // Parent-managed submits are still valid submit paths even when the
         // transport is disconnected, because the parent decides the failure mode.
         canSubmit: Boolean(sendAgentMessageRef.current || onSubmitMessageRef.current),
@@ -1607,7 +1616,7 @@ function ComposerContentImpl({
       clearDraft,
       completeSubmit,
       hasExternalContent,
-      isAgentRunning,
+      isQueueBusy,
       queueMessage,
       setSelectedAttachments,
       replaceUserInput,
@@ -2360,6 +2369,7 @@ function ComposerContentImpl({
                   voiceServerId={serverId}
                   voiceAgentId={agentId}
                   isAgentRunning={isAgentRunning}
+                  isQueueBusy={isQueueBusy}
                   defaultSendBehavior={activeSendBehavior}
                   onQueue={handleQueue}
                   onSubmitLoadingPress={submitLoadingPressHandler}
