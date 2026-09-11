@@ -1320,6 +1320,15 @@ test.each(["interrupt", "steer"] as const)(
   },
 );
 
+/** The provider has actually opened its compaction marker, not merely been asked to compact. */
+async function waitForCompactionMarker(scenario: {
+  timeline: () => AgentTimelineItem[];
+}): Promise<void> {
+  await waitFor(() =>
+    compactionItems(scenario.timeline()).some((item) => item.status === "loading"),
+  );
+}
+
 test("Stop during a Claude compaction never presents it as compacted", async () => {
   const sessionId = "compact-stop";
   const scenario = await startClaudeManagerScenario(sessionId, async ({ promptRecord, query }) => {
@@ -1330,7 +1339,9 @@ test("Stop during a Claude compaction never presents it as compacted", async () 
   });
   try {
     await sendClaudePrompt(scenario, "/compact", "interrupt");
-    await waitFor(() => scenario.manager.isHoldingPromptsForCompaction(scenario.agentId));
+    // The manager holds prompts from the moment /compact is dispatched. Wait for the provider's
+    // own marker, which is what this test is about.
+    await waitForCompactionMarker(scenario);
 
     await expect(scenario.manager.cancelAgentRun(scenario.agentId)).resolves.toEqual({
       status: "settled",
@@ -1359,7 +1370,7 @@ test("after a stopped Claude compaction, a steer into the next running turn is n
   });
   try {
     await sendClaudePrompt(scenario, "/compact", "interrupt");
-    await waitFor(() => scenario.manager.isHoldingPromptsForCompaction(scenario.agentId));
+    await waitForCompactionMarker(scenario);
     await scenario.manager.cancelAgentRun(scenario.agentId);
     scenario.query().emit(buildAbortedResult(sessionId));
     await waitFor(() => scenario.manager.getAgent(scenario.agentId)?.lifecycle === "idle");

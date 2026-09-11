@@ -35,6 +35,7 @@ import {
   type ProviderCatalog,
   type ProviderRefreshContext,
   type ToolCallDetail,
+  type OutOfBandPromptHandler,
 } from "../../agent-sdk-types.js";
 import type { PaseoToolCatalog } from "../../tools/types.js";
 import { importSessionFromPersistence } from "../../provider-session-import.js";
@@ -1198,9 +1199,7 @@ export class OmpAgentSession implements AgentSession {
     return mapOmpRuntimeSlashCommands(commands);
   }
 
-  tryHandleOutOfBand(
-    prompt: AgentPromptInput,
-  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+  tryHandleOutOfBand(prompt: AgentPromptInput): OutOfBandPromptHandler | null {
     if (typeof prompt !== "string") {
       return null;
     }
@@ -1212,8 +1211,9 @@ export class OmpAgentSession implements AgentSession {
     const commandName = parsed.commandName.toLowerCase();
     if (commandName === "compact") {
       return {
+        compaction: true,
         run: async ({ emit }) => {
-          await this.executeCompactCommand(parsed.args, emit);
+          return await this.executeCompactCommand(parsed.args, emit);
         },
       };
     }
@@ -1392,7 +1392,7 @@ export class OmpAgentSession implements AgentSession {
   private async executeCompactCommand(
     customInstructions: string | undefined,
     emit: (event: AgentStreamEvent) => void,
-  ): Promise<void> {
+  ): Promise<{ compactionStarted: boolean }> {
     if (this.outOfBandCompactionEmit) {
       throw new Error("An OMP compact command is already running");
     }
@@ -1401,6 +1401,7 @@ export class OmpAgentSession implements AgentSession {
     this.outOfBandCompactionCompleted = false;
     try {
       await this.runtimeSession.compact(customInstructions);
+      return { compactionStarted: true };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (
@@ -1427,6 +1428,8 @@ export class OmpAgentSession implements AgentSession {
           text: `[Error] Failed to compact context: ${message}`,
         },
       });
+      // Nothing is compacting: the manager must not keep holding prompts behind this arm.
+      return { compactionStarted: false };
     } finally {
       if (this.outOfBandCompactionEmit === emit && !this.outOfBandCompactionStarted) {
         this.outOfBandCompactionEmit = null;

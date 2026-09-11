@@ -521,6 +521,15 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       const { agentId, event, timestamp, seq, epoch } = message.payload;
       const parsedTimestamp = new Date(timestamp);
       const streamEvent = event;
+      if (event.type === "prompt_discarded") {
+        // The prompt never reached the provider, so no canonical row will ever arrive for it.
+        // Rejecting the submission is the only signal that retires the pending composer row
+        // (see composer/submission/model.ts); the daemon also writes a timeline row saying why.
+        useSessionStore
+          .getState()
+          .rejectAgentMessageSubmission(serverId, agentId, event.clientMessageId);
+        return;
+      }
       if (
         event.type === "turn_started" ||
         event.type === "turn_completed" ||

@@ -38,6 +38,7 @@ import {
   type ProviderCatalog,
   type ProviderRefreshContext,
   type ResolveAgentDefaultModeInput,
+  type OutOfBandPromptHandler,
 } from "../agent-sdk-types.js";
 import { importSessionFromPersistence } from "../provider-session-import.js";
 import { runProviderRefreshActivity } from "../provider-refresh-deadline.js";
@@ -4920,15 +4921,14 @@ export class CodexAppServerAgentSession implements AgentSession {
     );
   }
 
-  tryHandleOutOfBand(
-    prompt: AgentPromptInput,
-  ): { run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void> } | null {
+  tryHandleOutOfBand(prompt: AgentPromptInput): OutOfBandPromptHandler | null {
     if (typeof prompt !== "string") return null;
     const parsed = this.parseSlashCommandInput(prompt);
     if (!parsed) return null;
 
     if (parsed.commandName === "compact") {
       return {
+        compaction: true,
         run: async ({ emit }) => {
           const error = await this.executeCompactCommand();
           if (error) {
@@ -4938,6 +4938,7 @@ export class CodexAppServerAgentSession implements AgentSession {
               item: { type: "assistant_message", text: formatOutOfBandStatusMessage(error) },
             });
           }
+          return { compactionStarted: error === null };
         },
       };
     }

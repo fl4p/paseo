@@ -491,6 +491,17 @@ export type AgentStreamEvent =
       type: "provider_subagent";
       provider: AgentProvider;
       event: import("./provider-subagents/store.js").ProviderSubagentInputEvent;
+    }
+  /**
+   * A prompt the client submitted never reached the provider and never will. Keyed by
+   * `clientMessageId` so the client can retire the pending submission it is still showing;
+   * a timeline row alone cannot clear it (see `packages/app/src/composer/submission/model.ts`).
+   */
+  | {
+      type: "prompt_discarded";
+      provider: AgentProvider;
+      clientMessageId: string;
+      reason: string;
     };
 
 export function getAgentStreamEventTurnId(event: AgentStreamEvent): string | undefined {
@@ -772,9 +783,30 @@ export interface AgentSession {
    * (if any) is left untouched, so this is how mid-turn side-effect commands
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
-  tryHandleOutOfBand?(prompt: AgentPromptInput): {
-    run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
-  } | null;
+  tryHandleOutOfBand?(prompt: AgentPromptInput): OutOfBandPromptHandler | null;
+  /**
+   * Whether this prompt, dispatched as a normal turn, starts a manual compaction. Providers whose
+   * `/compact` is an ordinary prompt (Claude) answer true so the manager can hold prompts from
+   * dispatch instead of from the provider's first compaction marker.
+   */
+  isManualCompactionPrompt?(prompt: AgentPromptInput): boolean;
+}
+
+/**
+ * A prompt the provider handles without allocating a turn. `compaction: true` tells the manager
+ * the command starts a compaction, so it arms the compaction gate from dispatch — before the
+ * provider's first marker — and holds prompts that arrive in that window.
+ */
+export interface OutOfBandPromptHandler {
+  compaction?: boolean;
+  /**
+   * Resolve with `{ compactionStarted: false }` when a `compaction` command failed before the
+   * provider began compacting; the manager disarms the gate at once instead of waiting for its
+   * backstop. A rejection means the same thing.
+   */
+  run(ctx: {
+    emit: (event: AgentStreamEvent) => void;
+  }): Promise<void | { compactionStarted: boolean }>;
 }
 
 export type FetchCatalogOptions =

@@ -290,6 +290,38 @@ test("/compact armed during a running turn stays manual when that older turn end
   }
 });
 
+test("a prompt sent after /compact but BEFORE the compaction item does not interrupt it", async () => {
+  const scenario = await startCodexScenario();
+  try {
+    // The reviewer's reproduction: the manual-compaction turn has started, but Codex has not
+    // emitted the compaction item yet, so no timeline marker exists to hold behind.
+    await runManualCompactionTurn(scenario, "compact-turn");
+    expect(scenario.compactions()).toEqual([]);
+    expect(scenario.manager.isHoldingPromptsForCompaction(scenario.agentId)).toBe(true);
+
+    const dispatched = await sendPrompt(scenario, "follow-up", "interrupt");
+    expect(dispatched.disposition).toBe("held");
+    await settle();
+    expect(scenario.requests("turn/interrupt")).toHaveLength(0);
+    expect(scenario.requests("turn/start")).toHaveLength(0);
+
+    scenario.appServer.startsCompaction({ threadId: THREAD_ID, itemId: "compact-item" });
+    scenario.appServer.completesCompaction({ threadId: THREAD_ID, itemId: "compact-item" });
+    scenario.appServer.completeTurn({ threadId: THREAD_ID });
+
+    await expect.poll(() => scenario.requests("turn/start").length).toBe(1);
+    expect(promptTextsSent(scenario)[0]).toContain("follow-up");
+    expect(scenario.requests("turn/interrupt")).toHaveLength(0);
+    expect(scenario.compactions()).toEqual([
+      { type: "compaction", status: "loading", trigger: "manual" },
+      { type: "compaction", status: "completed", trigger: "manual" },
+    ]);
+    scenario.appServer.assertNoErrors();
+  } finally {
+    await scenario.cleanup();
+  }
+});
+
 test("two /compacts armed before either turn starts are both labeled manual", async () => {
   const scenario = await startCodexScenario();
   try {

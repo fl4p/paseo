@@ -528,3 +528,28 @@ describe("agent.fork_session compatibility", () => {
     expect(withoutFlag.features?.agentForkSession).toBeUndefined();
   });
 });
+
+test("a dropped prompt carries the clientMessageId an older client would simply ignore", () => {
+  const message = {
+    type: "agent_stream",
+    payload: {
+      agentId: "agent-1",
+      event: {
+        type: "prompt_discarded",
+        provider: "codex",
+        clientMessageId: "client-1",
+        reason: "Message not sent: the agent was closed",
+      },
+      timestamp: "2026-01-01T00:00:00.000Z",
+    },
+  };
+  expect(SessionOutboundMessageSchema.parse(message)).toEqual(message);
+
+  // A client built before this event existed drops the whole message at its schema boundary and
+  // keeps today's behavior (the submission stays pending) rather than misreading it.
+  const LegacyAgentStreamEventSchema = z.discriminatedUnion("type", [
+    z.object({ type: z.literal("turn_started"), provider: z.string() }),
+    z.object({ type: z.literal("timeline"), provider: z.string(), item: z.unknown() }),
+  ]);
+  expect(LegacyAgentStreamEventSchema.safeParse(message.payload.event).success).toBe(false);
+});

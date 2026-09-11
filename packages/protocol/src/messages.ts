@@ -820,6 +820,15 @@ export const AgentStreamEventPayloadSchema = z.discriminatedUnion("type", [
     resolution: AgentPermissionResponseSchema,
   }),
   z.object({
+    // A submitted prompt that will never reach the provider. Keyed by `clientMessageId` so the
+    // client can retire the pending submission it is still rendering. Older clients drop the
+    // event at the schema boundary and keep today's behavior (the row stays pending).
+    type: z.literal("prompt_discarded"),
+    provider: AgentProviderSchema,
+    clientMessageId: z.string(),
+    reason: z.string(),
+  }),
+  z.object({
     type: z.literal("attention_required"),
     provider: AgentProviderSchema,
     reason: z.enum(["finished", "error", "permission"]),

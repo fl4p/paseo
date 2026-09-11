@@ -14,6 +14,8 @@ export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   hasInFlightRun(agentId: string): boolean;
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
+  /** Drop prompts queued behind a compaction; returns how many were discarded. */
+  discardHeldPrompts(agentId: string, reason: string): number;
   clearAgentAttention(agentId: string): Promise<void>;
   archiveAgent(agentId: string): Promise<{ archivedAt: string }>;
   archiveSnapshot(agentId: string, archivedAt: string): Promise<StoredAgentRecord>;
@@ -93,10 +95,25 @@ async function requestAgentRunCancellation(
   };
 }
 
+/**
+ * Stop, as the user means it. A prompt held behind a compaction is discarded BEFORE the cancel:
+ * cancelling ends the compaction, which would otherwise release the hold and start exactly the
+ * work the user just stopped. Stop itself is never held.
+ */
 export async function cancelAgentRunCommand(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "logger">,
   agentId: string,
 ): Promise<CancelAgentRunResult> {
+  const discarded = dependencies.agentManager.discardHeldPrompts(
+    agentId,
+    "you stopped the agent while the message waited for a compaction",
+  );
+  if (discarded > 0) {
+    dependencies.logger.info(
+      { agentId, discarded },
+      "cancelAgentRunCommand: discarded held prompts",
+    );
+  }
   const result = await requestAgentRunCancellation(dependencies, agentId);
   if (result.cancellation.status === "refused") {
     dependencies.logger.warn(

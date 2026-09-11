@@ -94,6 +94,23 @@ describe("message submission transactions", () => {
     });
   });
 
+  // The daemon holds a prompt behind a compaction, so the send RPC settles at once and no
+  // canonical prompt row ever arrives if the hold is dropped. This is why a dropped hold needs
+  // `prompt_discarded` (which routes to `rejectMessageSubmission`) and not just a timeline row.
+  it("keeps a settled-but-unacknowledged submission pending until it is rejected", () => {
+    const sending = beginMessageSubmission([], { clientMessageId: "client-1" });
+    const settled = acceptMessageSubmission(sending, "client-1");
+
+    expect(getActiveMessageSubmissions(settled).map((item) => item.clientMessageId)).toEqual([
+      "client-1",
+    ]);
+    expect(observeMessageSubmissionCanonical(settled, [])).toBe(settled);
+    expect(rejectMessageSubmission(settled, "client-1")).toEqual({
+      outcome: "rejected",
+      submissions: [],
+    });
+  });
+
   it("does not create duplicate transaction identity", () => {
     const sending = beginMessageSubmission([], { clientMessageId: "client-1" });
 

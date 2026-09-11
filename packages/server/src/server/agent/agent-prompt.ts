@@ -80,13 +80,22 @@ async function startOrReplaceRun(
   replaced: boolean;
   held: boolean;
 }> {
-  const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
   // Read in the same tick replaceAgentRun makes the same decision, so the two cannot disagree.
-  const held = replaced && agentManager.isHoldingPromptsForCompaction(agentId);
+  // A compaction holds the prompt whether or not it would have replaced a run: an out-of-band
+  // compaction (pi, OMP) runs with no turn at all, and pi refuses a prompt that reaches it while
+  // it is compacting, losing the user's message.
+  if (agentManager.isHoldingPromptsForCompaction(agentId)) {
+    return {
+      iterator: await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions),
+      replaced: true,
+      held: true,
+    };
+  }
+  const replaced = Boolean(options?.replaceRunning && agentManager.hasInFlightRun(agentId));
   const iterator = replaced
     ? await agentManager.replaceAgentRun(agentId, prompt, options?.runOptions)
     : agentManager.streamAgent(agentId, prompt, options?.runOptions);
-  return { iterator, replaced, held };
+  return { iterator, replaced, held: false };
 }
 
 export async function startAgentRun(

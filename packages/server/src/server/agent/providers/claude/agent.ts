@@ -2956,6 +2956,19 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  /**
+   * Claude's `/compact` is an ordinary prompt to the CLI, so the manager cannot see it as a
+   * compaction until the CLI reports `compacting`. Answer for it here: the manager arms its
+   * compaction hold at dispatch, closing the window where a follow-up prompt replaced — and so
+   * cancelled — the compaction turn.
+   */
+  isManualCompactionPrompt(prompt: AgentPromptInput): boolean {
+    if (typeof prompt !== "string") {
+      return false;
+    }
+    return this.parseSlashCommandInput(prompt)?.commandName === "compact";
+  }
+
   private resolveSlashCommandInvocation(prompt: AgentPromptInput): SlashCommandInvocation | null {
     if (typeof prompt !== "string") {
       return null;

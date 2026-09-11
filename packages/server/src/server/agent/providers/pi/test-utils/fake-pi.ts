@@ -133,6 +133,8 @@ export class FakePiSession implements PiRuntimeSession {
   setSessionNameError: Error | null = null;
   compactError: Error | null = null;
   emitCompactEnd = true;
+  /** When set, `compact` waits on it between `compaction_start` and `compaction_end`. */
+  compactGate: Promise<void> | null = null;
   getStateError: Error | null = null;
   getSessionStatsError: Error | null = null;
   promptAck: PiPromptAck = {};
@@ -234,6 +236,9 @@ export class FakePiSession implements PiRuntimeSession {
   async compact(customInstructions?: string): Promise<void> {
     this.compactRequests.push(customInstructions === undefined ? {} : { customInstructions });
     this.emit({ type: "compaction_start", reason: "manual" });
+    if (this.compactGate) {
+      await this.compactGate;
+    }
     if (this.emitCompactEnd) {
       this.emit({ type: "compaction_end", reason: "manual" });
     }
