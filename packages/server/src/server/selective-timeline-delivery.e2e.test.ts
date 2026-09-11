@@ -240,6 +240,68 @@ test("notification timeline items are sent only to clients that advertise suppor
   expect(legacyTimeline.endCursor).toEqual(capableTimeline.endCursor);
 });
 
+test("timeline search covers history no client has loaded, and only rows the client can render", async () => {
+  await daemon.close();
+  daemon = await createTestPaseoDaemon({
+    isDev: true,
+    agentClients: { mock: new MockLoadTestAgentClient() },
+  });
+  const capable = await connect({
+    clientId: "search-capable",
+    selective: false,
+    timelineNotifications: true,
+  });
+  const legacy = await connect({
+    clientId: "search-legacy",
+    selective: false,
+    timelineNotifications: false,
+  });
+  const agent = await capable.client.createAgent({
+    provider: "mock",
+    cwd: "/tmp",
+    title: "Timeline search",
+    model: "ten-second-stream",
+  });
+
+  const manager = daemon.daemon.agentManager;
+  await manager.appendTimelineItem(agent.id, {
+    type: "user_message",
+    text: "find the needle early",
+  });
+  for (let index = 0; index < 60; index += 1) {
+    await manager.appendTimelineItem(agent.id, { type: "user_message", text: `filler ${index}` });
+  }
+  await manager.appendTimelineItem(agent.id, {
+    type: "notification",
+    level: "warning",
+    message: "a needle in a notification",
+  });
+  // Streamed chunks that only spell the word once the transcript joins them.
+  await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "the nee" });
+  await manager.appendTimelineItem(agent.id, { type: "assistant_message", text: "dle, late" });
+
+  const tail = await capable.client.fetchAgentTimeline(agent.id, {
+    direction: "tail",
+    projection: "projected",
+    limit: 10,
+  });
+  const [capableSearch, legacySearch] = await Promise.all([
+    capable.client.searchAgentTimeline(agent.id, "NEEDLE"),
+    legacy.client.searchAgentTimeline(agent.id, "NEEDLE"),
+  ]);
+
+  expect(capableSearch.epoch).toBe(tail.epoch);
+  expect(capableSearch.truncated).toBe(false);
+  expect(capableSearch.matches).toHaveLength(3);
+  const [early, notification, joined] = capableSearch.matches;
+  // The first hit lies far behind the window a client loads first.
+  expect(early?.seqEnd).toBeLessThan(tail.startCursor?.seq ?? 0);
+  expect(notification?.seqEnd).toBeLessThan(joined?.seqStart ?? 0);
+  expect(joined?.seqEnd).toBe((joined?.seqStart ?? 0) + 1);
+  // A client that cannot render notifications is not told about a hit in one.
+  expect(legacySearch.matches).toEqual([early, joined]);
+});
+
 test("plugin timeline items are sent only to clients that advertise support", async () => {
   await daemon.close();
   daemon = await createTestPaseoDaemon({

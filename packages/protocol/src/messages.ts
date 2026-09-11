@@ -1839,6 +1839,16 @@ export const AgentTimelineListPromptsRequestMessageSchema = z.object({
   requestId: z.string(),
 });
 
+/** Search every row of an agent's timeline, loaded by the client or not. */
+export const AgentTimelineSearchRequestMessageSchema = z.object({
+  type: z.literal("agent.timeline.search.request"),
+  agentId: z.string(),
+  requestId: z.string(),
+  query: z.string(),
+  // Upper bound on reported hits; the daemon applies its own cap as well.
+  limit: z.number().int().nonnegative().optional(),
+});
+
 export const ProviderSubagentListRequestMessageSchema = z.object({
   type: z.literal("agent.provider_subagents.list.request"),
   parentAgentId: z.string(),
@@ -3217,6 +3227,7 @@ export const SessionInboundMessageSchema = z.discriminatedUnion("type", [
   DaemonUpdateRequestMessageSchema,
   FetchAgentTimelineRequestMessageSchema,
   AgentTimelineListPromptsRequestMessageSchema,
+  AgentTimelineSearchRequestMessageSchema,
   ProviderSubagentListRequestMessageSchema,
   ProviderSubagentTimelineRequestMessageSchema,
   ProviderSubagentStopRequestMessageSchema,
@@ -3533,6 +3544,8 @@ export const ServerInfoStatusPayloadSchema = z
         // and github_search fallback after 2027-01-17 once the supported daemon
         // floor is >= v0.2.0.
         forgeSearch: z.boolean().optional(),
+        // COMPAT(timelineSearch): added in v0.8.0, remove gate after 2027-03-11.
+        timelineSearch: z.boolean().optional(),
         // COMPAT(daemonStatusRpc): added in v0.1.76, remove gate after 2026-11-18.
         daemonStatusRpc: z.boolean().optional(),
         // COMPAT(daemonConfigReload): added in v0.4.0, remove gate after 2027-02-14.
@@ -4575,6 +4588,27 @@ export const AgentTimelineListPromptsResponseMessageSchema = z.object({
         preview: z.string(),
       }),
     ),
+    error: z.string().nullable(),
+  }),
+});
+
+export const AgentTimelineSearchResponseMessageSchema = z.object({
+  type: z.literal("agent.timeline.search.response"),
+  payload: z.object({
+    requestId: z.string(),
+    agentId: z.string(),
+    epoch: z.string(),
+    query: z.string(),
+    // One entry per hit, at the projected timeline range of the message showing it.
+    matches: z.array(
+      z.object({
+        seqStart: z.number().int().nonnegative(),
+        seqEnd: z.number().int().nonnegative(),
+        occurrence: z.number().int().nonnegative(),
+      }),
+    ),
+    // The scan stopped at its cap, so the number of matches is a floor.
+    truncated: z.boolean(),
     error: z.string().nullable(),
   }),
 });
@@ -6637,6 +6671,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   FetchAgentTimelineResponseMessageSchema,
   AgentTimelineReplacementMessageSchema,
   AgentTimelineListPromptsResponseMessageSchema,
+  AgentTimelineSearchResponseMessageSchema,
   ProviderSubagentListResponseMessageSchema,
   ProviderSubagentTimelineResponseMessageSchema,
   ProviderSubagentStopResponseMessageSchema,
@@ -6857,6 +6892,9 @@ export type FetchAgentTimelineResponseMessage = z.infer<
 >;
 export type AgentTimelineListPromptsResponseMessage = z.infer<
   typeof AgentTimelineListPromptsResponseMessageSchema
+>;
+export type AgentTimelineSearchResponseMessage = z.infer<
+  typeof AgentTimelineSearchResponseMessageSchema
 >;
 export type AgentForkContextResponseMessage = z.infer<typeof AgentForkContextResponseMessageSchema>;
 export type AgentForkSessionResponseMessage = z.infer<typeof AgentForkSessionResponseMessageSchema>;

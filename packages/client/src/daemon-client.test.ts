@@ -1360,6 +1360,93 @@ test("lists the full agent prompt index", async () => {
   });
 });
 
+test("searches an agent's whole timeline and returns the daemon's hits", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.searchAgentTimeline("agent-1", "widget", {
+    requestId: "req-search-1",
+  });
+
+  expect(parseSentFrame(mock.sent[0])).toEqual({
+    type: "agent.timeline.search.request",
+    requestId: "req-search-1",
+    agentId: "agent-1",
+    query: "widget",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.timeline.search.response",
+      payload: {
+        requestId: "req-search-1",
+        agentId: "agent-1",
+        epoch: "epoch-1",
+        query: "widget",
+        matches: [{ seqStart: 3, seqEnd: 4, occurrence: 1 }],
+        truncated: false,
+        error: null,
+      },
+    }),
+  );
+
+  await expect(responsePromise).resolves.toMatchObject({
+    epoch: "epoch-1",
+    matches: [{ seqStart: 3, seqEnd: 4, occurrence: 1 }],
+    truncated: false,
+  });
+});
+
+test("rejects a timeline search the daemon could not run", async () => {
+  const logger = createMockLogger();
+  const mock = createMockTransport();
+  const client = new DaemonClient({
+    url: "ws://test",
+    clientId: "clsk_unit_test",
+    logger,
+    reconnect: { enabled: false },
+    transportFactory: () => mock.transport,
+  });
+  clients.push(client);
+
+  const connectPromise = client.connect();
+  mock.triggerOpen();
+  await connectPromise;
+
+  const responsePromise = client.searchAgentTimeline("agent-1", "widget", {
+    requestId: "req-search-2",
+  });
+
+  mock.triggerMessage(
+    wrapSessionMessage({
+      type: "agent.timeline.search.response",
+      payload: {
+        requestId: "req-search-2",
+        agentId: "agent-1",
+        epoch: "",
+        query: "widget",
+        matches: [],
+        truncated: false,
+        error: "Agent not found",
+      },
+    }),
+  );
+
+  await expect(responsePromise).rejects.toThrow("Agent not found");
+});
+
 test("honors explicit fetchAgents timeout below the session RPC default", async () => {
   useHeartbeatClock();
   const logger = createMockLogger();

@@ -37,6 +37,33 @@ describe("shared messages stream parsing", () => {
     ]);
   });
 
+  it("parses a timeline search request and its response through the session unions", () => {
+    const request = SessionInboundMessageSchema.parse({
+      type: "agent.timeline.search.request",
+      agentId: "agent_live",
+      requestId: "req-search-1",
+      query: "pagination",
+      limit: 50,
+    });
+    expect(request).toMatchObject({ type: "agent.timeline.search.request", limit: 50 });
+
+    const response = SessionOutboundMessageSchema.parse({
+      type: "agent.timeline.search.response",
+      payload: {
+        requestId: "req-search-1",
+        agentId: "agent_live",
+        epoch: "epoch-1",
+        query: "pagination",
+        matches: [{ seqStart: 40, seqEnd: 42, occurrence: 0 }],
+        truncated: true,
+        error: null,
+      },
+    });
+    expect(response).toMatchObject({
+      payload: { matches: [{ seqStart: 40, seqEnd: 42, occurrence: 0 }], truncated: true },
+    });
+  });
+
   it("parses representative fetch_agent_timeline_response payload", () => {
     const parsed = FetchAgentTimelineResponseMessageSchema.parse({
       type: "fetch_agent_timeline_response",

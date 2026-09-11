@@ -1,5 +1,18 @@
 import { create } from "zustand";
+import type { HistorySearchResult } from "@/agent-stream/find/model";
 import type { StreamItem } from "@/types/stream";
+
+/**
+ * The daemon's side of transcript Find: the full timeline, including history
+ * the transcript has not loaded.
+ */
+export interface TranscriptHistorySearch {
+  /** The timeline epoch the loaded rows belong to; results from another epoch do not apply. */
+  epoch: string;
+  search: (query: string) => Promise<HistorySearchResult>;
+  /** Loads the history window around a timeline position into the transcript. */
+  load: (seq: number) => void;
+}
 
 /**
  * The transcript that Find should search, published by the mounted agent
@@ -11,6 +24,8 @@ export interface TranscriptFindSource {
   items: readonly StreamItem[];
   /** Reveals a row that partial virtualization has unmounted, then scrolls to it. */
   jumpToItem: (itemId: string) => void;
+  /** Null when the host daemon cannot search timeline history. */
+  history: TranscriptHistorySearch | null;
 }
 
 interface TranscriptFindState {

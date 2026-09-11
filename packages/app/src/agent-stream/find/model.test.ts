@@ -1,12 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { StreamItem } from "@/types/stream";
 import {
-  flattenInlineMarkdown,
   findTranscriptMatches,
   getSearchableText,
-  preserveActiveMatch,
+  mergeTranscriptHits,
+  preserveActiveHit,
   stepMatchIndex,
   TRANSCRIPT_MATCH_LIMIT,
+  type HistorySearchResult,
+  type TranscriptHit,
 } from "./model";
 
 const timestamp = new Date(0);
@@ -107,24 +109,6 @@ describe("getSearchableText", () => {
   });
 });
 
-describe("flattenInlineMarkdown", () => {
-  it("finds a phrase the reader sees but the source splits", () => {
-    expect(flattenInlineMarkdown("hello **world**")).toBe("hello world");
-    expect(flattenInlineMarkdown("hello _world_")).toBe("hello world");
-    expect(flattenInlineMarkdown("hello ***world***")).toBe("hello world");
-    expect(flattenInlineMarkdown("run `npm test` now")).toBe("run npm test now");
-    expect(flattenInlineMarkdown("see [the docs](https://example.com)")).toBe("see the docs");
-    expect(flattenInlineMarkdown("## Heading")).toBe("Heading");
-    expect(flattenInlineMarkdown("> quoted")).toBe("quoted");
-  });
-
-  it("leaves text that is not inline markup alone", () => {
-    expect(flattenInlineMarkdown("2 * 3 * 4")).toBe("2 * 3 * 4");
-    expect(flattenInlineMarkdown("snake_case_name")).toBe("snake_case_name");
-    expect(flattenInlineMarkdown("plain sentence")).toBe("plain sentence");
-  });
-});
-
 describe("findTranscriptMatches", () => {
   const items = [
     userMessage("u1", "Deploy the widget"),
@@ -140,9 +124,9 @@ describe("findTranscriptMatches", () => {
     const { matches } = findTranscriptMatches({ items, query: "widget" });
 
     expect(matches).toEqual([
-      { itemId: "u1", itemIndex: 0, start: 11 },
-      { itemId: "a1", itemIndex: 1, start: 14 },
-      { itemId: "a1", itemIndex: 1, start: 30 },
+      { itemId: "u1", itemIndex: 0, start: 11, occurrence: 0 },
+      { itemId: "a1", itemIndex: 1, start: 14, occurrence: 0 },
+      { itemId: "a1", itemIndex: 1, start: 30, occurrence: 1 },
     ]);
   });
 
@@ -208,31 +192,135 @@ describe("stepMatchIndex", () => {
   });
 });
 
-describe("preserveActiveMatch", () => {
-  const matches = [
-    { itemId: "a1", itemIndex: 1, start: 5 },
-    { itemId: "a1", itemIndex: 1, start: 20 },
-    { itemId: "u2", itemIndex: 2, start: 0 },
+function atSeq(item: StreamItem, seq: number, epoch = "epoch-1"): StreamItem {
+  return { ...item, timelineCursor: { epoch, seq } };
+}
+
+function history(matches: HistorySearchResult["matches"], epoch = "epoch-1"): HistorySearchResult {
+  return { epoch, matches, truncated: false };
+}
+
+function loadedHit(itemId: string, seq: number | null, occurrence = 0): TranscriptHit {
+  return { kind: "loaded", itemId, seq, occurrence };
+}
+
+function historyHit(seqStart: number, seqEnd: number, occurrence = 0): TranscriptHit {
+  return { kind: "history", seqStart, seqEnd, occurrence };
+}
+
+describe("mergeTranscriptHits", () => {
+  it("places history hits by timeline position around the loaded ones", () => {
+    const items = [
+      atSeq(userMessage("u50", "widget"), 50),
+      atSeq(assistantMessage("a52", "widget widget"), 52),
+    ];
+    const local = findTranscriptMatches({ items, query: "widget" }).matches;
+
+    expect(
+      mergeTranscriptHits({
+        items,
+        local,
+        history: history([
+          { seqStart: 3, seqEnd: 3, occurrence: 0 },
+          { seqStart: 70, seqEnd: 71, occurrence: 0 },
+        ]),
+      }),
+    ).toEqual([
+      historyHit(3, 3),
+      loadedHit("u50", 50),
+      loadedHit("a52", 52, 0),
+      loadedHit("a52", 52, 1),
+      historyHit(70, 71),
+    ]);
+  });
+
+  it("lets a loaded row answer for its own history, even after it grew", () => {
+    // The daemon answered before the live turn added a second hit to row 52.
+    const items = [atSeq(assistantMessage("a52", "widget, and another widget"), 52)];
+    const local = findTranscriptMatches({ items, query: "widget" }).matches;
+
+    expect(
+      mergeTranscriptHits({
+        items,
+        local,
+        history: history([{ seqStart: 51, seqEnd: 52, occurrence: 0 }]),
+      }),
+    ).toEqual([loadedHit("a52", 52, 0), loadedHit("a52", 52, 1)]);
+  });
+
+  it("keeps history hits in the gap between a loaded window and the tail", () => {
+    const items = [
+      atSeq(userMessage("u10", "widget"), 10),
+      atSeq(userMessage("u90", "widget"), 90),
+    ];
+    const local = findTranscriptMatches({ items, query: "widget" }).matches;
+
+    expect(
+      mergeTranscriptHits({
+        items,
+        local,
+        history: history([
+          { seqStart: 10, seqEnd: 10, occurrence: 0 },
+          { seqStart: 40, seqEnd: 40, occurrence: 0 },
+          { seqStart: 90, seqEnd: 90, occurrence: 0 },
+        ]),
+      }),
+    ).toEqual([loadedHit("u10", 10), historyHit(40, 40), loadedHit("u90", 90)]);
+  });
+
+  it("does not treat rows from another timeline epoch as covering history", () => {
+    const items = [atSeq(userMessage("old", "widget"), 5, "epoch-0")];
+    const local = findTranscriptMatches({ items, query: "widget" }).matches;
+
+    expect(
+      mergeTranscriptHits({
+        items,
+        local,
+        history: history([{ seqStart: 5, seqEnd: 5, occurrence: 0 }]),
+      }),
+    ).toEqual([loadedHit("old", null), historyHit(5, 5)]);
+  });
+
+  it("is just the loaded hits when the daemon cannot search history", () => {
+    const items = [userMessage("u1", "widget")];
+    const local = findTranscriptMatches({ items, query: "widget" }).matches;
+
+    expect(mergeTranscriptHits({ items, local, history: null })).toEqual([loadedHit("u1", null)]);
+  });
+});
+
+describe("preserveActiveHit", () => {
+  const hits = [
+    historyHit(3, 4),
+    loadedHit("a1", 20, 0),
+    loadedHit("a1", 20, 1),
+    loadedHit("u2", 22, 0),
   ];
 
   it("keeps the reader on the same hit when the transcript grows", () => {
-    expect(preserveActiveMatch({ previous: matches[1] ?? null, matches })).toBe(1);
+    expect(preserveActiveHit({ previous: loadedHit("a1", 20, 1), hits })).toBe(2);
+  });
+
+  it("follows a history hit into the row that loading its window produced", () => {
+    const loaded = [loadedHit("u3", 4, 0), loadedHit("u3", 4, 1), loadedHit("a1", 20, 0)];
+
+    expect(preserveActiveHit({ previous: historyHit(3, 4, 1), hits: loaded })).toBe(1);
+  });
+
+  it("follows a loaded hit into history when its row is unloaded", () => {
+    const unloaded = [historyHit(20, 20, 0), historyHit(20, 20, 1), loadedHit("u3", 4, 0)];
+
+    expect(preserveActiveHit({ previous: loadedHit("a1", 20, 1), hits: unloaded })).toBe(1);
   });
 
   it("falls back to the same row when the hit moved", () => {
-    expect(
-      preserveActiveMatch({ previous: { itemId: "u2", itemIndex: 9, start: 99 }, matches }),
-    ).toBe(2);
+    expect(preserveActiveHit({ previous: loadedHit("u2", 22, 7), hits })).toBe(3);
   });
 
-  it("falls back to the first hit when the row is gone", () => {
-    expect(
-      preserveActiveMatch({ previous: { itemId: "gone", itemIndex: 0, start: 0 }, matches }),
-    ).toBe(0);
-  });
-
-  it("handles having nothing to preserve", () => {
-    expect(preserveActiveMatch({ previous: null, matches })).toBe(0);
-    expect(preserveActiveMatch({ previous: matches[0] ?? null, matches: [] })).toBe(0);
+  it("starts, and falls back, on the first loaded hit: that is where the reader is", () => {
+    expect(preserveActiveHit({ previous: null, hits })).toBe(1);
+    expect(preserveActiveHit({ previous: loadedHit("gone", 99), hits })).toBe(1);
+    expect(preserveActiveHit({ previous: null, hits: [historyHit(1, 1)] })).toBe(0);
+    expect(preserveActiveHit({ previous: loadedHit("a1", 20), hits: [] })).toBe(0);
   });
 });

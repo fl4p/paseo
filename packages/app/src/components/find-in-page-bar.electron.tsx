@@ -5,12 +5,13 @@ import { StyleSheet } from "react-native-unistyles";
 import { PaneFind, type PaneFindHandle } from "@/pane-find";
 import {
   findTranscriptMatches,
-  preserveActiveMatch,
+  mergeTranscriptHits,
+  preserveActiveHit,
   stepMatchIndex,
-  type TranscriptMatch,
-  type TranscriptSearchResult,
+  type HistorySearchResult,
+  type TranscriptHit,
 } from "@/agent-stream/find/model";
-import { useTranscriptFindStore } from "@/agent-stream/find/store";
+import { useTranscriptFindStore, type TranscriptFindSource } from "@/agent-stream/find/store";
 import { useTerminalFindStore, type TerminalFindSource } from "@/terminal/find/store";
 import {
   afterRowSettles,
@@ -28,10 +29,16 @@ const EMPTY_RESULT: DesktopFindResult = {
   finalUpdate: true,
 };
 
-const NO_TRANSCRIPT_RESULT: TranscriptSearchResult = { matches: [], truncated: false };
+const NO_TRANSCRIPT_HITS: { hits: TranscriptHit[]; truncated: boolean } = {
+  hits: [],
+  truncated: false,
+};
 
 /** A live turn mutates the DOM every few dozen milliseconds; repaint at most this often. */
 const HIGHLIGHT_REFRESH_MS = 150;
+
+/** Scanning the whole timeline waits for a pause in typing rather than chasing every key. */
+const HISTORY_SEARCH_DELAY_MS = 150;
 
 function isFindResult(value: unknown): value is DesktopFindResult {
   if (typeof value !== "object" || value === null) {
@@ -73,22 +80,69 @@ function useDesktopEvent(event: string, handler: (payload: unknown) => void): vo
   }, [event]);
 }
 
-/** The active hit is the n-th hit in its row, counted the same way in the model and the DOM. */
+/**
+ * The active hit is the n-th hit in its row, counted the same way in the model
+ * and the DOM. A hit in unloaded history has no row to paint yet.
+ */
 function activeHitFor(
-  matches: readonly TranscriptMatch[],
+  hits: readonly TranscriptHit[],
   activeMatchIndex: number,
 ): ActiveTranscriptHit | null {
-  const match = matches[activeMatchIndex];
-  if (!match) {
+  const hit = hits[activeMatchIndex];
+  return hit?.kind === "loaded" ? { itemId: hit.itemId, occurrence: hit.occurrence } : null;
+}
+
+/**
+ * The daemon's hits across the transcript's whole timeline, for the query the
+ * bar is showing. An answer is dropped once it no longer applies — the reader
+ * typed on, the transcript changed, or the timeline was replaced — rather than
+ * merged into hits for something else.
+ */
+function useHistorySearch(input: {
+  enabled: boolean;
+  query: string;
+  source: TranscriptFindSource | null;
+}): HistorySearchResult | null {
+  const { enabled, query, source } = input;
+  const history = source?.history ?? null;
+  const epoch = history?.epoch ?? null;
+  // The source is republished on every stream update; only these change the question.
+  const key =
+    enabled && source !== null && epoch !== null && query.length > 0
+      ? JSON.stringify([source.agentId, epoch, query])
+      : null;
+  const historyRef = useRef(history);
+  historyRef.current = history;
+  const [answer, setAnswer] = useState<{ key: string; result: HistorySearchResult } | null>(null);
+
+  useEffect(() => {
+    const search = historyRef.current?.search;
+    if (key === null || !search) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      search(query)
+        .then((result) => {
+          if (!cancelled) {
+            setAnswer({ key, result });
+          }
+          return undefined;
+        })
+        .catch((error: unknown) => {
+          console.warn("Find could not search the timeline history", error);
+        });
+    }, HISTORY_SEARCH_DELAY_MS);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [key, query]);
+
+  if (answer === null || answer.key !== key || answer.result.epoch !== epoch) {
     return null;
   }
-  let occurrence = 0;
-  for (let index = 0; index < activeMatchIndex; index += 1) {
-    if (matches[index]?.itemId === match.itemId) {
-      occurrence += 1;
-    }
-  }
-  return { itemId: match.itemId, occurrence };
+  return answer.result;
 }
 
 /**
@@ -102,14 +156,11 @@ function useTranscriptHighlights(input: {
   visible: boolean;
   owned: boolean;
   query: string;
-  matches: readonly TranscriptMatch[];
+  hits: readonly TranscriptHit[];
   activeMatchIndex: number;
 }): void {
-  const { visible, owned, query, matches, activeMatchIndex } = input;
-  const activeHit = useMemo(
-    () => activeHitFor(matches, activeMatchIndex),
-    [activeMatchIndex, matches],
-  );
+  const { visible, owned, query, hits, activeMatchIndex } = input;
+  const activeHit = useMemo(() => activeHitFor(hits, activeMatchIndex), [activeMatchIndex, hits]);
   const activeHitRef = useRef(activeHit);
   activeHitRef.current = activeHit;
   const highlightQuery = visible && owned ? query : "";
@@ -162,6 +213,64 @@ function useTranscriptHighlights(input: {
       }
     });
   }, [activeHitKey, highlightQuery]);
+}
+
+/**
+ * Moves the transcript to the active hit whenever it becomes a different hit.
+ * The transcript is read through a ref: its source is republished on every
+ * stream update, and depending on it would drag the reader back to the active
+ * hit on each update of a live turn. A hit in unloaded history loads its window
+ * first; the anchor then follows it into the loaded row, whose new key makes
+ * the jump.
+ */
+function useJumpToActiveHit(input: {
+  visible: boolean;
+  activeHit: TranscriptHit | null;
+  transcriptRef: { readonly current: TranscriptFindSource | null };
+}): void {
+  const { visible, activeHit, transcriptRef } = input;
+  const activeHitRef = useRef(activeHit);
+  activeHitRef.current = activeHit;
+  let jumpKey: string | null = null;
+  if (activeHit?.kind === "loaded") {
+    jumpKey = `item:${activeHit.itemId}`;
+  } else if (activeHit?.kind === "history") {
+    jumpKey = `seq:${activeHit.seqEnd}`;
+  }
+  useEffect(() => {
+    const hit = activeHitRef.current;
+    if (!visible || jumpKey === null || !hit) {
+      return;
+    }
+    if (hit.kind === "loaded") {
+      transcriptRef.current?.jumpToItem(hit.itemId);
+    } else {
+      transcriptRef.current?.history?.load(hit.seqEnd);
+    }
+  }, [jumpKey, transcriptRef, visible]);
+}
+
+interface FindCounts {
+  total: number;
+  /** 1-based; 0 when there is no active match to point at. */
+  current: number;
+  truncated: boolean;
+}
+
+const NO_COUNTS: FindCounts = { total: 0, current: 0, truncated: false };
+
+function terminalCounts(
+  result: { resultIndex: number; resultCount: number } | null | undefined,
+): FindCounts {
+  const total = result?.resultCount ?? 0;
+  const index = result?.resultIndex ?? -1;
+  return {
+    total,
+    current: index >= 0 ? index + 1 : 0,
+    // The addon reports index -1 once its highlight limit is exceeded: the
+    // count is then a floor, and the bar says so instead of pinning it.
+    truncated: total > 0 && index < 0,
+  };
 }
 
 function formatStatus(input: {
@@ -219,20 +328,32 @@ export function FindInPageBar(): React.ReactElement | null {
   const usingTerminal = terminal !== null;
   const usingTranscript = !usingTerminal && transcript !== null;
 
-  const { matches, truncated: truncatedMatches } = useMemo<TranscriptSearchResult>(() => {
+  const history = useHistorySearch({
+    enabled: visible && usingTranscript,
+    query,
+    source: transcript,
+  });
+  // Loaded rows answer at once; the daemon's hits in unloaded history join them
+  // when its answer arrives.
+  const { hits, truncated: truncatedMatches } = useMemo(() => {
     if (!transcript || query.length === 0) {
-      return NO_TRANSCRIPT_RESULT;
+      return NO_TRANSCRIPT_HITS;
     }
-    return findTranscriptMatches({ items: transcript.items, query });
-  }, [query, transcript]);
+    const local = findTranscriptMatches({ items: transcript.items, query });
+    return {
+      hits: mergeTranscriptHits({ items: transcript.items, local: local.matches, history }),
+      truncated: local.truncated || history?.truncated === true,
+    };
+  }, [history, query, transcript]);
 
   // The selection is an anchor on a hit, not an index. A live turn appends rows
-  // and renumbers the list, and deriving the index here rather than repairing it
-  // in an effect means the bar never renders a count it has to take back.
-  const [anchor, setAnchor] = useState<TranscriptMatch | null>(null);
+  // and renumbers the list, and loading history turns a history hit into a
+  // loaded one; deriving the index here rather than repairing it in an effect
+  // means the bar never renders a count it has to take back.
+  const [anchor, setAnchor] = useState<TranscriptHit | null>(null);
   const activeMatchIndex = useMemo(
-    () => preserveActiveMatch({ previous: anchor, matches }),
-    [anchor, matches],
+    () => preserveActiveHit({ previous: anchor, hits }),
+    [anchor, hits],
   );
 
   const searchChromium = useCallback((nextQuery: string, forward: boolean, findNext: boolean) => {
@@ -301,18 +422,17 @@ export function FindInPageBar(): React.ReactElement | null {
   // Only a transcript that actually answers Find may jump the reader: a
   // focused terminal pane outranks it, and jumping behind the terminal's own
   // scroll would move text the reader is not looking at.
-  const jumpTargetId = usingTranscript ? (matches[activeMatchIndex]?.itemId ?? null) : null;
-  useEffect(() => {
-    if (visible && jumpTargetId) {
-      transcriptRef.current?.jumpToItem(jumpTargetId);
-    }
-  }, [jumpTargetId, visible]);
+  useJumpToActiveHit({
+    visible,
+    activeHit: usingTranscript ? (hits[activeMatchIndex] ?? null) : null,
+    transcriptRef,
+  });
 
   useTranscriptHighlights({
     visible,
     owned: usingTranscript,
     query,
-    matches,
+    hits,
     activeMatchIndex,
   });
 
@@ -325,17 +445,17 @@ export function FindInPageBar(): React.ReactElement | null {
       if (transcript) {
         const next = stepMatchIndex({
           current: activeMatchIndex,
-          total: matches.length,
+          total: hits.length,
           forward,
         });
         // The jump belongs to the effect above, which owns it for every route
         // into a new match — typing, stepping, or the menu's Find Next.
-        setAnchor(matches[next] ?? null);
+        setAnchor(hits[next] ?? null);
         return;
       }
       searchChromium(query, forward, true);
     },
-    [activeMatchIndex, matches, query, searchChromium, terminal, transcript, usingTerminal],
+    [activeMatchIndex, hits, query, searchChromium, terminal, transcript, usingTerminal],
   );
 
   const onNext = useCallback(() => step(true), [step]);
@@ -417,24 +537,19 @@ export function FindInPageBar(): React.ReactElement | null {
   // Find may search, and "No matches" there would be a claim about text
   // nobody read.
   const searchable = usingTerminal || usingTranscript || chromiumSearchable === true;
-  let total = 0;
-  let current = 0;
-  let truncated = false;
+  let counts: FindCounts = NO_COUNTS;
   if (usingTerminal) {
-    total = terminalResult?.resultCount ?? 0;
-    current =
-      terminalResult && terminalResult.resultIndex >= 0 ? terminalResult.resultIndex + 1 : 0;
-    // The addon reports index -1 once its highlight limit is exceeded: the
-    // count is then a floor, and the bar says so instead of pinning it.
-    truncated = total > 0 && (terminalResult?.resultIndex ?? -1) < 0;
+    counts = terminalCounts(terminalResult);
   } else if (usingTranscript) {
-    total = matches.length;
-    current = activeMatchIndex + 1;
-    truncated = truncatedMatches;
+    counts = { total: hits.length, current: activeMatchIndex + 1, truncated: truncatedMatches };
   } else if (searchable) {
-    total = chromiumResult.matches;
-    current = chromiumResult.activeMatchOrdinal;
+    counts = {
+      total: chromiumResult.matches,
+      current: chromiumResult.activeMatchOrdinal,
+      truncated: false,
+    };
   }
+  const { total, current, truncated } = counts;
   const status = formatStatus({
     current,
     total,

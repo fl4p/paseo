@@ -72,7 +72,7 @@ import { type StreamSegmentRenderers, type StreamViewportHandle } from "./strate
 import { ChatOutlineRail } from "@/agent-stream/chat-outline/rail";
 import { useChatOutline } from "@/agent-stream/chat-outline/use-chat-outline";
 import { getHostRuntimeStore } from "@/runtime/host-runtime";
-import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
+import { planTimelinePromptJump, planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
 import {
   CompletedTurnFooterRow,
   TurnFooter,
@@ -101,7 +101,8 @@ import {
 } from "@/workspace/file-open";
 import { navigateToWorkspace } from "@/stores/navigation-active-workspace-store";
 import { useStableEvent } from "@/hooks/use-stable-event";
-import { useTranscriptFindStore } from "@/agent-stream/find/store";
+import type { HistorySearchResult } from "@/agent-stream/find/model";
+import { useTranscriptFindStore, type TranscriptHistorySearch } from "@/agent-stream/find/store";
 import { useForkAgent } from "@/hooks/use-fork-agent";
 import { resolveForkMode, resolveForkTargetCwd } from "@/hooks/fork-mode";
 import { ForkModeProvider } from "@/contexts/fork-mode-context";
@@ -344,6 +345,25 @@ function canShowChatOutline(
   return session.agents.has(agentId) || session.agentDetails.has(agentId);
 }
 
+/**
+ * Whether Find may ask the daemon about this pane's whole timeline. The same two conditions as
+ * `canShowChatOutline`, for the same reason: a placeholder pane id is a failed request, not an
+ * empty answer.
+ */
+function canSearchTimelineHistory(
+  session:
+    | {
+        agents: Map<string, unknown>;
+        agentDetails: Map<string, unknown>;
+        serverInfo?: { features?: { timelineSearch?: boolean } } | null;
+      }
+    | undefined,
+  agentId: string,
+): boolean {
+  if (session?.serverInfo?.features?.timelineSearch !== true) return false;
+  return session.agents.has(agentId) || session.agentDetails.has(agentId);
+}
+
 const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamViewProps>(
   function AgentStreamView(
     {
@@ -434,6 +454,9 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
      */
     const supportsChatOutline = useSessionStore((state) =>
       canShowChatOutline(state.sessions[resolvedServerId], agentId),
+    );
+    const supportsHistoryFind = useSessionStore((state) =>
+      canSearchTimelineHistory(state.sessions[resolvedServerId], agentId),
     );
     const timelineEpoch = useSessionStore(
       (state) => state.sessions[resolvedServerId]?.agentTimelineCursor.get(agentId)?.epoch ?? null,
@@ -704,6 +727,42 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
       () => [...effectiveStreamItems, ...(effectiveStreamHead ?? [])],
       [effectiveStreamHead, effectiveStreamItems],
     );
+    // Most of a long conversation is history the transcript has not loaded. Find
+    // asks the daemon for hits across the whole timeline, and loads the window
+    // around one when the reader steps onto it — the Chat outline's prompt jump.
+    const searchFindHistory = useStableEvent(
+      async (query: string): Promise<HistorySearchResult> => {
+        const hostClient = getHostRuntimeStore().getClient(resolvedServerId);
+        if (!hostClient) {
+          throw new Error("The host is not connected");
+        }
+        const payload = await hostClient.searchAgentTimeline(agentId, query);
+        return { epoch: payload.epoch, matches: payload.matches, truncated: payload.truncated };
+      },
+    );
+    const loadFindHistory = useStableEvent((seq: number) => {
+      if (timelineEpoch === null) {
+        return;
+      }
+      void getHostRuntimeStore()
+        .fetchAgentTimeline(
+          resolvedServerId,
+          agentId,
+          planTimelinePromptJump({ epoch: timelineEpoch, seq }),
+        )
+        .catch((error: unknown) => {
+          console.warn("Failed to load a Find window", error);
+          handleTimelineHistoryLoadError();
+        });
+    });
+    const findHistory = useMemo<TranscriptHistorySearch | null>(
+      () =>
+        supportsHistoryFind && timelineEpoch !== null
+          ? { epoch: timelineEpoch, search: searchFindHistory, load: loadFindHistory }
+          : null,
+      [loadFindHistory, searchFindHistory, supportsHistoryFind, timelineEpoch],
+    );
+
     // Only the panel the reader is looking at answers Find; a retained
     // background transcript would otherwise claim it by registering last.
     useEffect(() => {
@@ -711,9 +770,14 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         return;
       }
       const store = useTranscriptFindStore.getState();
-      store.setSource({ agentId, items: findableStreamItems, jumpToItem: jumpToStreamItem });
+      store.setSource({
+        agentId,
+        items: findableStreamItems,
+        jumpToItem: jumpToStreamItem,
+        history: findHistory,
+      });
       return () => store.clearSource(agentId);
-    }, [agentId, findableStreamItems, isActive, jumpToStreamItem]);
+    }, [agentId, findHistory, findableStreamItems, isActive, jumpToStreamItem]);
 
     useImperativeHandle(
       ref,

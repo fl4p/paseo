@@ -88,6 +88,7 @@ import {
 
 import { AgentManager, AgentRunCancellationError } from "./agent/agent-manager.js";
 import { buildTimelinePromptIndex } from "./agent/timeline-prompt-index.js";
+import { searchTimelineEntries } from "./agent/timeline-search.js";
 import { ProviderSnapshotManager } from "./agent/provider-snapshot-manager.js";
 import type {
   AgentManagerEvent,
@@ -2372,6 +2373,8 @@ export class Session {
         return this.handleAgentTimelineAppendRequest(msg);
       case "agent.timeline.list_prompts.request":
         return this.handleAgentTimelineListPromptsRequest(msg, source);
+      case "agent.timeline.search.request":
+        return this.handleAgentTimelineSearchRequest(msg, source);
       case "agent.provider_subagents.list.request":
         return this.handleProviderSubagentListRequest(msg);
       case "agent.provider_subagents.timeline.get.request":
@@ -7441,6 +7444,64 @@ export class Session {
             agentId: msg.agentId,
             epoch: "",
             prompts: [],
+            error: error instanceof Error ? error.message : String(error),
+          },
+        },
+        source,
+      );
+    }
+  }
+
+  private async handleAgentTimelineSearchRequest(
+    msg: Extract<SessionInboundMessage, { type: "agent.timeline.search.request" }>,
+    source?: object,
+  ): Promise<void> {
+    try {
+      await ensureAgentLoaded(msg.agentId, {
+        agentManager: this.agentManager,
+        agentStorage: this.agentStorage,
+        logger: this.sessionLogger,
+      });
+      const rows = await this.agentManager.getTimelineRows(msg.agentId);
+      const timeline = this.agentManager.fetchTimeline(msg.agentId, {
+        direction: "tail",
+        limit: 1,
+      });
+      // The same projected entries the app loads, filtered the same way, so every
+      // hit is a message this client can render and jump to.
+      const entries = projectTimelineRows({ rows, mode: "projected" }).filter((entry) =>
+        this.supportsTimelineItem(entry.item, source),
+      );
+      const result = searchTimelineEntries(entries, msg.query, msg.limit);
+      this.emitForSource(
+        {
+          type: "agent.timeline.search.response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            epoch: timeline.epoch,
+            query: msg.query,
+            ...result,
+            error: null,
+          },
+        },
+        source,
+      );
+    } catch (error) {
+      this.sessionLogger.error(
+        { err: error, agentId: msg.agentId },
+        "Failed to handle agent.timeline.search.request",
+      );
+      this.emitForSource(
+        {
+          type: "agent.timeline.search.response",
+          payload: {
+            requestId: msg.requestId,
+            agentId: msg.agentId,
+            epoch: "",
+            query: msg.query,
+            matches: [],
+            truncated: false,
             error: error instanceof Error ? error.message : String(error),
           },
         },

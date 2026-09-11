@@ -3,7 +3,8 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 import { i18n } from "@/i18n/i18next";
 import { FindInPageBar } from "./find-in-page-bar.electron";
-import { useTranscriptFindStore } from "@/agent-stream/find/store";
+import { useTranscriptFindStore, type TranscriptHistorySearch } from "@/agent-stream/find/store";
+import type { HistorySearchResult } from "@/agent-stream/find/model";
 import { useTerminalFindStore } from "@/terminal/find/store";
 import type { StreamItem } from "@/types/stream";
 import type { DesktopFindStartInput, DesktopFindStopAction } from "@/desktop/host";
@@ -62,25 +63,84 @@ function message(id: string, text: string): StreamItem {
   return { kind: "user_message", id, text, timestamp };
 }
 
-function installTranscript(items: StreamItem[]): string[] {
+function installTranscript(
+  items: StreamItem[],
+  history: TranscriptHistorySearch | null = null,
+): string[] {
   const jumps: string[] = [];
   useTranscriptFindStore.getState().setSource({
     agentId: "agent-1",
     items,
     jumpToItem: (itemId) => jumps.push(itemId),
+    history,
   });
   return jumps;
 }
 
 /** A live turn republishes the source object without changing the match. */
-function republishTranscript(items: StreamItem[], jumps: string[]): void {
+function republishTranscript(
+  items: StreamItem[],
+  jumps: string[],
+  history: TranscriptHistorySearch | null = null,
+): void {
   act(() =>
     useTranscriptFindStore.getState().setSource({
       agentId: "agent-1",
       items,
       jumpToItem: (itemId) => jumps.push(itemId),
+      history,
     }),
   );
+}
+
+/** A row the daemon has placed on the timeline. */
+function timelineMessage(id: string, text: string, seq: number): StreamItem {
+  return { ...message(id, text), timelineCursor: { epoch: "epoch-1", seq } };
+}
+
+interface FakeHistory {
+  source: TranscriptHistorySearch;
+  searches: string[];
+  loads: number[];
+  /** Resolves the oldest search still waiting for the daemon. */
+  answer: (result: Partial<HistorySearchResult>) => Promise<void>;
+}
+
+/** The daemon's side of Find, answering when the test says so. */
+function fakeHistory(): FakeHistory {
+  const waiting: Array<(result: HistorySearchResult) => void> = [];
+  const fake: FakeHistory = {
+    searches: [],
+    loads: [],
+    source: {
+      epoch: "epoch-1",
+      search: (query) => {
+        fake.searches.push(query);
+        return new Promise((resolve) => waiting.push(resolve));
+      },
+      load: (seq) => {
+        fake.loads.push(seq);
+      },
+    },
+    answer: async (result) => {
+      const resolve = waiting.shift();
+      if (!resolve) {
+        throw new Error("No history search is waiting for an answer");
+      }
+      await act(async () => {
+        resolve({ epoch: "epoch-1", matches: [], truncated: false, ...result });
+        await Promise.resolve();
+      });
+    },
+  };
+  return fake;
+}
+
+/** Lets the bar's pause before a history search run out. */
+async function waitForHistorySearch(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => window.setTimeout(resolve, 200));
+  });
 }
 
 interface FakeTerminalSource {
@@ -397,6 +457,136 @@ describe("FindInPageBar with a transcript", () => {
 
     expect(statusText(container)).toBe(i18n.t("paneFind.noMatches"));
     expect(host.startCalls).toEqual([]);
+  });
+});
+
+describe("FindInPageBar with timeline history the transcript has not loaded", () => {
+  it("counts the daemon's hits in unloaded history alongside the loaded ones", async () => {
+    const host = installFakeHost();
+    const history = fakeHistory();
+    const jumps = installTranscript([timelineMessage("recent", "the widget", 50)], history.source);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    // The loaded row answers at once, before the daemon has been asked.
+    expect(statusText(container)).toBe("1 of 1");
+    expect(history.searches).toEqual([]);
+
+    await waitForHistorySearch();
+    expect(history.searches).toEqual(["widget"]);
+    await history.answer({
+      matches: [
+        { seqStart: 3, seqEnd: 3, occurrence: 0 },
+        // The loaded row's own hit, which the loaded row already counts.
+        { seqStart: 50, seqEnd: 50, occurrence: 0 },
+      ],
+    });
+
+    // The older hit comes first; the reader stays on the hit they were shown.
+    expect(statusText(container)).toBe("2 of 2");
+    expect(jumps).toEqual(["recent"]);
+    expect(history.loads).toEqual([]);
+  });
+
+  it("loads the window around an unloaded hit when the reader steps onto it", async () => {
+    const host = installFakeHost();
+    const history = fakeHistory();
+    const recent = timelineMessage("recent", "the widget", 50);
+    const jumps = installTranscript([recent], history.source);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    await waitForHistorySearch();
+    await history.answer({
+      matches: [
+        { seqStart: 2, seqEnd: 3, occurrence: 1 },
+        { seqStart: 50, seqEnd: 50, occurrence: 0 },
+      ],
+    });
+
+    pressButton(container, i18n.t("paneFind.previous"));
+    expect(statusText(container)).toBe("1 of 2");
+    expect(history.loads).toEqual([3]);
+    expect(jumps).toEqual(["recent"]);
+
+    // The window arrives: the history hit is now the second hit in a loaded row.
+    republishTranscript(
+      [timelineMessage("old", "a widget, then another widget", 3), recent],
+      jumps,
+      history.source,
+    );
+
+    expect(statusText(container)).toBe("2 of 3");
+    expect(jumps).toEqual(["recent", "old"]);
+    expect(history.loads).toEqual([3]);
+  });
+
+  it("drops the daemon's answer for a query the reader has since changed", async () => {
+    const host = installFakeHost();
+    const history = fakeHistory();
+    installTranscript([timelineMessage("recent", "the widget", 50)], history.source);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    const input = findInput(container);
+    type(input, "widget");
+    await waitForHistorySearch();
+    type(input, "widgets");
+
+    // An answer that arrives after the query moved on.
+    await history.answer({ matches: [{ seqStart: 3, seqEnd: 3, occurrence: 0 }] });
+    expect(statusText(container)).toBe(i18n.t("paneFind.noMatches"));
+
+    // An answer that arrived in time, then outlived its query.
+    type(input, "widget");
+    await waitForHistorySearch();
+    await history.answer({ matches: [{ seqStart: 3, seqEnd: 3, occurrence: 0 }] });
+    expect(statusText(container)).toBe("2 of 2");
+    type(input, "widgets");
+    expect(statusText(container)).toBe(i18n.t("paneFind.noMatches"));
+
+    expect(history.loads).toEqual([]);
+  });
+
+  it("drops an answer about a timeline the transcript no longer shows", async () => {
+    const host = installFakeHost();
+    const history = fakeHistory();
+    installTranscript([timelineMessage("recent", "the widget", 50)], history.source);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    await waitForHistorySearch();
+    await history.answer({
+      epoch: "epoch-0",
+      matches: [{ seqStart: 3, seqEnd: 3, occurrence: 0 }],
+    });
+
+    expect(statusText(container)).toBe("1 of 1");
+  });
+
+  it("marks the count as a floor when the daemon capped its scan", async () => {
+    const host = installFakeHost();
+    const history = fakeHistory();
+    installTranscript([timelineMessage("recent", "the widget", 50)], history.source);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    type(findInput(container), "widget");
+    await waitForHistorySearch();
+    await history.answer({
+      matches: [{ seqStart: 3, seqEnd: 3, occurrence: 0 }],
+      truncated: true,
+    });
+
+    expect(statusText(container)).toBe("2 of 2+");
   });
 });
 
