@@ -11,6 +11,13 @@ import {
   type TranscriptSearchResult,
 } from "@/agent-stream/find/model";
 import { useTranscriptFindStore } from "@/agent-stream/find/store";
+import {
+  afterRowSettles,
+  applyTranscriptHighlights,
+  clearTranscriptHighlights,
+  revealRange,
+  type ActiveTranscriptHit,
+} from "@/agent-stream/find/highlight";
 import { getDesktopHost, type DesktopFindResult } from "@/desktop/host";
 import { listenToDesktopEvent } from "@/desktop/electron/events";
 
@@ -21,6 +28,9 @@ const EMPTY_RESULT: DesktopFindResult = {
 };
 
 const NO_TRANSCRIPT_RESULT: TranscriptSearchResult = { matches: [], truncated: false };
+
+/** A live turn mutates the DOM every few dozen milliseconds; repaint at most this often. */
+const HIGHLIGHT_REFRESH_MS = 150;
 
 function isFindResult(value: unknown): value is DesktopFindResult {
   if (typeof value !== "object" || value === null) {
@@ -60,6 +70,94 @@ function useDesktopEvent(event: string, handler: (payload: unknown) => void): vo
       unlisten?.();
     };
   }, [event]);
+}
+
+/** The active hit is the n-th hit in its row, counted the same way in the model and the DOM. */
+function activeHitFor(
+  matches: readonly TranscriptMatch[],
+  activeMatchIndex: number,
+): ActiveTranscriptHit | null {
+  const match = matches[activeMatchIndex];
+  if (!match) {
+    return null;
+  }
+  let occurrence = 0;
+  for (let index = 0; index < activeMatchIndex; index += 1) {
+    if (matches[index]?.itemId === match.itemId) {
+      occurrence += 1;
+    }
+  }
+  return { itemId: match.itemId, occurrence };
+}
+
+/**
+ * Chromium's find painted its matches; the transcript search paints its own
+ * (see agent-stream/find/highlight.web.ts). Kept out of FindInPageBar so the bar
+ * stays a router between backends.
+ */
+function useTranscriptHighlights(input: {
+  enabled: boolean;
+  query: string;
+  matches: readonly TranscriptMatch[];
+  activeMatchIndex: number;
+}): void {
+  const { enabled, query, matches, activeMatchIndex } = input;
+  const activeHit = useMemo(
+    () => activeHitFor(matches, activeMatchIndex),
+    [activeMatchIndex, matches],
+  );
+  const activeHitRef = useRef(activeHit);
+  activeHitRef.current = activeHit;
+  const highlightQuery = enabled ? query : "";
+
+  useEffect(() => {
+    if (highlightQuery.length === 0) {
+      clearTranscriptHighlights();
+      return;
+    }
+    let pending: number | null = null;
+    let lastPaint = 0;
+    const paint = () => {
+      pending = null;
+      lastPaint = Date.now();
+      applyTranscriptHighlights({ query: highlightQuery, active: activeHitRef.current });
+    };
+    paint();
+    // Rows mount as the transcript scrolls, and grow while a turn streams.
+    const observer = new MutationObserver(() => {
+      if (pending !== null) {
+        return;
+      }
+      pending = window.setTimeout(
+        paint,
+        Math.max(0, HIGHLIGHT_REFRESH_MS - (Date.now() - lastPaint)),
+      );
+    });
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    return () => {
+      observer.disconnect();
+      if (pending !== null) {
+        window.clearTimeout(pending);
+      }
+      clearTranscriptHighlights();
+    };
+  }, [highlightQuery]);
+
+  // Reveal the exact hit once the jump has settled: a long message can put it far
+  // below the row top the transcript scrolls to.
+  const activeHitKey = activeHit ? `${activeHit.itemId}#${activeHit.occurrence}` : null;
+  useEffect(() => {
+    const hit = activeHitRef.current;
+    if (highlightQuery.length === 0 || !hit || activeHitKey === null) {
+      return;
+    }
+    return afterRowSettles(hit.itemId, () => {
+      const { activeRange } = applyTranscriptHighlights({ query: highlightQuery, active: hit });
+      if (activeRange) {
+        revealRange(activeRange);
+      }
+    });
+  }, [activeHitKey, highlightQuery]);
 }
 
 function formatStatus(input: {
@@ -173,6 +271,13 @@ export function FindInPageBar(): React.ReactElement | null {
       transcriptRef.current?.jumpToItem(jumpTargetId);
     }
   }, [jumpTargetId, visible]);
+
+  useTranscriptHighlights({
+    enabled: visible && transcript !== null,
+    query,
+    matches,
+    activeMatchIndex,
+  });
 
   const step = useCallback(
     (forward: boolean) => {

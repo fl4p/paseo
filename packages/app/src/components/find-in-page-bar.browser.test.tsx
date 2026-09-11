@@ -211,6 +211,33 @@ describe("FindInPageBar with nothing searchable", () => {
   });
 });
 
+describe("FindInPageBar highlighting", () => {
+  it("paints the hits in mounted transcript rows and clears them on close", async () => {
+    const host = installFakeHost();
+    installTranscript([message("a", "widget and widget"), message("b", "no match here")]);
+    const rows = document.createElement("div");
+    rows.innerHTML =
+      '<div data-history-row-id="a">widget and widget</div>' +
+      '<div data-history-row-id="b">no match here</div>';
+    document.body.appendChild(rows);
+    const container = mountBar();
+    await settle();
+    act(() => host.emit("find-open", {}));
+
+    const input = findInput(container);
+    type(input, "widget");
+
+    expect(CSS.highlights.get("paseo-find")?.size).toBe(2);
+    expect(CSS.highlights.get("paseo-find-active")?.size).toBe(1);
+
+    pressKey(input, "Escape");
+
+    expect(CSS.highlights.has("paseo-find")).toBe(false);
+    expect(CSS.highlights.has("paseo-find-active")).toBe(false);
+    rows.remove();
+  });
+});
+
 describe("FindInPageBar with a transcript", () => {
   it("finds text in a row the DOM never mounted", async () => {
     const host = installFakeHost();
