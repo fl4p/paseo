@@ -95,6 +95,13 @@ import { createTestLogger } from "../../../test-utils/test-logger.js";
 import { asInternals as castInternals, createStub } from "../../test-utils/class-mocks.js";
 import { buildProviderRegistry } from "../provider-registry.js";
 
+function requestParams(appServer: FakeCodexAppServer, method: string): unknown[] {
+  return appServer
+    .requests()
+    .filter((request) => request.method === method)
+    .map((request) => request.params);
+}
+
 interface CollaborationModeRecord {
   name: string;
   mode?: string | null;
@@ -1672,9 +1679,22 @@ describe("Codex app-server provider", () => {
 
     await session.revertConversation({ messageId: "codex-first" });
 
-    expect(appServer.recordedRollbacks).toEqual([{ threadId: "forked-thread", numTurns: 2 }]);
-    await expect(session.getRuntimeInfo()).resolves.toMatchObject({
-      sessionId: "forked-thread",
+    expect(requestParams(appServer, "thread/fork")).toEqual([
+      {
+        threadId: "thread-1",
+        cwd: "/workspace/project",
+        model: "gpt-5.4",
+        serviceTier: null,
+        excludeTurns: true,
+        persistExtendedHistory: true,
+      },
+    ]);
+    expect(requestParams(appServer, "thread/unsubscribe")).toEqual([{ threadId: "forked-thread" }]);
+    expect(appServer.recordedRollbacks).toEqual([{ threadId: "thread-1", numTurns: 2 }]);
+    await expect(session.getRuntimeInfo()).resolves.toMatchObject({ sessionId: "thread-1" });
+    expect(session.describePersistence()).toMatchObject({
+      sessionId: "thread-1",
+      nativeHandle: "thread-1",
     });
     appServer.assertNoErrors();
     await session.close();
@@ -1713,24 +1733,25 @@ describe("Codex app-server provider", () => {
 
     await session.revertConversation({ messageId: "codex-first" });
 
-    const forkRequests = appServer
-      .requests()
-      .filter((request) => request.method === "thread/fork")
-      .map((request) => request.params);
-    expect(forkRequests).toEqual([
+    expect(requestParams(appServer, "thread/fork")).toEqual([
       {
         threadId: "thread-1",
-        beforeTurnId: "turn-first",
         cwd: "/workspace/project",
         model: "gpt-5.4",
         serviceTier: null,
-        excludeTurns: false,
+        excludeTurns: true,
         persistExtendedHistory: true,
       },
     ]);
+    expect(requestParams(appServer, "thread/unsubscribe")).toEqual([{ threadId: "forked-thread" }]);
+    expect(requestParams(appServer, "thread/revert")).toEqual([
+      { threadId: "thread-1", beforeTurnId: "turn-first" },
+    ]);
     expect(appServer.recordedRollbacks).toEqual([]);
-    await expect(session.getRuntimeInfo()).resolves.toMatchObject({
-      sessionId: "forked-thread",
+    await expect(session.getRuntimeInfo()).resolves.toMatchObject({ sessionId: "thread-1" });
+    expect(session.describePersistence()).toMatchObject({
+      sessionId: "thread-1",
+      nativeHandle: "thread-1",
     });
     appServer.assertNoErrors();
     await session.close();

@@ -95,6 +95,8 @@ A steering adapter also owes its interrupt: stopping a turn must discard the ste
 
 Rewind accepts the canonical wire `messageId` and resolves it to the provider identity before calling the adapter. A submitted prompt cannot be rewound until its provider echo supplies that identity.
 
+Codex rewinds a conversation in place, so the agent keeps its thread id. Codex sends the thread's session id as the OpenAI `prompt_cache_key`, and a fork gets a new one: moving the agent to a rewound fork makes the first turn after rewind miss the cache for the whole kept prefix. The adapter first forks the untouched thread as a backup (`codex resume <backup-id>`; the id is logged at rewind), then calls `thread/revert` on paginated threads or `thread/rollback` on legacy threads.
+
 Submitted user-message wire items carry the same Paseo ID in `messageId` and `clientMessageId`. Provider adapters attach `clientMessageId` only to the echo for that foreground submission; provider history and externally initiated user rows do not have a Paseo client ID.
 
 Provider adapters must terminalize every transient timeline row before emitting the turn's terminal event. Codex may omit the completed `contextCompaction` item when a turn ends during compaction, so its adapter closes any pending root compaction before forwarding `turn_completed`, `turn_failed`, or `turn_canceled`. A terminal turn must never leave the client showing an operation as still loading.
