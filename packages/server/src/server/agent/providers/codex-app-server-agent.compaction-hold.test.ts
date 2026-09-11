@@ -289,3 +289,46 @@ test("/compact armed during a running turn stays manual when that older turn end
     await scenario.cleanup();
   }
 });
+
+test("two /compacts armed before either turn starts are both labeled manual", async () => {
+  const scenario = await startCodexScenario();
+  try {
+    const first = await startAgentRun(scenario.manager, scenario.agentId, "/compact", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "interrupt",
+    });
+    expect(first.disposition).toBe("out_of_band");
+    await expect.poll(() => scenario.requests("thread/compact/start").length).toBe(1);
+    // A second /compact is accepted before the first compaction's turn has even started, so both
+    // arms carry the same turn ordinal. Out-of-band commands are never held.
+    const second = await startAgentRun(scenario.manager, scenario.agentId, "/compact", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "interrupt",
+    });
+    expect(second.disposition).toBe("out_of_band");
+    await expect.poll(() => scenario.requests("thread/compact/start").length).toBe(2);
+
+    scenario.appServer.startsTurn({ threadId: THREAD_ID, turnId: "compact-turn-1" });
+    scenario.appServer.startsCompaction({ threadId: THREAD_ID, itemId: "compact-item-1" });
+    scenario.appServer.completesCompaction({ threadId: THREAD_ID, itemId: "compact-item-1" });
+    scenario.appServer.completeTurn({ threadId: THREAD_ID });
+    await expect.poll(() => scenario.compactions().length).toBe(2);
+
+    scenario.appServer.startsTurn({ threadId: THREAD_ID, turnId: "compact-turn-2" });
+    scenario.appServer.startsCompaction({ threadId: THREAD_ID, itemId: "compact-item-2" });
+    scenario.appServer.completesCompaction({ threadId: THREAD_ID, itemId: "compact-item-2" });
+    scenario.appServer.completeTurn({ threadId: THREAD_ID });
+    await expect.poll(() => scenario.compactions().length).toBe(4);
+
+    // The first turn's end must not clear the arm belonging to the second /compact.
+    expect(scenario.compactions()).toEqual([
+      { type: "compaction", status: "loading", trigger: "manual" },
+      { type: "compaction", status: "completed", trigger: "manual" },
+      { type: "compaction", status: "loading", trigger: "manual" },
+      { type: "compaction", status: "completed", trigger: "manual" },
+    ]);
+    scenario.appServer.assertNoErrors();
+  } finally {
+    await scenario.cleanup();
+  }
+});

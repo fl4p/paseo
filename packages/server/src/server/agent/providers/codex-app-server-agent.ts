@@ -3364,11 +3364,17 @@ export class CodexAppServerAgentSession implements AgentSession {
   private readonly userMessageTurnIndexes = new Map<string, number>();
   private readonly userMessageTurnIds: string[] = [];
   private readonly userMessageProviderTurnIds = new Map<string, string>();
-  private pendingManualCompactionStarts = 0;
+  /**
+   * One entry per `/compact` accepted and not yet consumed, holding the `rootTurnStartOrdinal`
+   * that was current when it was armed. Per-arm, not a count plus one scalar: two `/compact`s
+   * accepted before either turn starts share an ordinal, and one turn end must not speak for
+   * both of them.
+   */
+  private readonly manualCompactionArms: number[] = [];
   /** Counts root `turn/started` notifications; orders manual compaction arms against turns. */
   private rootTurnStartOrdinal = 0;
-  /** `rootTurnStartOrdinal` when `/compact` last armed `pendingManualCompactionStarts`. */
-  private manualCompactionArmedAtTurnOrdinal = 0;
+  /** Whether the root turn now running already claimed one of `manualCompactionArms`. */
+  private currentTurnConsumedManualCompactionArm = false;
   private compactionTriggerByItemId = new Map<string, "auto" | "manual">();
   private pendingRootCompactionItemIds = new Set<string>();
   private pendingAnonymousRootCompactions = 0;
@@ -3559,7 +3565,8 @@ export class CodexAppServerAgentSession implements AgentSession {
     const hasActiveRootTurn = this.activeForegroundTurnId !== null || this.currentTurnId !== null;
     this.clearPendingPermissions({ preservePlanApprovals: !hasActiveRootTurn });
     // A dead app-server finishes no compaction, and delivers no item to consume a manual arm.
-    this.pendingManualCompactionStarts = 0;
+    this.manualCompactionArms.length = 0;
+    this.currentTurnConsumedManualCompactionArm = false;
     if (hasActiveRootTurn) {
       this.completePendingRootCompactions("failed");
       this.emitEvent({
@@ -4961,14 +4968,15 @@ export class CodexAppServerAgentSession implements AgentSession {
       if (!this.client || !this.currentThreadId) {
         throw new Error("Codex thread is not available");
       }
-      this.pendingManualCompactionStarts += 1;
-      this.manualCompactionArmedAtTurnOrdinal = this.rootTurnStartOrdinal;
+      const arm = this.rootTurnStartOrdinal;
+      this.manualCompactionArms.push(arm);
       try {
         await this.client.request("thread/compact/start", {
           threadId: this.currentThreadId,
         });
       } catch (error) {
-        this.pendingManualCompactionStarts = Math.max(0, this.pendingManualCompactionStarts - 1);
+        const index = this.manualCompactionArms.lastIndexOf(arm);
+        if (index >= 0) this.manualCompactionArms.splice(index, 1);
         throw error;
       }
       return null;
@@ -5922,6 +5930,7 @@ export class CodexAppServerAgentSession implements AgentSession {
     }
     this.currentTurnId = parsed.turnId;
     this.rootTurnStartOrdinal += 1;
+    this.currentTurnConsumedManualCompactionArm = false;
     const pendingIdentification = this.pendingForegroundTurnIdentification;
     if (
       pendingIdentification &&
@@ -5991,11 +6000,18 @@ export class CodexAppServerAgentSession implements AgentSession {
    * turn, so only its end drops the count.
    */
   private dropManualCompactionStartsOutlivedByTurn(): void {
-    if (
-      this.pendingManualCompactionStarts > 0 &&
-      this.rootTurnStartOrdinal > this.manualCompactionArmedAtTurnOrdinal
-    ) {
-      this.pendingManualCompactionStarts = 0;
+    // The turn that just ended already claimed its arm, so nothing here is stale because of it.
+    if (this.currentTurnConsumedManualCompactionArm) {
+      this.currentTurnConsumedManualCompactionArm = false;
+      return;
+    }
+    // Drop exactly ONE arm — the oldest that a later turn could have been. Zeroing the list would
+    // also unlabel the `/compact`s whose own turns have not started yet.
+    const index = this.manualCompactionArms.findIndex(
+      (armedAt) => this.rootTurnStartOrdinal > armedAt,
+    );
+    if (index >= 0) {
+      this.manualCompactionArms.splice(index, 1);
     }
   }
 
@@ -6066,8 +6082,9 @@ export class CodexAppServerAgentSession implements AgentSession {
         return known;
       }
     }
-    if (this.pendingManualCompactionStarts > 0) {
-      this.pendingManualCompactionStarts -= 1;
+    if (this.manualCompactionArms.length > 0) {
+      this.manualCompactionArms.shift();
+      this.currentTurnConsumedManualCompactionArm = true;
       return "manual";
     }
     return undefined;
