@@ -46,6 +46,7 @@ import { getDesktopHost } from "@/desktop/host";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
 import {
+  selectAgentQueueBusy,
   useSessionStore,
   type Agent,
   type WorkspaceDescriptor,
@@ -2181,6 +2182,9 @@ export class HostRuntimeStore {
     if (!client || !queue?.length || session.initializingAgents.get(agentId) === true) {
       return;
     }
+    // Every trigger (a turn ending, a compaction ending, a synced timeline) lands here, so this is
+    // the one place the queue waits: a queued message must never reach a running compaction.
+    if (selectAgentQueueBusy(session, agentId, "drain")) return;
     this.queuedAgentDrainInFlight.add(drainKey);
     const next = queue[0];
     void sendQueuedComposerMessageNow({

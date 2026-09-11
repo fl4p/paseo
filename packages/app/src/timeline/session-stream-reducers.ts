@@ -1,6 +1,10 @@
 import type { AgentTimelineItem } from "@getpaseo/protocol/agent-types";
 import type { AgentStreamEventPayload } from "@getpaseo/protocol/messages";
-import { selectAgentTimelineState, useSessionStore } from "@/stores/session-store";
+import {
+  selectAgentCompactionInProgress,
+  selectAgentTimelineState,
+  useSessionStore,
+} from "@/stores/session-store";
 import type { AssistantMessageItem, StreamItem, TodoEntry } from "@/types/stream";
 import type { TurnLivenessTransition } from "@/timeline/turn-liveness";
 import {
@@ -1857,6 +1861,11 @@ export interface CreateSessionAgentStreamReducerQueueInput {
   ) => void;
   recoverTimelineGap: (agentId: string, cursor: { epoch: string; endSeq: number }) => void;
   onCommitted?: (agentId: string) => void;
+  /**
+   * A commit ended the agent's compaction. An out-of-band compaction runs without a turn, so its
+   * end is not a turn end and nothing else tells the queue it may continue.
+   */
+  onCompactionSettled?: (agentId: string) => void;
 }
 
 interface ScheduledReducerFlush {
@@ -1910,8 +1919,16 @@ function cancelAgentStreamReducerFlush(id: number) {
 export function createSessionAgentStreamReducerQueue(
   input: CreateSessionAgentStreamReducerQueueInput,
 ): AgentStreamReducerQueue {
-  const { serverId, setAgentStreamState, setAgentTimelineCursor, recoverTimelineGap, onCommitted } =
-    input;
+  const {
+    serverId,
+    setAgentStreamState,
+    setAgentTimelineCursor,
+    recoverTimelineGap,
+    onCommitted,
+    onCompactionSettled,
+  } = input;
+  const readCompactionInProgress = (agentId: string) =>
+    selectAgentCompactionInProgress(useSessionStore.getState().sessions[serverId], agentId);
 
   return createAgentStreamReducerQueue({
     getSnapshot: (agentId) => {
@@ -1926,6 +1943,8 @@ export function createSessionAgentStreamReducerQueue(
       };
     },
     commit: (agentId, result, events) => {
+      // Read before this commit lands; the store still holds the previous timeline here.
+      const wasCompacting = onCompactionSettled ? readCompactionInProgress(agentId) : false;
       if (
         result.changedTail ||
         result.changedHead ||
@@ -1971,6 +1990,7 @@ export function createSessionAgentStreamReducerQueue(
         });
       }
       onCommitted?.(agentId);
+      if (wasCompacting && !readCompactionInProgress(agentId)) onCompactionSettled?.(agentId);
     },
     handleSideEffects: (agentId, sideEffects) => {
       for (const effect of sideEffects) {

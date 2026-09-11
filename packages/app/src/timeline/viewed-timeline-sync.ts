@@ -371,6 +371,7 @@ export function createViewedTimelineOwner(input: {
     setAgentTimelineCursor: (...args) => useSessionStore.getState().setAgentTimelineCursor(...args),
     recoverTimelineGap: (agentId, cursor) => sync.recoverGap(agentId, cursor),
     onCommitted: (agentId) => input.replica.timelineUpdated(agentId),
+    onCompactionSettled: input.drainQueuedAgentMessage,
   });
   return {
     ...sync,
