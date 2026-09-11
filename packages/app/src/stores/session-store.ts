@@ -59,6 +59,7 @@ import {
   type TurnLiveness,
   type TurnPresentation,
 } from "@/timeline/turn-liveness";
+import { resolveCompactionInProgress } from "@/timeline/compaction-progress";
 
 export interface AgentRuntimeInfo {
   provider: AgentProvider;
@@ -335,6 +336,58 @@ export function selectAgentTurnPresentation(
       TURN_LIVENESS_IDLE,
     getActiveMessageSubmissions(session?.messageSubmissions.get(agentId)).length > 0,
   );
+}
+
+function readAgentTurnLiveness(session: SessionState | undefined, agentId: string): TurnLiveness {
+  return (
+    session?.agents.get(agentId)?.turn ??
+    session?.agentDetails.get(agentId)?.turn ??
+    TURN_LIVENESS_IDLE
+  );
+}
+
+/**
+ * Whether the agent is compacting, as its timeline shows (see `resolveCompactionInProgress`). A
+ * timeline that has never been authoritatively synced cannot say, and reads as not compacting: the
+ * daemon still holds any prompt that reaches it mid-compaction, so a wrong "no" costs a held
+ * prompt, while a wrong "yes" would strand the queue with nothing left to wake it.
+ */
+export function selectAgentCompactionInProgress(
+  session: SessionState | undefined,
+  agentId: string,
+): boolean {
+  if (session?.agentAuthoritativeHistoryApplied.get(agentId) !== true) return false;
+  return resolveCompactionInProgress({
+    tail: session.agentStreamTail.get(agentId) ?? [],
+    head: session.agentStreamHead.get(agentId) ?? [],
+    turn: readAgentTurnLiveness(session, agentId),
+  });
+}
+
+/**
+ * Who asks whether the queue is busy.
+ * - `composer`: whether a message sent now should be queued instead. A submission still waiting
+ *   for its canonical row counts, as it always has for the composer.
+ * - `drain`: whether the queue may dispatch its next message. A pending submission does not
+ *   count: an agent outside the live stream window never observes its canonical row, so the
+ *   submission would stay pending and stall that agent's queue for good.
+ */
+export type AgentQueueBusyScope = "composer" | "drain";
+
+/**
+ * The single answer to "is this agent busy for the client message queue": a turn is running, or a
+ * compaction is (a compaction without a turn is still work a queued message must wait for).
+ */
+export function selectAgentQueueBusy(
+  session: SessionState | undefined,
+  agentId: string,
+  scope: AgentQueueBusyScope,
+): boolean {
+  const turnBusy =
+    scope === "composer"
+      ? selectAgentTurnPresentation(session, agentId).isActive
+      : readAgentTurnLiveness(session, agentId).phase === "open";
+  return turnBusy || selectAgentCompactionInProgress(session, agentId);
 }
 
 function latestTasksFromStream(items: readonly StreamItem[]): TodoEntry[] {

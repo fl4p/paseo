@@ -2974,6 +2974,269 @@ describe("HostRuntimeStore", () => {
     sessionStore.clearSession(host.serverId);
   });
 
+  describe("queued messages behind a compaction", () => {
+    const AGENT = "compacting-agent";
+    const EPOCH = "epoch-compaction";
+    const at = new Date("2026-09-11T10:00:00.000Z");
+    const settle = async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    };
+
+    async function setupCompactionQueue(serverId: string, queue: string[]) {
+      const host = makeHost({
+        serverId,
+        connections: [{ id: "direct:lan:6767", type: "directTcp", endpoint: "lan:6767" }],
+      });
+      const fakeClient = new FakeDaemonClient();
+      fakeClient.setConnectionState({ status: "connected" });
+      const entry = makeFetchAgentsEntry({
+        id: AGENT,
+        cwd: "/repo",
+        updatedAt: "2026-09-11T10:00:00.000Z",
+      });
+      const idleEntry = { ...entry, agent: { ...entry.agent, status: "idle" as const } };
+      fakeClient.fetchAgentsResponses.push(makeFetchAgentsPayload({ entries: [idleEntry] }));
+      const store = new HostRuntimeStore({
+        deps: {
+          createClient: () => fakeClient as unknown as DaemonClient,
+          connectToDaemon: async () => ({
+            client: fakeClient as unknown as DaemonClient,
+            serverId,
+            hostname: null,
+          }),
+          getClientId: async () => `cid_${serverId}`,
+        },
+      });
+      const sessionStore = useSessionStore.getState();
+      sessionStore.initializeSession(serverId, fakeClient as unknown as DaemonClient, 1);
+      sessionStore.updateSessionServerInfo(serverId, {
+        serverId,
+        hostname: null,
+        version: null,
+        features: { canonicalSubmittedPrompts: true },
+      });
+      sessionStore.setAgents(serverId, new Map([[AGENT, replicaAgent(idleEntry.agent, serverId)]]));
+      store.syncHosts([host]);
+      await waitForHostOnline(store, serverId);
+      await store.refreshAgentDirectory({ serverId });
+      useSessionStore.getState().applyAgentTimelineResponseState(serverId, AGENT, {
+        items: [
+          {
+            kind: "assistant_message",
+            id: "earlier",
+            text: "earlier work",
+            timestamp: at,
+            timelineCursor: { epoch: EPOCH, seq: 1 },
+          },
+        ],
+        head: [],
+        range: { epoch: EPOCH, startSeq: 1, endSeq: 1 },
+        older: "none",
+        newer: false,
+        synchronized: true,
+        acknowledgedClientMessageIds: [],
+      });
+      useSessionStore
+        .getState()
+        .setQueuedMessages(
+          serverId,
+          new Map([
+            [AGENT, queue.map((text, index) => ({ id: `queued-${index}`, text, attachments: [] }))],
+          ]),
+        );
+      const owner = store.createViewedTimelineOwner(serverId, {
+        observe: () => ({ ready: Promise.resolve(), release: async () => undefined }),
+        readCursor: () => undefined,
+        fetchPage: async () => ({ hasNewer: false, endCursor: null }),
+        fetchLatestTail: async () => ({ hasNewer: false, endCursor: null }),
+        reportError: () => undefined,
+        schedule: () => () => undefined,
+      });
+      let seq = 1;
+      const stream = (item: Record<string, unknown>, turnId?: string) => {
+        seq += 1;
+        owner.enqueueStreamEvent(AGENT, {
+          event: {
+            type: "timeline",
+            provider: "codex",
+            item,
+            ...(turnId ? { turnId } : {}),
+          } as never,
+          seq,
+          epoch: EPOCH,
+          timestamp: at,
+        });
+        owner.flushStreamAgent(AGENT);
+      };
+      const sentTexts = () => fakeClient.sentAgentMessages.map(([, text]) => text);
+      const waitForSent = (texts: string[]) => vi.waitFor(() => expect(sentTexts()).toEqual(texts));
+      const sentClientMessageId = (index: number) =>
+        fakeClient.sentAgentMessages[index]?.[2]?.messageId;
+      const queuedTexts = () =>
+        (useSessionStore.getState().sessions[serverId]?.queuedMessages.get(AGENT) ?? []).map(
+          (item) => item.text,
+        );
+      const cleanup = () => {
+        owner.dispose();
+        store.syncHosts([]);
+        useSessionStore.getState().clearSession(serverId);
+      };
+      return { store, stream, sentTexts, waitForSent, sentClientMessageId, queuedTexts, cleanup };
+    }
+
+    it("holds a queued message while a turn-less compaction runs and drains it once after", async () => {
+      const serverId = "srv_oob_compaction_queue";
+      const q = await setupCompactionQueue(serverId, ["after compaction"]);
+      q.stream({ type: "user_message", text: "/compact", clientMessageId: "sent-directly" });
+      q.stream({ type: "compaction", status: "loading", trigger: "manual" });
+
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await settle();
+      expect(q.sentTexts()).toEqual([]);
+      expect(q.queuedTexts()).toEqual(["after compaction"]);
+
+      q.stream({ type: "compaction", status: "completed", trigger: "manual" });
+      await q.waitForSent(["after compaction"]);
+
+      q.stream({ type: "assistant_message", text: "compacted summary" });
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await settle();
+      expect(q.sentTexts()).toEqual(["after compaction"]);
+      q.cleanup();
+    });
+
+    it("dispatches [A, /compact, B] in order and holds B until the compaction ends", async () => {
+      const serverId = "srv_ordered_compaction_queue";
+      const q = await setupCompactionQueue(serverId, ["A", "/compact", "B"]);
+
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await q.waitForSent(["A"]);
+      await settle();
+      q.store.applyAgentTurnLiveness(serverId, AGENT, {
+        type: "stream_open",
+        turn: { turnId: "turn-a", startedAt: at },
+      });
+      q.stream(
+        { type: "user_message", text: "A", clientMessageId: q.sentClientMessageId(0) },
+        "turn-a",
+      );
+      q.store.applyAgentTurnLiveness(serverId, AGENT, { type: "stream_close", turnId: "turn-a" });
+      await q.waitForSent(["A", "/compact"]);
+      // The /compact send RPC has settled: acknowledged, but nothing has compacted yet.
+      await settle();
+
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await settle();
+      expect(q.sentTexts()).toEqual(["A", "/compact"]);
+
+      q.stream({
+        type: "user_message",
+        text: "/compact",
+        clientMessageId: q.sentClientMessageId(1),
+      });
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await settle();
+      expect(q.sentTexts()).toEqual(["A", "/compact"]);
+
+      q.stream({ type: "compaction", status: "loading", trigger: "manual" });
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await settle();
+      expect(q.sentTexts()).toEqual(["A", "/compact"]);
+      expect(q.queuedTexts()).toEqual(["B"]);
+
+      q.stream({ type: "compaction", status: "completed", trigger: "manual" });
+      await q.waitForSent(["A", "/compact", "B"]);
+      q.cleanup();
+    });
+
+    it.each(["canceled", "failed"] as const)(
+      "resumes the queue after a compaction that ended %s",
+      async (outcome) => {
+        const serverId = `srv_compaction_${outcome}_queue`;
+        const q = await setupCompactionQueue(serverId, ["next"]);
+        q.stream({ type: "user_message", text: "/compact", clientMessageId: "sent-directly" });
+        q.stream({ type: "compaction", status: "loading", trigger: "manual" });
+        q.store.drainQueuedAgentMessage(serverId, AGENT);
+        await settle();
+        expect(q.sentTexts()).toEqual([]);
+
+        q.stream({ type: "compaction", status: "completed", trigger: "manual", outcome });
+        await q.waitForSent(["next"]);
+        q.cleanup();
+      },
+    );
+
+    it("waits for a Claude-shaped /compact turn to end before draining", async () => {
+      const serverId = "srv_turn_compaction_queue";
+      const q = await setupCompactionQueue(serverId, ["/compact", "B"]);
+
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await q.waitForSent(["/compact"]);
+      await settle();
+      q.store.applyAgentTurnLiveness(serverId, AGENT, {
+        type: "stream_open",
+        turn: { turnId: "turn-c", startedAt: at },
+      });
+      q.stream(
+        { type: "user_message", text: "/compact", clientMessageId: q.sentClientMessageId(0) },
+        "turn-c",
+      );
+      q.stream({ type: "compaction", status: "loading", trigger: "manual" }, "turn-c");
+      q.store.drainQueuedAgentMessage(serverId, AGENT);
+      await settle();
+      expect(q.sentTexts()).toEqual(["/compact"]);
+
+      q.stream({ type: "compaction", status: "completed", trigger: "manual" }, "turn-c");
+      await settle();
+      expect(q.sentTexts()).toEqual(["/compact"]);
+
+      q.store.applyAgentTurnLiveness(serverId, AGENT, { type: "stream_close", turnId: "turn-c" });
+      await q.waitForSent(["/compact", "B"]);
+      q.cleanup();
+    });
+
+    it.each([
+      { name: "a turn-bound marker", markerTurnId: "turn-c" },
+      { name: "a marker without a turn id", markerTurnId: undefined },
+    ])(
+      "drains once when the turn end and the compaction end arrive back to back ($name)",
+      async ({ markerTurnId }) => {
+        const serverId = `srv_back_to_back_${markerTurnId ?? "compat"}`;
+        const q = await setupCompactionQueue(serverId, ["/compact", "B", "C"]);
+
+        q.store.drainQueuedAgentMessage(serverId, AGENT);
+        await q.waitForSent(["/compact"]);
+        await settle();
+        q.store.applyAgentTurnLiveness(serverId, AGENT, {
+          type: "stream_open",
+          turn: { turnId: "turn-c", startedAt: at },
+        });
+        q.stream(
+          { type: "user_message", text: "/compact", clientMessageId: q.sentClientMessageId(0) },
+          "turn-c",
+        );
+        q.stream({ type: "compaction", status: "loading", trigger: "manual" }, markerTurnId);
+
+        q.store.applyAgentTurnLiveness(serverId, AGENT, { type: "stream_close", turnId: "turn-c" });
+        q.stream({ type: "compaction", status: "completed", trigger: "manual" }, markerTurnId);
+        await q.waitForSent(["/compact", "B"]);
+        await settle();
+
+        expect(q.sentTexts()).toEqual(["/compact", "B"]);
+        expect(q.queuedTexts()).toEqual(["C"]);
+
+        // B's send has settled, so only the trigger itself can hold C back now: a compaction
+        // that already ended must not release the queue again on every later commit.
+        q.stream({ type: "assistant_message", text: "answer to B" });
+        await settle();
+        expect(q.sentTexts()).toEqual(["/compact", "B"]);
+        expect(q.queuedTexts()).toEqual(["C"]);
+        q.cleanup();
+      },
+    );
+  });
+
   it("applies buffered stale side effects from the accepted page agent", async () => {
     const host = makeHost({
       serverId: "srv_buffered_stale_side_effects",
