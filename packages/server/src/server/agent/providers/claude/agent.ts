@@ -44,7 +44,7 @@ import {
 } from "./model-manifest.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
-import { readClaudePeerMessage } from "./peer-message.js";
+import { type ClaudePeerMessage, readClaudePeerMessage } from "./peer-message.js";
 import { ClaudeTaskState } from "./task-state.js";
 import {
   ClaudeTaskProtocolSource,
@@ -4339,6 +4339,7 @@ class ClaudeAgentSession implements AgentSession {
         this.appendStreamEventEvents(message, events, options);
         break;
       case "result":
+        this.appendPeerMessageFromResult(message, events);
         this.appendResultEvents(message, events);
         break;
       default:
@@ -4602,6 +4603,50 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  /**
+   * The turn a peer's message started ends with the only live frame that carries it, so the message
+   * is emitted from the result — before the result's own events, and after the reply it caused. Out
+   * of order, but present; a history reload replays it into its real place, and the shared delivery
+   * id keeps that from becoming a second copy.
+   */
+  private appendPeerMessageFromResult(
+    message: Extract<SDKMessage, { type: "result" }>,
+    events: AgentStreamEvent[],
+  ): void {
+    const peerMessage = readClaudePeerMessage(message);
+    if (!peerMessage) {
+      return;
+    }
+    this.appendPeerMessageEvents(peerMessage, message.uuid, events);
+  }
+
+  /**
+   * One delivery is one timeline item, whichever carrier surfaced it. Claude Code puts a peer's
+   * message on a user frame in the transcript and on the `result` frame live, so this is reached
+   * from both and deduplicates on the sender's id rather than on the carrier's uuid.
+   */
+  private appendPeerMessageEvents(
+    peerMessage: ClaudePeerMessage,
+    carrierUuid: unknown,
+    events: AgentStreamEvent[],
+  ): void {
+    const messageId = resolvePeerMessageId(peerMessage, carrierUuid);
+    if (messageId && this.emittedUserMessageIds.has(messageId)) {
+      return;
+    }
+    this.rememberEmittedUserMessageId(messageId);
+    events.push({
+      type: "timeline",
+      item: {
+        type: "user_message",
+        text: peerMessage.text,
+        origin: peerMessage.origin,
+        ...(messageId ? { messageId } : {}),
+      },
+      provider: "claude",
+    });
+  }
+
   private appendUserMessageEvents(
     message: Extract<SDKMessage, { type: "user" }>,
     events: AgentStreamEvent[],
@@ -4611,20 +4656,7 @@ class ClaudeAgentSession implements AgentSession {
       typeof message.uuid === "string" && message.uuid.length > 0 ? message.uuid : undefined;
     const peerMessage = readClaudePeerMessage(message);
     if (peerMessage) {
-      if (messageId && this.emittedUserMessageIds.has(messageId)) {
-        return;
-      }
-      this.rememberEmittedUserMessageId(messageId);
-      events.push({
-        type: "timeline",
-        item: {
-          type: "user_message",
-          text: peerMessage.text,
-          origin: peerMessage.origin,
-          ...(messageId ? { messageId } : {}),
-        },
-        provider: "claude",
-      });
+      this.appendPeerMessageEvents(peerMessage, message.uuid, events);
       return;
     }
     if (this.isStreamedCompactSummary(message, options?.clientSubmitted === true)) {
@@ -5358,8 +5390,9 @@ class ClaudeAgentSession implements AgentSession {
       this.rememberRewindUserAnchor(entry.uuid);
       return;
     }
-    if (readClaudePeerMessage(entry)) {
-      this.rememberEmittedUserMessageId(entry.uuid);
+    const peerMessage = readClaudePeerMessage(entry);
+    if (peerMessage) {
+      this.rememberEmittedUserMessageId(resolvePeerMessageId(peerMessage, entry.uuid));
     }
   }
 
@@ -6313,13 +6346,26 @@ function buildPeerMessageTimelineItem(entry: ClaudeHistoryEntry): AgentTimelineI
   if (!peerMessage) {
     return null;
   }
-  const messageId = typeof entry.uuid === "string" && entry.uuid.length > 0 ? entry.uuid : null;
+  const messageId = resolvePeerMessageId(peerMessage, entry.uuid);
   return {
     type: "user_message",
     text: peerMessage.text,
     origin: peerMessage.origin,
     ...(messageId ? { messageId } : {}),
   };
+}
+
+/**
+ * The carrier uuids differ between the two deliveries of one peer message — the `result` frame's
+ * uuid belongs to the turn, not to the message — so the sender's `msg_id` is what makes the live
+ * item and the replayed item the same item. Older transcripts predate `msg_id`; there the carrier
+ * uuid is still better than nothing, because replay is then the only source.
+ */
+function resolvePeerMessageId(peerMessage: ClaudePeerMessage, carrierUuid: unknown): string | null {
+  if (peerMessage.msgId) {
+    return peerMessage.msgId;
+  }
+  return typeof carrierUuid === "string" && carrierUuid.length > 0 ? carrierUuid : null;
 }
 
 function convertClaudeHistoryEntryPreamble(

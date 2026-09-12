@@ -16,6 +16,7 @@ const PEER_ORIGIN = {
   name: "dragino",
   fromMode: "bypass",
   verifiedPeerPid: 65428,
+  msg_id: "f1e8257d-5444-4c3f-8a17-07573bea4c61",
   body: "I changed things under you on farmgw.",
 } as const;
 
@@ -35,7 +36,21 @@ const EXPECTED_ITEM = {
   type: "user_message",
   text: "I changed things under you on farmgw.",
   origin: { kind: "peer", name: "dragino", address: "uds:/tmp/cc-socks/65428.sock" },
-  messageId: "d24c7444-1b8a-48d1-917a-c2d67a118a6e",
+  messageId: "f1e8257d-5444-4c3f-8a17-07573bea4c61",
+};
+
+/**
+ * The live shape, captured from Claude Code 2.1.269 by sending a real peer message to a session
+ * run with --input-format stream-json: no user frame is emitted for the delivery at all, and the
+ * only frame that carries it is the result that ends the turn the message started.
+ */
+const PEER_RESULT_FRAME = {
+  type: "result",
+  subtype: "success",
+  uuid: "09e2df76-33c5-4f16-95b0-769ac20c1a26",
+  session_id: "f6a6b942-ae4d-441d-bdcf-8eea7f75d94f",
+  is_error: false,
+  origin: PEER_ORIGIN,
 };
 
 async function createSessionForTest(): Promise<TestClaudeSession> {
@@ -56,6 +71,39 @@ describe("peer messages", () => {
     const { origin: _origin, ...withoutOrigin } = PEER_ENTRY;
 
     expect(convertClaudeHistoryEntry(withoutOrigin, () => [])).toEqual([]);
+  });
+
+  test("emits a peer message carried only by the result frame", async () => {
+    const session = await createSessionForTest();
+    try {
+      const frame = PEER_RESULT_FRAME as unknown as SDKMessage;
+
+      const items = session
+        .translateMessageToEvents(frame)
+        .filter((event) => event.type === "timeline")
+        .map((event) => event.item);
+
+      expect(items).toContainEqual(EXPECTED_ITEM);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test("does not show a delivery twice when both carriers arrive", async () => {
+    const session = await createSessionForTest();
+    try {
+      session.translateMessageToEvents(PEER_ENTRY as unknown as SDKMessage);
+
+      const repeats = session
+        .translateMessageToEvents(PEER_RESULT_FRAME as unknown as SDKMessage)
+        .filter((event) => event.type === "timeline")
+        .map((event) => event.item)
+        .filter((item) => item.type === "user_message");
+
+      expect(repeats).toEqual([]);
+    } finally {
+      await session.close();
+    }
   });
 
   test("emits a peer message on the live stream, once per delivery", async () => {
