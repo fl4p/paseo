@@ -44,6 +44,7 @@ import {
 } from "./model-manifest.js";
 import { parsePartialJsonObject } from "./partial-json.js";
 import { ClaudeSidechainTracker } from "./sidechain-tracker.js";
+import { ClaudePeerTranscriptTail } from "./peer-message-tail.js";
 import { type ClaudePeerMessage, readClaudePeerMessage } from "./peer-message.js";
 import { ClaudeTaskState } from "./task-state.js";
 import {
@@ -2156,6 +2157,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
+  private readonly peerTranscriptTail = new ClaudePeerTranscriptTail();
   private readonly rewindTurnAnchors: ClaudeRewindTurnAnchor[] = [];
   private pendingFreshSessionId: string | null = null;
   private recentStderr = "";
@@ -3145,6 +3147,7 @@ class ClaudeAgentSession implements AgentSession {
     this.historyPending = false;
     this.userMessageIds = [];
     this.emittedUserMessageIds.clear();
+    this.peerTranscriptTail.reset();
     this.rewindTurnAnchors.length = 0;
     this.taskState.reset();
     this.loadPersistedHistory(sessionId);
@@ -3176,6 +3179,7 @@ class ClaudeAgentSession implements AgentSession {
     this.historyPending = false;
     this.userMessageIds = [];
     this.emittedUserMessageIds.clear();
+    this.peerTranscriptTail.reset();
     this.rewindTurnAnchors.length = 0;
     this.taskState.reset();
   }
@@ -4315,6 +4319,7 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     this.forgetReadSteer(message);
+    this.appendPeerMessagesFromTranscriptTail(message, events);
 
     switch (message.type) {
       case "system":
@@ -4600,6 +4605,30 @@ class ClaudeAgentSession implements AgentSession {
         item: taskNotificationItem,
         provider: "claude",
       });
+    }
+  }
+
+  /**
+   * A turn can start because another session sent this one a message, and the stream says nothing
+   * about that until the turn ends. The transcript already has the message by then, so it is read
+   * from there at turn start and emitted ahead of the turn's own output — which is where the
+   * message belongs, above the reply rather than below it.
+   *
+   * The result frame still emits it if this finds nothing, so this decides position, not delivery.
+   */
+  private appendPeerMessagesFromTranscriptTail(
+    message: SDKMessage,
+    events: AgentStreamEvent[],
+  ): void {
+    if (readClaudeCommandLifecycle(message)?.state !== "started") {
+      return;
+    }
+    const sessionId = this.claudeSessionId;
+    if (!sessionId) {
+      return;
+    }
+    for (const peerMessage of this.peerTranscriptTail.read(this.resolveHistoryPath(sessionId))) {
+      this.appendPeerMessageEvents(peerMessage, null, events);
     }
   }
 
