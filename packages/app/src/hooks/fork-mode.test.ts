@@ -21,10 +21,11 @@ function resolve(overrides: Partial<Parameters<typeof resolveForkMode>[0]> = {})
 describe("resolveForkMode", () => {
   it("uses the native path for the same provider in the same directory", () => {
     expect(resolve()).toBe("native");
+    expect(resolve({ provider: "pi" })).toBe("native");
   });
 
   it("falls back to the attachment for a different provider", () => {
-    // Only Claude's session store can branch; everything else has to re-send
+    // Only Claude and Pi session stores can branch; everything else has to re-send
     // the conversation as text.
     expect(resolve({ provider: "codex" })).toBe("attachment");
     expect(resolve({ provider: "opencode" })).toBe("attachment");
@@ -91,6 +92,7 @@ describe("resolveForkTargetCwd", () => {
 describe("providerSupportsNativeFork", () => {
   it("recognizes only providers whose session store can branch", () => {
     expect(providerSupportsNativeFork("claude")).toBe(true);
+    expect(providerSupportsNativeFork("pi")).toBe(true);
     expect(providerSupportsNativeFork("codex")).toBe(false);
     expect(providerSupportsNativeFork(undefined)).toBe(false);
   });

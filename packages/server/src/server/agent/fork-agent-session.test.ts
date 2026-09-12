@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import pino from "pino";
 import { forkAgentSessionNatively, type ForkAgentSessionDeps } from "./fork-agent-session.js";
 import { forkClaudeSession } from "./providers/claude/fork-session.js";
+import { forkPiSession } from "./providers/pi/fork-session.js";
 import { FakeClaudeSdk } from "./providers/claude/test-rewind-claude-sdk.js";
 import { convertClaudeHistoryEntry } from "./providers/claude/agent.js";
 import type { AgentSessionConfig, AgentTimelineItem } from "./agent-sdk-types.js";
@@ -513,5 +514,192 @@ describe("forkAgentSessionNatively", () => {
     });
     await forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-6" }, deps);
     expect(deps.registerCreatedWorkspace).toHaveBeenCalledWith(workspace);
+  });
+});
+
+describe("forkAgentSessionNatively with Pi", () => {
+  let dir: string;
+  let sourceSessionPath: string;
+  let deps: ForkAgentSessionDeps;
+  let importedConfigs: Partial<AgentSessionConfig>[];
+
+  const PI_SOURCE_CONFIG: AgentSessionConfig = {
+    provider: "pi",
+    cwd: "/workspace",
+    model: "antigravity/gemini-3.8-flash",
+    thinkingOptionId: "high",
+    title: "pi source agent",
+  };
+
+  const PI_SOURCE_ENTRIES = [
+    {
+      type: "session",
+      version: 3,
+      id: "source-pi-session-1",
+      timestamp: "2026-09-10T10:00:00.000Z",
+      cwd: "/workspace",
+    },
+    {
+      type: "message",
+      id: "u1",
+      parentId: null,
+      timestamp: "2026-09-10T10:00:01.000Z",
+      message: { role: "user", content: "pi first task" },
+    },
+    {
+      type: "message",
+      id: "a1",
+      parentId: "u1",
+      timestamp: "2026-09-10T10:00:02.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "pi response 1" }],
+        stopReason: "stop",
+      },
+    },
+    {
+      type: "message",
+      id: "u2",
+      parentId: "a1",
+      timestamp: "2026-09-10T10:00:03.000Z",
+      message: { role: "user", content: "pi second task" },
+    },
+    {
+      type: "message",
+      id: "a2",
+      parentId: "u2",
+      timestamp: "2026-09-10T10:00:04.000Z",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "pi response 2" }],
+        stopReason: "stop",
+      },
+    },
+  ];
+
+  const PI_SOURCE_ROWS: AgentTimelineRow[] = [
+    row(1, { type: "user_message", text: "pi first task", messageId: "u1" }),
+    row(2, { type: "assistant_message", text: "pi response 1", messageId: "a1" }),
+    row(3, { type: "user_message", text: "pi second task", messageId: "u2" }),
+    row(4, { type: "assistant_message", text: "pi response 2", messageId: "a2" }),
+  ];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "paseo-pi-fork-"));
+    sourceSessionPath = join(dir, "2026-09-10T10-00-00-000Z_source-pi-1.jsonl");
+    writeFileSync(
+      sourceSessionPath,
+      PI_SOURCE_ENTRIES.map((e) => JSON.stringify(e)).join("\n"),
+      "utf8",
+    );
+    importedConfigs = [];
+    deps = {
+      loadAgent: vi.fn(async () => ({
+        cwd: "/workspace",
+        workspaceId: "ws-pi-1",
+        config: PI_SOURCE_CONFIG,
+      })),
+      fetchTimeline: vi.fn(() => ({ epoch: "epoch-1", rows: PI_SOURCE_ROWS })),
+      hasInFlightRun: vi.fn(() => false),
+      forkProviderSession: async (_agentId, input) => {
+        const fork = await forkPiSession({
+          sourceSessionPath,
+          boundaryMessageId: input.boundaryMessageId,
+          atCompletedTurn: input.atCompletedTurn,
+          sessionDir: dir,
+        });
+        return { providerHandleId: fork.sessionPath, provider: "pi", cwd: "/workspace" };
+      },
+      importProviderSession: async (input) => {
+        importedConfigs.push(input.config);
+        const lines = readFileSync(input.providerHandleId, "utf8").trim().split("\n");
+        return {
+          agentId: "agent-pi-forked",
+          timelineSize: lines.length - 1,
+          createdWorkspace: null,
+        };
+      },
+      registerCreatedWorkspace: vi.fn(async () => {}),
+      validateForkTarget: vi.fn(async () => {}),
+      deleteForkedProviderSession: vi.fn(async () => {}),
+      logger,
+    };
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("forks a Pi session natively preserving config and exact entry chain", async () => {
+    const result = await forkAgentSessionNatively(
+      { agentId: "agent-pi-source", requestId: "req-pi-1" },
+      deps,
+    );
+
+    expect(result.agentId).toBe("agent-pi-forked");
+    expect(result.timelineSize).toBe(4); // 4 entries after header
+    expect(importedConfigs[0]).toEqual({
+      model: "antigravity/gemini-3.8-flash",
+      thinkingOptionId: "high",
+    });
+
+    // Verify the forked file header links to the source session file
+    const forkedContent = readFileSync(result.providerHandleId, "utf8").trim().split("\n");
+    const header = JSON.parse(forkedContent[0]);
+    expect(header.type).toBe("session");
+    expect(header.parentSession).toBe(sourceSessionPath);
+    expect(header.cwd).toBe("/workspace");
+  });
+
+  it("cuts Pi fork at boundaryMessageId", async () => {
+    const result = await forkAgentSessionNatively(
+      { agentId: "agent-pi-source", requestId: "req-pi-boundary", boundaryMessageId: "a1" },
+      deps,
+    );
+
+    expect(result.agentId).toBe("agent-pi-forked");
+    expect(result.timelineSize).toBe(2); // u1, a1
+    const forkedContent = readFileSync(result.providerHandleId, "utf8").trim().split("\n");
+    const lastEntry = JSON.parse(forkedContent[2]);
+    expect(lastEntry.id).toBe("a1");
+  });
+
+  it("cuts Pi fork at completed turn when run is in flight", async () => {
+    const inFlightEntries = [
+      ...PI_SOURCE_ENTRIES,
+      {
+        type: "message",
+        id: "u3",
+        parentId: "a2",
+        message: { role: "user", content: "pi third task" },
+      },
+      {
+        type: "message",
+        id: "a3",
+        parentId: "u3",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_1", name: "bash" }],
+          stopReason: "toolUse",
+        },
+      },
+    ];
+    writeFileSync(
+      sourceSessionPath,
+      inFlightEntries.map((e) => JSON.stringify(e)).join("\n"),
+      "utf8",
+    );
+    deps.hasInFlightRun = vi.fn(() => true);
+
+    const result = await forkAgentSessionNatively(
+      { agentId: "agent-pi-source", requestId: "req-pi-inflight" },
+      deps,
+    );
+
+    expect(result.agentId).toBe("agent-pi-forked");
+    expect(result.timelineSize).toBe(4); // stops at a2, excluding u3 and uncompleted a3
+    const forkedContent = readFileSync(result.providerHandleId, "utf8").trim().split("\n");
+    const lastEntry = JSON.parse(forkedContent[4]);
+    expect(lastEntry.id).toBe("a2");
   });
 });

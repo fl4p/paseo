@@ -2795,6 +2795,61 @@ describe("PiRpcAgentClient", () => {
     expect(actualLaunch.mcpConfigPath).toBeUndefined();
     expect(session.capabilities.supportsMcpServers).toBe(false);
   });
+
+  test("implements forkProviderSession, deleteForkedProviderSession, and readCompactionSummary on session", async () => {
+    const testDir = mkdtempSync(path.join(tmpdir(), "paseo-pi-session-test-"));
+    onTestFinished(() => rmSync(testDir, { recursive: true, force: true }));
+    const sessionFile = path.join(testDir, "test-session.jsonl");
+    const transcript = [
+      JSON.stringify({
+        type: "session",
+        version: 3,
+        id: "session-1",
+        timestamp: "2026-09-10T10:00:00.000Z",
+        cwd: testDir,
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "m1",
+        parentId: null,
+        message: { role: "user", content: "hello" },
+      }),
+      JSON.stringify({
+        type: "compaction",
+        id: "c1",
+        parentId: "m1",
+        summary: "Summary of earlier talk",
+        tokensBefore: 1000,
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "m2",
+        parentId: "c1",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "world" }],
+          stopReason: "stop",
+        },
+      }),
+    ].join("\n");
+    writeFileSync(sessionFile, transcript, "utf8");
+
+    const pi = new FakePi();
+    const client = createClient(pi);
+    const session = await client.createSession(createConfig({ cwd: testDir }));
+    (session as unknown as { state: { sessionFile: string } }).state.sessionFile = sessionFile;
+
+    const summary = await session.readCompactionSummary?.();
+    expect(summary).toBe("Summary of earlier talk");
+
+    const forkResult = await session.forkProviderSession?.({});
+    expect(forkResult?.providerHandleId).toBeDefined();
+    expect(existsSync(forkResult!.providerHandleId)).toBe(true);
+
+    await session.deleteForkedProviderSession?.(forkResult!);
+    expect(existsSync(forkResult!.providerHandleId)).toBe(false);
+    expect(existsSync(sessionFile)).toBe(true);
+  });
 });
 
 describe("transformPiModels", () => {

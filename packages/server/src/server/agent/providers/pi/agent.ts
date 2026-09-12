@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  promises as fsPromises,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve as resolvePath } from "node:path";
 import type { Logger } from "pino";
@@ -68,6 +75,7 @@ import { materializeProviderImage } from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
 import { shouldDisplayPiCustomMessage } from "./custom-message.js";
 import { revertPiConversation } from "./rewind.js";
+import { deleteForkedPiSession, forkPiSession, readPiCompactionSummary } from "./fork-session.js";
 import { listPiImportableSessions, readPiImportSessionConfig } from "./session-descriptor.js";
 import type { PiRuntime, PiRuntimeSession, PiStartSessionInput } from "./runtime.js";
 import type {
@@ -1541,6 +1549,43 @@ export class PiRpcAgentSession implements AgentSession {
         ...(this.currentModeId ? { modeId: this.currentModeId } : {}),
       },
     };
+  }
+
+  async forkProviderSession(input: {
+    boundaryMessageId?: string | null;
+    atCompletedTurn?: boolean;
+  }): Promise<{ providerHandleId: string }> {
+    const sourceSessionPath = this.state.sessionFile;
+    if (!sourceSessionPath) {
+      throw new Error("Pi session is not ready to fork: session file not found");
+    }
+    const fork = await forkPiSession({
+      sourceSessionPath,
+      boundaryMessageId: input.boundaryMessageId,
+      atCompletedTurn: input.atCompletedTurn,
+      logger: this.logger,
+    });
+    return { providerHandleId: fork.sessionPath };
+  }
+
+  async deleteForkedProviderSession(input: { providerHandleId: string }): Promise<void> {
+    const sourceSessionPath = this.state.sessionFile;
+    if (!sourceSessionPath) {
+      throw new Error("Cannot delete forked session: source session file unknown");
+    }
+    await deleteForkedPiSession({
+      sourceSessionPath,
+      forkSessionPath: input.providerHandleId,
+    });
+  }
+
+  async readCompactionSummary(input?: { untilMessageId?: string | null }): Promise<string | null> {
+    const sessionPath = this.state.sessionFile;
+    if (!sessionPath || !existsSync(sessionPath)) {
+      return null;
+    }
+    const content = await fsPromises.readFile(sessionPath, "utf8");
+    return readPiCompactionSummary(content, { untilMessageId: input?.untilMessageId ?? null });
   }
 
   async interrupt(): Promise<void> {

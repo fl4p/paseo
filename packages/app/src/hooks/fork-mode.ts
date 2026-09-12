@@ -15,7 +15,7 @@ import type { AssistantForkTarget } from "@/components/assistant-fork-menu";
 export type ForkMode = "native" | "attachment";
 
 /** Providers whose session store can branch (see `AgentClient.forkProviderSession`). */
-const NATIVE_FORK_PROVIDERS: ReadonlySet<string> = new Set<string>(["claude"]);
+const NATIVE_FORK_PROVIDERS: ReadonlySet<string> = new Set<string>(["claude", "pi"]);
 
 export function providerSupportsNativeFork(provider: AgentProvider | null | undefined): boolean {
   return typeof provider === "string" && NATIVE_FORK_PROVIDERS.has(provider);
