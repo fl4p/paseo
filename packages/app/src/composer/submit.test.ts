@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { submitAgentInput } from "./submit";
+import { usePromptHistoryStore } from "@/stores/prompt-history-store";
 
 function createDeferredPromise<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -249,5 +250,67 @@ describe("submitAgentInput", () => {
       attachments: [],
     });
     expect(clearDraft).toHaveBeenCalledWith("sent");
+  });
+
+  it("records non-empty submitted prompt into prompt history", async () => {
+    usePromptHistoryStore.getState().clearHistory();
+
+    await submitAgentInput({
+      message: "hello from submit test",
+      attachments: [],
+      isQueueBusy: false,
+      canSubmit: true,
+      queueMessage: vi.fn(),
+      submitMessage: vi.fn(async () => {}),
+      clearDraft: vi.fn(),
+      setUserInput: vi.fn(),
+      setAttachments: vi.fn(),
+      setSendError: vi.fn(),
+      setIsProcessing: vi.fn(),
+    });
+
+    expect(usePromptHistoryStore.getState().history).toContain("hello from submit test");
+  });
+
+  it("records non-empty queued prompt into prompt history", async () => {
+    usePromptHistoryStore.getState().clearHistory();
+
+    await submitAgentInput({
+      message: "hello queued message",
+      attachments: [],
+      isQueueBusy: true,
+      canSubmit: true,
+      queueMessage: vi.fn(),
+      submitMessage: vi.fn(async () => {}),
+      clearDraft: vi.fn(),
+      setUserInput: vi.fn(),
+      setAttachments: vi.fn(),
+      setSendError: vi.fn(),
+      setIsProcessing: vi.fn(),
+    });
+
+    expect(usePromptHistoryStore.getState().history).toContain("hello queued message");
+  });
+
+  it("does not record prompt into history when submission fails", async () => {
+    usePromptHistoryStore.getState().clearHistory();
+
+    await submitAgentInput({
+      message: "failing message",
+      attachments: [],
+      isQueueBusy: false,
+      canSubmit: true,
+      queueMessage: vi.fn(),
+      submitMessage: vi.fn(async () => {
+        throw new Error("Network error");
+      }),
+      clearDraft: vi.fn(),
+      setUserInput: vi.fn(),
+      setAttachments: vi.fn(),
+      setSendError: vi.fn(),
+      setIsProcessing: vi.fn(),
+    });
+
+    expect(usePromptHistoryStore.getState().history).not.toContain("failing message");
   });
 });

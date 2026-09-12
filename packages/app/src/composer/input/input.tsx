@@ -101,6 +101,10 @@ export interface ComposerInputSnapshot {
 
 export interface ComposerKeyPressEvent {
   key: string;
+  shiftKey?: boolean;
+  metaKey?: boolean;
+  ctrlKey?: boolean;
+  altKey?: boolean;
   preventDefault: () => void;
   input: ComposerInputSnapshot;
 }
@@ -202,6 +206,7 @@ type WebTextInputKeyPressEvent = NativeSyntheticEvent<
     metaKey?: boolean;
     ctrlKey?: boolean;
     shiftKey?: boolean;
+    altKey?: boolean;
     // Web-only: present on DOM KeyboardEvent during IME composition (CJK input).
     isComposing?: boolean;
     keyCode?: number;
@@ -405,7 +410,11 @@ function handleDesktopKeyPressImpl(
   if (ctx.onKeyPressCallback) {
     const handled = ctx.onKeyPressCallback({
       key: event.nativeEvent.key,
-      preventDefault: () => event.preventDefault(),
+      shiftKey: Boolean(event.nativeEvent.shiftKey),
+      metaKey: Boolean(event.nativeEvent.metaKey),
+      ctrlKey: Boolean(event.nativeEvent.ctrlKey),
+      altKey: Boolean(event.nativeEvent.altKey),
+      preventDefault: () => event.preventDefault?.(),
       input: ctx.input,
     });
     if (handled) return;
@@ -1245,11 +1254,12 @@ export const MessageInput = forwardRef<MessageInputRef, MessageInputProps>(
         updateComposerHeightForText?.(valueRef.current, nextText);
         valueRef.current = nextText;
         updateLiveTextPresence(nextText);
-        selectionRef.current = selection ?? { start: nextText.length, end: nextText.length };
+        const resolvedSelection = selection ?? { start: nextText.length, end: nextText.length };
+        selectionRef.current = resolvedSelection;
         if (nextText === "") {
           textInputRef.current?.reset();
         } else {
-          textInputRef.current?.replaceText(nextText, selection);
+          textInputRef.current?.replaceText(nextText, resolvedSelection);
         }
         onChangeText(nextText);
       },

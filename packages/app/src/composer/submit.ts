@@ -1,4 +1,5 @@
 import { i18n } from "@/i18n/i18next";
+import { usePromptHistoryStore } from "@/stores/prompt-history-store";
 
 export type AgentInputSubmitResult = "noop" | "queued" | "submitted" | "failed";
 
@@ -48,6 +49,9 @@ export async function submitAgentInput<TAttachment>(
       input.setUserInput("");
       input.setAttachments([]);
     }
+    if (trimmedMessage) {
+      usePromptHistoryStore.getState().addPrompt(trimmedMessage);
+    }
     return "queued";
   }
 
@@ -61,6 +65,9 @@ export async function submitAgentInput<TAttachment>(
 
   try {
     await input.submitMessage({ message: trimmedMessage, attachments });
+    if (trimmedMessage) {
+      usePromptHistoryStore.getState().addPrompt(trimmedMessage);
+    }
     input.clearDraft("sent");
     input.setIsProcessing(false);
     return "submitted";

@@ -111,6 +111,8 @@ import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import type { KeyboardActionDefinition } from "@/keyboard/keyboard-action-dispatcher";
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
 import { submitAgentInput } from "@/composer/submit";
+import { usePromptHistoryStore } from "@/stores/prompt-history-store";
+import { buildCombinedPromptHistory, useComposerPromptHistory } from "@/composer/prompt-history";
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
 import { ComposerKeyboardScopeProvider, useComposerKeyboardScope } from "@/composer/keyboard-scope";
 import { useAppSettings } from "@/hooks/use-settings";
@@ -1286,6 +1288,8 @@ function ComposerContentImpl({
   const keyboardHandlerIdRef = useRef(
     `message-input:${serverId}:${agentId}:${Math.random().toString(36).slice(2)}`,
   );
+  const userInputRef = useRef(userInput);
+  userInputRef.current = userInput;
 
   const replaceUserInput = useCallback(
     (text: string, selection?: { start: number; end: number }) => {
@@ -1307,6 +1311,10 @@ function ComposerContentImpl({
       if (blurOnSubmit) {
         messageInputRef.current?.blur();
       }
+      if (userInputRef.current.trim()) {
+        usePromptHistoryStore.getState().addPrompt(userInputRef.current.trim());
+      }
+      promptHistoryResetRef.current();
       clearDraft("sent");
       replaceUserInput("");
       setSelectedAttachments([]);
@@ -1336,6 +1344,10 @@ function ComposerContentImpl({
   const runPluginClientSlashCommand = useCallback(
     (resolved: { command: (typeof pluginClientSlashCommands)[number]; args: string }): boolean => {
       if (blurOnSubmit) messageInputRef.current?.blur();
+      if (userInputRef.current.trim()) {
+        usePromptHistoryStore.getState().addPrompt(userInputRef.current.trim());
+      }
+      promptHistoryResetRef.current();
       clearDraft("sent");
       replaceUserInput("");
       setSelectedAttachments([]);
@@ -1376,6 +1388,42 @@ function ComposerContentImpl({
       selectAutocompleteOption(option, messageInputRef.current?.getInputSnapshot()),
     [selectAutocompleteOption],
   );
+
+  const globalPromptHistory = usePromptHistoryStore((state) => state.history);
+  const sessionStreamTail = useSessionStore(
+    useCallback(
+      (state) => (agentId ? state.sessions[serverId]?.agentStreamTail?.get(agentId) : undefined),
+      [serverId, agentId],
+    ),
+  );
+  const sessionPrompts = useMemo(() => {
+    if (!sessionStreamTail) return [];
+    const prompts: string[] = [];
+    for (const item of sessionStreamTail) {
+      if (item.kind === "user_message" && item.text?.trim()) {
+        prompts.push(item.text.trim());
+      }
+    }
+    return prompts;
+  }, [sessionStreamTail]);
+
+  const combinedPromptHistory = useMemo(
+    () => buildCombinedPromptHistory(globalPromptHistory, sessionPrompts),
+    [globalPromptHistory, sessionPrompts],
+  );
+
+  const promptHistory = useComposerPromptHistory({
+    history: combinedPromptHistory,
+    replaceUserInput,
+  });
+  const promptHistoryOnKeyPressRef = useRef(promptHistory.onKeyPress);
+  promptHistoryOnKeyPressRef.current = promptHistory.onKeyPress;
+  const promptHistoryResetRef = useRef(promptHistory.reset);
+  promptHistoryResetRef.current = promptHistory.reset;
+
+  useEffect(() => {
+    promptHistoryResetRef.current();
+  }, [agentId, serverId]);
 
   // Clear send error when user edits the input
   useEffect(() => {
@@ -1573,6 +1621,7 @@ function ComposerContentImpl({
       outgoingAttachments: ComposerAttachment[],
       forceSend?: boolean,
     ) => {
+      promptHistoryResetRef.current();
       const result = await submitAgentInput({
         message: outgoingMessage,
         attachments: outgoingAttachments,
@@ -1888,6 +1937,7 @@ function ComposerContentImpl({
 
   const handleQueue = useCallback(
     (payload: MessagePayload) => {
+      promptHistoryResetRef.current();
       const outgoingAttachments = buildOutgoingAttachments(attachments);
       const clientSlashCommand = resolveClientSlashCommand({
         text: payload.text,
@@ -1916,11 +1966,13 @@ function ComposerContentImpl({
 
   const hasSendableContent = userInput.trim().length > 0 || selectedAttachments.length > 0;
 
-  // Handle keyboard navigation for command autocomplete.
-  const handleCommandKeyPress = useCallback(
-    (event: ComposerKeyPressEvent) => autocompleteOnKeyPressRef.current(event),
-    [],
-  );
+  // Handle keyboard navigation for command autocomplete and prompt history.
+  const handleCommandKeyPress = useCallback((event: ComposerKeyPressEvent) => {
+    if (autocompleteOnKeyPressRef.current(event)) {
+      return true;
+    }
+    return promptHistoryOnKeyPressRef.current(event);
+  }, []);
 
   const cancelButtonStyle = useMemo(
     () => buildCancelButtonStyle(isConnected, isCancellingAgent),
