@@ -1084,6 +1084,13 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     return true;
   });
 
+  const disposeBellSubscription = terminal.onBell(() => {
+    if (disposed || killed) {
+      return;
+    }
+    activityTracker.bell();
+  });
+
   activityTracker.onChange((snapshot, previousSnapshot) => {
     if (disposed || killed) {
       return;
@@ -1152,6 +1159,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
     clearPendingTitleChange();
     disposeTitleChangeSubscription();
     disposeCommandLifecycleSubscription.dispose();
+    disposeBellSubscription.dispose();
     activityTracker.dispose();
     terminal.dispose();
     listeners.clear();
@@ -1311,6 +1319,7 @@ export async function createTerminal(options: CreateTerminalOptions): Promise<Te
         if (isTerminalActivityInterruptInput(msg.data)) {
           activityTracker.interrupt();
         }
+        activityTracker.clearAttention();
         pendingInput += msg.data;
         scheduleInputFlush();
         break;

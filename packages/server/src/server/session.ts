@@ -7035,6 +7035,24 @@ export class Session {
           clearedAgentIds.push(agentId);
         }
 
+        if (
+          this.terminalManager &&
+          typeof this.terminalManager.listDirectories === "function" &&
+          typeof this.terminalManager.getTerminals === "function" &&
+          typeof this.terminalManager.clearTerminalAttention === "function"
+        ) {
+          const directories = this.terminalManager.listDirectories();
+          const terminalsByDirectory = await Promise.all(
+            directories.map((cwd) => this.terminalManager!.getTerminals(cwd)),
+          );
+          const workspaceTerminals = terminalsByDirectory
+            .flat()
+            .filter((terminal) => terminal.workspaceId === workspace.workspaceId);
+          for (const terminal of workspaceTerminals) {
+            await this.terminalManager.clearTerminalAttention(terminal.id);
+          }
+        }
+
         await this.emitWorkspaceUpdateForWorkspaceId(workspace.workspaceId);
         results.push({
           workspaceId: requestedWorkspaceId,

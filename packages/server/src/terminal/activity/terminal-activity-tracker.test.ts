@@ -45,6 +45,54 @@ describe("TerminalActivityTracker — set", () => {
   });
 });
 
+describe("TerminalActivityTracker — bell", () => {
+  it("transitions an unknown terminal to finished attention", () => {
+    const tracker = new TerminalActivityTracker();
+
+    tracker.bell();
+
+    expect(tracker.getSnapshot()).toMatchObject({
+      state: "idle",
+      attentionReason: "finished",
+    });
+  });
+
+  it("transitions a working terminal to finished attention", () => {
+    const tracker = new TerminalActivityTracker();
+
+    tracker.set("working");
+    tracker.bell();
+
+    expect(tracker.getSnapshot()).toMatchObject({
+      state: "idle",
+      attentionReason: "finished",
+    });
+  });
+
+  it("transitions an idle terminal to finished attention", () => {
+    const tracker = new TerminalActivityTracker();
+
+    tracker.set("idle");
+    tracker.bell();
+
+    expect(tracker.getSnapshot()).toMatchObject({
+      state: "idle",
+      attentionReason: "finished",
+    });
+  });
+
+  it("does not re-emit when already finished", () => {
+    const tracker = new TerminalActivityTracker();
+    const changes: TerminalActivitySnapshot[] = [];
+
+    tracker.bell();
+    tracker.onChange((snap) => changes.push(snap));
+    tracker.bell();
+
+    expect(changes).toHaveLength(0);
+  });
+});
+
 describe("TerminalActivityTracker — clearAttention", () => {
   it("moves attention back to idle", () => {
     const tracker = new TerminalActivityTracker();

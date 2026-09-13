@@ -1259,6 +1259,56 @@ describe("terminal activity interruption", () => {
   });
 });
 
+describe("terminal bell activity", () => {
+  it("transitions to finished attention when output carries a bell signal", async () => {
+    const session = trackSession(
+      await createTerminal({
+        workspaceId: "ws-test",
+        cwd: realpathSync(tmpdir()),
+        shell: "/bin/sh",
+        env: { PS1: "$ " },
+      }),
+    );
+    await waitForLines(session, ["$"]);
+
+    session.send({ type: "input", data: "printf '\\a'\r" });
+
+    await vi.waitFor(() => {
+      expect(session.getActivity()).toMatchObject({
+        state: "idle",
+        attentionReason: "finished",
+      });
+    });
+  });
+
+  it("clears finished attention on user input", async () => {
+    const session = trackSession(
+      await createTerminal({
+        workspaceId: "ws-test",
+        cwd: realpathSync(tmpdir()),
+        shell: "/bin/sh",
+        env: { PS1: "$ " },
+      }),
+    );
+    await waitForLines(session, ["$"]);
+
+    session.send({ type: "input", data: "printf '\\a'\r" });
+
+    await vi.waitFor(() => {
+      expect(session.getActivity()).toMatchObject({
+        state: "idle",
+        attentionReason: "finished",
+      });
+    });
+
+    session.send({ type: "input", data: "echo hi\r" });
+
+    await vi.waitFor(() => {
+      expect(session.getActivity()?.attentionReason).toBeUndefined();
+    });
+  });
+});
+
 // The escaping tests above assert the command line we generate. This one runs
 // it: a real cmd.exe launches a real .cmd shim, which echoes the argv it was
 // handed. It is the only check that proves cmd.exe's tokenizer reconstructs

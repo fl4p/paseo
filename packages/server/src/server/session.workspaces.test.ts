@@ -8893,6 +8893,152 @@ test("removing a contributing terminal clears workspace status", async () => {
   });
 });
 
+test("terminal bell activity marks the owning workspace attention and clears via heartbeat", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const cwd = mkdtempSync(path.join(tmpdir(), "paseo-session-bell-"));
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-bell",
+    projectId: "proj-bell",
+    cwd,
+    kind: "directory",
+    displayName: "bell-workspace",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const project = createPersistedProjectRecord({
+    projectId: "proj-bell",
+    rootPath: cwd,
+    kind: "non_git",
+    displayName: "bell-project",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const { session, terminalManager } = createSessionWithTerminalManager({
+    workspaces: [workspace],
+    projects: [project],
+    onMessage: (message) => emitted.push(message),
+  });
+
+  const terminal = await terminalManager.createTerminal({
+    cwd,
+    workspaceId: workspace.workspaceId,
+  });
+
+  terminal.send({ type: "input", data: "printf '\\a'\r" });
+
+  const update = await waitForWorkspaceUpdate(
+    emitted,
+    (message) =>
+      message.payload.kind === "upsert" &&
+      message.payload.workspace.id === workspace.workspaceId &&
+      message.payload.workspace.status === "attention",
+    "terminal bell marks the owning workspace attention",
+  );
+  expect(update.payload).toMatchObject({
+    kind: "upsert",
+    workspace: {
+      id: workspace.workspaceId,
+      status: "attention",
+    },
+  });
+
+  emitted.length = 0;
+
+  await session.handleMessage({
+    type: "client_heartbeat",
+    deviceType: "web",
+    focusedAgentId: null,
+    focusedTerminalId: terminal.id,
+    lastActivityAt: "2026-06-13T12:00:00.000Z",
+    appVisible: true,
+  });
+
+  const clearUpdate = await waitForWorkspaceUpdate(
+    emitted,
+    (message) =>
+      message.payload.kind === "upsert" &&
+      message.payload.workspace.id === workspace.workspaceId &&
+      message.payload.workspace.status === "done",
+    "focusing the terminal clears attention back to done",
+  );
+  expect(clearUpdate.payload).toMatchObject({
+    kind: "upsert",
+    workspace: {
+      id: workspace.workspaceId,
+      status: "done",
+    },
+  });
+});
+
+test("workspace clear attention clears terminal attention in the workspace", async () => {
+  const emitted: SessionOutboundMessage[] = [];
+  const cwd = mkdtempSync(path.join(tmpdir(), "paseo-session-clear-terminal-"));
+  const workspace = createPersistedWorkspaceRecord({
+    workspaceId: "ws-clear-term",
+    projectId: "proj-clear-term",
+    cwd,
+    kind: "directory",
+    displayName: "clear-term-workspace",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const project = createPersistedProjectRecord({
+    projectId: "proj-clear-term",
+    rootPath: cwd,
+    kind: "non_git",
+    displayName: "clear-term-project",
+    createdAt: "2026-03-01T12:00:00.000Z",
+    updatedAt: "2026-03-01T12:00:00.000Z",
+  });
+  const { session, terminalManager } = createSessionWithTerminalManager({
+    workspaces: [workspace],
+    projects: [project],
+    onMessage: (message) => emitted.push(message),
+  });
+
+  const terminal = await terminalManager.createTerminal({
+    cwd,
+    workspaceId: workspace.workspaceId,
+  });
+
+  terminal.send({ type: "input", data: "printf '\\a'\r" });
+
+  await waitForWorkspaceUpdate(
+    emitted,
+    (message) =>
+      message.payload.kind === "upsert" &&
+      message.payload.workspace.id === workspace.workspaceId &&
+      message.payload.workspace.status === "attention",
+    "terminal bell marks workspace attention",
+  );
+
+  emitted.length = 0;
+
+  await session.handleMessage({
+    type: "workspace.clear_attention.request",
+    workspaceId: workspace.workspaceId,
+    requestId: "req-clear-term",
+  });
+
+  expect(terminal.getActivity()?.attentionReason).toBeUndefined();
+
+  const clearUpdate = await waitForWorkspaceUpdate(
+    emitted,
+    (message) =>
+      message.payload.kind === "upsert" &&
+      message.payload.workspace.id === workspace.workspaceId &&
+      message.payload.workspace.status === "done",
+    "workspace clear attention clears terminal attention and resets workspace status",
+  );
+  expect(clearUpdate.payload).toMatchObject({
+    kind: "upsert",
+    workspace: {
+      id: workspace.workspaceId,
+      status: "done",
+    },
+  });
+});
+
 interface WorkspaceCreatePrRepoFixture {
   tempDir: string;
   repoDir: string;

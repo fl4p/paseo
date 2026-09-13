@@ -54,6 +54,10 @@ export class TerminalActivityTracker {
     this.setState(null, null);
   }
 
+  bell(): void {
+    this.setState("idle", "finished");
+  }
+
   private setState(
     state: TerminalActivityState | null,
     attentionReason: TerminalActivityAttentionReason | null,
