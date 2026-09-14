@@ -96,6 +96,8 @@ function applyRuntimeSettingsToClaudeOptions(
         // containing double quotes, which cmd.exe mangles (strips quotes, breaks parsing).
         // The command is always a resolved binary path, so shell routing is unnecessary.
         shell: false,
+        // Keep inherited tools in an owned group even if the CLI exits first.
+        detached: process.platform !== "win32",
       });
       onChildProcess?.(child);
       if (typeof options.stderr === "function") {

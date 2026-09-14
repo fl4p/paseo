@@ -37,6 +37,8 @@ function createQueryMock(events: unknown[]): Query {
 
 function createChildProcessStub(): ChildProcess {
   const child = new EventEmitter() as ChildProcess;
+  // This fixture never starts an OS process; cleanup must observe that fact.
+  child.exitCode = 0;
   child.stderr = new EventEmitter() as ChildProcess["stderr"];
   return child;
 }
@@ -145,5 +147,6 @@ describe("Claude spawn override", () => {
     expect(claudeSpawnCall).toBeDefined();
     const spawnOptions = claudeSpawnCall?.[2];
     expect(spawnOptions?.shell).toBe(false);
+    expect(spawnOptions?.detached).toBe(process.platform !== "win32");
   });
 });

@@ -238,3 +238,8 @@ export function claudeAccountRecoveryPrompt(
     "Do not launch replacement agents or repeat their original prompts. If a saved agent cannot be resumed, report its ID and the error to the user. Do not claim recovery succeeded until Claude confirms the agent resumed.",
   ].join("\n");
 }
+
+export function readClaudeAccountRecovery(value: unknown): string[] {
+  if (value === undefined) return [];
+  return z.array(z.string().regex(/^[a-zA-Z0-9_-]+$/)).parse(value);
+}

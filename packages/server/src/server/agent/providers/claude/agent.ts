@@ -98,6 +98,7 @@ import {
   claudeAccountEnv,
   copyClaudeConversation,
   claudeAccountRecoveryPrompt,
+  readClaudeAccountRecovery,
   validateClaudeAccountSubagents,
   parseClaudeAccounts,
   resolveClaudeAccount,
@@ -163,6 +164,12 @@ import {
 } from "../../provider-launch-config.js";
 import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
+import {
+  captureProcessTree,
+  refreshProcessTree,
+  terminateCapturedProcessTree,
+  type ProcessTreeSnapshot,
+} from "../../../../utils/process-tree.js";
 import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
@@ -2105,6 +2112,9 @@ class ClaudeAgentSession implements AgentSession {
   private readonly config: ClaudeAgentConfig;
   private readonly accounts: ClaudeAccount[];
   private switchingAccount = false;
+  private retiringProcessTree: ProcessTreeSnapshot | null = null;
+  private processTreeCapture: Promise<ProcessTreeSnapshot> | null = null;
+  private readonly pendingAccountRecovery = new Set<string>();
   private readonly retiringQueries = new Set<Query>();
   private readonly launchEnv?: Record<string, string>;
   private readonly agentId?: string;
@@ -2216,6 +2226,9 @@ class ClaudeAgentSession implements AgentSession {
         throw new Error("Cannot resume: persistence handle has no sessionId");
       }
       this.claudeSessionId = handle.sessionId;
+      for (const id of readClaudeAccountRecovery(handle.metadata?.claudeAccountRecovery)) {
+        this.pendingAccountRecovery.add(id);
+      }
       this.persistence = handle;
       this.loadPersistedHistory(handle.sessionId);
     } else {
@@ -2495,6 +2508,7 @@ class ClaudeAgentSession implements AgentSession {
         { cause: error },
       );
     }
+    if (this.pendingAccountRecovery.delete(taskId)) this.persistence = null;
     return true;
   }
 
@@ -2653,7 +2667,13 @@ class ClaudeAgentSession implements AgentSession {
         "Wait for untracked subagent work to finish before switching accounts.",
       );
     }
-    return migration.taskIds;
+    const taskIds = [...new Set([...migration.taskIds, ...this.pendingAccountRecovery])];
+    if (process.platform === "win32" && taskIds.length > 0) {
+      throw new ClaudeAccountError(
+        "Running subagent account migration is not supported on Windows. Wait for subagents to finish before switching.",
+      );
+    }
+    return taskIds;
   }
 
   private async switchAccount(value: unknown): Promise<void> {
@@ -2684,6 +2704,9 @@ class ClaudeAgentSession implements AgentSession {
         );
       }
       migration.taskIds = latest;
+      // Retain the plan before teardown, including when process cleanup cannot finish.
+      for (const id of migration.taskIds) this.pendingAccountRecovery.add(id);
+      this.persistence = null;
       // A retired process must finish writing before we copy its transcript.
       await this.retireQuery(() => {
         retired = true;
@@ -2692,6 +2715,8 @@ class ClaudeAgentSession implements AgentSession {
           (id) => !this.taskProtocolSource.isTaskCompleted(id),
         );
         interruptedTaskIds = late.blockedTaskIds;
+        for (const id of migration.taskIds) this.pendingAccountRecovery.add(id);
+        this.persistence = null;
       });
       await validateClaudeAccountSubagents(sourcePath, migration.taskIds);
       const sessionId = await this.copyAccountConversation(account, sourceConfigDir, sourcePath);
@@ -2905,7 +2930,7 @@ class ClaudeAgentSession implements AgentSession {
       provider: "claude",
       sessionId: this.claudeSessionId,
       nativeHandle: this.claudeSessionId,
-      metadata: { ...this.config },
+      metadata: { ...this.config, claudeAccountRecovery: [...this.pendingAccountRecovery] },
     };
     return this.persistence;
   }
@@ -2936,28 +2961,7 @@ class ClaudeAgentSession implements AgentSession {
     this.turnState = "idle";
     this.sidechainTracker.clear();
     this.taskProtocolSource.reset();
-    this.input?.end();
-    this.query?.close?.();
-    await this.awaitWithTimeout(this.query?.interrupt?.(), "close query interrupt");
-    await this.awaitWithTimeout(this.query?.return?.(), "close query return");
-    this.query = null;
-    this.input = null;
-    // Terminate the entire process tree (claude + MCP children) to prevent
-    // orphan accumulation. The SDK's internal cleanup may only kill the
-    // direct child process.
-    if (this.childProcess) {
-      const result = await terminateWithTreeKill(this.childProcess, {
-        gracefulTimeoutMs: 2_000,
-        forceTimeoutMs: 2_000,
-      });
-      if (result === "kill-timeout") {
-        this.logger.warn(
-          { pid: this.childProcess.pid, agentId: this.agentId },
-          "Claude process tree did not report exit after SIGKILL",
-        );
-      }
-      this.childProcess = null;
-    }
+    await this.retireQuery();
     if (this.persistSession === false && this.claudeSessionId) {
       // Claude Code currently ignores --no-session-persistence outside --print mode
       // (see `claude --help`), so the SDK's persistSession=false is silently dropped
@@ -3330,6 +3334,7 @@ class ClaudeAgentSession implements AgentSession {
     const sessionId = randomUUID();
     this.claudeSessionId = sessionId;
     this.pendingFreshSessionId = sessionId;
+    this.pendingAccountRecovery.clear();
     this.persistence = null;
     this.cachedRuntimeInfo = null;
     this.queryRestartNeeded = true;
@@ -3444,6 +3449,12 @@ class ClaudeAgentSession implements AgentSession {
     const oldInput = this.input;
     const retiredChild = this.childProcess;
     const retiredPump = this.queryPumpPromise;
+    // Capture before SDK close can orphan tool/MCP processes. Keep this snapshot if cleanup
+    // fails so a retry still owns descendants even after the root has disappeared.
+    const processTree =
+      this.retiringProcessTree ?? (this.processTreeCapture ? await this.processTreeCapture : null);
+    this.retiringProcessTree = processTree;
+    if (processTree) await refreshProcessTree(processTree);
     // Detach before retiring so the old event pump cannot report a crash or
     // fail a turn belonging to the replacement process.
     this.query = null;
@@ -3462,23 +3473,25 @@ class ClaudeAgentSession implements AgentSession {
             : undefined;
         }),
       ]);
-      if (retiredChild) {
+      if (retiredChild || processTree) {
         try {
-          const result = await terminateWithTreeKill(retiredChild, {
-            gracefulTimeoutMs: 2_000,
-            forceTimeoutMs: 2_000,
-          });
+          const terminationOptions = { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 };
+          const result = processTree
+            ? await terminateCapturedProcessTree(processTree, terminationOptions)
+            : await terminateWithTreeKill(retiredChild!, terminationOptions);
           if (result === "kill-timeout") {
             throw new ClaudeAccountError(
-              "Claude has not exited. Cannot safely restart or switch accounts.",
+              "Claude has not exited. Cannot safely restart or switch accounts while its processes survive.",
             );
           }
+          this.retiringProcessTree = null;
+          this.processTreeCapture = null;
         } catch (error) {
           this.childProcess = retiredChild;
           throw error;
         }
       }
-      if (retiredChild || settled.status === "fulfilled") {
+      if (retiredChild || processTree || settled.status === "fulfilled") {
         // The stream may contain task announcements written during shutdown. Drain it before
         // capturing the final recovery list and clearing runtime statuses.
         const [drained] = await Promise.allSettled([
@@ -3502,7 +3515,8 @@ class ClaudeAgentSession implements AgentSession {
       return this.query;
     }
 
-    if (this.queryRestartNeeded || (!this.query && this.childProcess)) await this.retireQuery();
+    const pendingCleanup = this.childProcess || this.retiringProcessTree || this.processTreeCapture;
+    if (this.queryRestartNeeded || (!this.query && pendingCleanup)) await this.retireQuery();
 
     // Preserve claudeSessionId across query recreation so buildOptions() passes
     // resume: sessionId and the new query continues the existing conversation.
@@ -3527,6 +3541,10 @@ class ClaudeAgentSession implements AgentSession {
         queryFactory: this.queryFactory,
         onChildProcess: (child) => {
           this.childProcess = child;
+          const groupId = process.platform === "win32" ? undefined : child.pid;
+          this.processTreeCapture = child.pid ? captureProcessTree(child.pid, groupId) : null;
+          // A capture failure must reach the next cleanup attempt, never an unhandled rejection.
+          void this.processTreeCapture?.catch(() => undefined);
           child.once("exit", (code, signal) => this.handleRuntimeExit(child, code, signal));
         },
       },
@@ -4271,6 +4289,15 @@ class ClaudeAgentSession implements AgentSession {
     return this.isAssistantishMessage(message);
   }
 
+  private acknowledgeAccountRecovery(message: SDKMessage): void {
+    if (message.type !== "system") return;
+    const resumed = message.subtype === "task_started";
+    const completed = message.subtype === "task_notification" && message.status === "completed";
+    if ((resumed || completed) && "task_id" in message) {
+      if (this.pendingAccountRecovery.delete(message.task_id)) this.persistence = null;
+    }
+  }
+
   private acceptsQueryEvents(query: Query): boolean {
     return !this.closed && (this.query === query || this.retiringQueries.has(query));
   }
@@ -4305,6 +4332,7 @@ class ClaudeAgentSession implements AgentSession {
       "provider.claude.parsed_event",
     );
 
+    this.acknowledgeAccountRecovery(message);
     const events = await this.buildPumpedMessageEvents(message, identifiers.messageId, turnId);
     if (!this.acceptsQueryEvents(query)) return;
 
