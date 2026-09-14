@@ -97,6 +97,8 @@ import {
   ClaudeAccountError,
   claudeAccountEnv,
   copyClaudeConversation,
+  claudeAccountRecoveryPrompt,
+  validateClaudeAccountSubagents,
   parseClaudeAccounts,
   resolveClaudeAccount,
   type ClaudeAccount,
@@ -2103,6 +2105,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly config: ClaudeAgentConfig;
   private readonly accounts: ClaudeAccount[];
   private switchingAccount = false;
+  private readonly retiringQueries = new Set<Query>();
   private readonly launchEnv?: Record<string, string>;
   private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
@@ -2629,6 +2632,30 @@ class ClaudeAgentSession implements AgentSession {
     await this.applyFastModeFeature(enabled);
   }
 
+  private accountMigrationTasks(): string[] {
+    if (this.activeForegroundTurnId || this.autonomousTurn || this.pendingPermissions.size > 0) {
+      throw new ClaudeAccountError(
+        "Stop the current turn before switching accounts. Background subagents will be resumed.",
+      );
+    }
+    const migration = this.taskProtocolSource.accountMigrationTasks();
+    if (migration.blockedTaskIds.length > 0) {
+      throw new ClaudeAccountError(
+        "Stop background shell commands and workflows before switching accounts; only saved Claude subagents can be resumed safely.",
+      );
+    }
+    const untrackedSidechain = this.sidechainTracker.activeToolUseIds.some((toolId) => {
+      const id = this.taskProtocolSource.resolveSubagentId(toolId);
+      return !id || !this.taskProtocolSource.isDeclared(id);
+    });
+    if (untrackedSidechain) {
+      throw new ClaudeAccountError(
+        "Wait for untracked subagent work to finish before switching accounts.",
+      );
+    }
+    return migration.taskIds;
+  }
+
   private async switchAccount(value: unknown): Promise<void> {
     const account = resolveClaudeAccount(this.accounts, value);
     const selectedId = account?.id ?? DEFAULT_CLAUDE_ACCOUNT;
@@ -2636,49 +2663,87 @@ class ClaudeAgentSession implements AgentSession {
     if (this.switchingAccount) throw new ClaudeAccountError("Account switch already in progress.");
     if (selectedId === currentId) return;
     if (this.closed) throw new ClaudeAccountError("Claude session is closed.");
-    const hasActiveWork =
-      this.activeForegroundTurnId ||
-      this.autonomousTurn ||
-      this.pendingPermissions.size > 0 ||
-      this.taskProtocolSource.hasRunningTasks ||
-      this.sidechainTracker.hasActiveSidechains;
-    if (hasActiveWork) {
-      throw new ClaudeAccountError(
-        "Stop the current turn and background tasks before switching accounts.",
-      );
-    }
+    const migration = { taskIds: this.accountMigrationTasks() };
     this.switchingAccount = true;
+    let retired = false;
+    let interruptedTaskIds: string[] = [];
+    let switchError: unknown;
     try {
       const sourceConfigDir =
         this.buildSdkEnv().CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
       const sourcePath = this.claudeSessionId
         ? this.resolveHistoryPath(this.claudeSessionId)
         : null;
-      // A retired process must finish writing before we copy its transcript.
-      await this.retireQuery();
-      const targetEnv = createProviderEnv({
-        runtimeSettings: this.runtimeSettings,
-        overlays: [this.launchEnv, claudeAccountEnv(account)],
-      });
-      const targetConfigDir = targetEnv.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
-      let sessionId = this.claudeSessionId;
-      if (sourcePath && sourceConfigDir !== targetConfigDir) {
-        sessionId = await copyClaudeConversation({
-          sourcePath,
-          sourceConfigDir,
-          targetConfigDir,
-          cwd: this.config.cwd,
-        });
+      await validateClaudeAccountSubagents(sourcePath, migration.taskIds);
+      // Recheck after filesystem preflight; reconcile once more after process exit because
+      // the subprocess can still launch work while its query is closing.
+      const latest = this.accountMigrationTasks();
+      if (latest.some((id) => !migration.taskIds.includes(id))) {
+        throw new ClaudeAccountError(
+          "Background work changed while preparing the account switch. Try again once it settles.",
+        );
       }
+      migration.taskIds = latest;
+      // A retired process must finish writing before we copy its transcript.
+      await this.retireQuery(() => {
+        retired = true;
+        const late = this.taskProtocolSource.accountMigrationTasks();
+        migration.taskIds = [...new Set([...migration.taskIds, ...late.taskIds])].filter(
+          (id) => !this.taskProtocolSource.isTaskCompleted(id),
+        );
+        interruptedTaskIds = late.blockedTaskIds;
+      });
+      await validateClaudeAccountSubagents(sourcePath, migration.taskIds);
+      const sessionId = await this.copyAccountConversation(account, sourceConfigDir, sourcePath);
       if (this.closed) throw new ClaudeAccountError("Claude session closed during account switch.");
       this.config.featureValues = { ...this.config.featureValues, account: selectedId };
       this.claudeSessionId = sessionId;
       this.persistence = null;
       this.cachedRuntimeInfo = null;
       this.queryRestartNeeded = false;
+    } catch (error) {
+      const hasRecoveryWork = migration.taskIds.length + interruptedTaskIds.length > 0;
+      if (!retired || !hasRecoveryWork) throw error;
+      // The original account/handle remain selected when copying fails. Ask that account
+      // to recover the stopped work as well; a disk failure must not silently abandon it.
+      switchError = error;
     } finally {
       this.switchingAccount = false;
     }
+    const hasRecoveryWork = migration.taskIds.length + interruptedTaskIds.length > 0;
+    if (hasRecoveryWork && !this.closed) {
+      // startTurn reserves the foreground synchronously. The recovery is a visible turn:
+      // auth failures and a native resume refusal must reach the user, not look like success.
+      await this.startTurn(claudeAccountRecoveryPrompt(migration.taskIds, interruptedTaskIds));
+    }
+    if (switchError) {
+      throw new ClaudeAccountError(
+        "Account switch failed after stopping Claude. Recovery of known subagents was requested on the original account; shutdown may have left additional work unverified.",
+        { cause: switchError },
+      );
+    }
+  }
+
+  private async copyAccountConversation(
+    account: ClaudeAccount | null,
+    sourceConfigDir: string,
+    sourcePath: string | null,
+  ): Promise<string | null> {
+    const targetEnv = createProviderEnv({
+      runtimeSettings: this.runtimeSettings,
+      overlays: [this.launchEnv, claudeAccountEnv(account)],
+    });
+    const targetConfigDir = targetEnv.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    let sessionId = this.claudeSessionId;
+    if (sourcePath && sourceConfigDir !== targetConfigDir) {
+      sessionId = await copyClaudeConversation({
+        sourcePath,
+        sourceConfigDir,
+        targetConfigDir,
+        cwd: this.config.cwd,
+      });
+    }
+    return sessionId;
   }
 
   private async applyFastModeFeature(enabled: boolean, query?: Query): Promise<void> {
@@ -3374,10 +3439,11 @@ class ClaudeAgentSession implements AgentSession {
     return { kind: "fork", messageId: previousTurn.assistantMessageId };
   }
 
-  private async retireQuery(): Promise<void> {
+  private async retireQuery(onRetired?: () => void): Promise<void> {
     const oldQuery = this.query;
     const oldInput = this.input;
     const retiredChild = this.childProcess;
+    const retiredPump = this.queryPumpPromise;
     // Detach before retiring so the old event pump cannot report a crash or
     // fail a turn belonging to the replacement process.
     this.query = null;
@@ -3385,33 +3451,49 @@ class ClaudeAgentSession implements AgentSession {
     this.queryPumpPromise = null;
     this.queryRestartNeeded = false;
     this.childProcess = null;
-    const [settled] = await Promise.allSettled([
-      Promise.resolve().then(() => {
-        oldInput?.end();
-        oldQuery?.close?.();
-        return oldQuery
-          ? withTimeout(oldQuery.return(), 3_000, "Claude did not finish closing its transcript")
-          : undefined;
-      }),
-    ]);
-    if (retiredChild) {
-      try {
-        const result = await terminateWithTreeKill(retiredChild, {
-          gracefulTimeoutMs: 2_000,
-          forceTimeoutMs: 2_000,
-        });
-        if (result === "kill-timeout") {
-          throw new ClaudeAccountError(
-            "Claude has not exited. Cannot safely restart or switch accounts.",
-          );
+    if (oldQuery) this.retiringQueries.add(oldQuery);
+    try {
+      const [settled] = await Promise.allSettled([
+        Promise.resolve().then(() => {
+          oldInput?.end();
+          oldQuery?.close?.();
+          return oldQuery
+            ? withTimeout(oldQuery.return(), 3_000, "Claude did not finish closing its transcript")
+            : undefined;
+        }),
+      ]);
+      if (retiredChild) {
+        try {
+          const result = await terminateWithTreeKill(retiredChild, {
+            gracefulTimeoutMs: 2_000,
+            forceTimeoutMs: 2_000,
+          });
+          if (result === "kill-timeout") {
+            throw new ClaudeAccountError(
+              "Claude has not exited. Cannot safely restart or switch accounts.",
+            );
+          }
+        } catch (error) {
+          this.childProcess = retiredChild;
+          throw error;
         }
-      } catch (error) {
-        this.childProcess = retiredChild;
-        throw error;
       }
-      this.failRunningRuntimeTasks();
+      if (retiredChild || settled.status === "fulfilled") {
+        // The stream may contain task announcements written during shutdown. Drain it before
+        // capturing the final recovery list and clearing runtime statuses.
+        const [drained] = await Promise.allSettled([
+          retiredPump
+            ? withTimeout(retiredPump, 3_000, "Claude shutdown stream did not settle")
+            : undefined,
+        ]);
+        onRetired?.();
+        this.failRunningRuntimeTasks();
+        if (drained.status === "rejected") throw drained.reason;
+      }
+      if (settled.status === "rejected") throw settled.reason;
+    } finally {
+      if (oldQuery) this.retiringQueries.delete(oldQuery);
     }
-    if (settled.status === "rejected") throw settled.reason;
   }
 
   private async ensureQuery(): Promise<Query> {
@@ -4090,12 +4172,17 @@ class ClaudeAgentSession implements AgentSession {
       );
     };
     const handlePumpedMessage = async (message: SDKMessage): Promise<boolean> => {
+      if (!this.acceptsQueryEvents(activeQuery)) return true;
       logRawMessage(message);
       consecutiveInterruptAbortRecoveries = 0;
-      if (await this.handleMissingResumedConversation(message, activeQuery)) {
+      if (
+        this.query === activeQuery &&
+        (await this.handleMissingResumedConversation(message, activeQuery))
+      ) {
         return true;
       }
-      await this.routeSdkMessageFromPump(message);
+      if (!this.acceptsQueryEvents(activeQuery)) return true;
+      await this.routeSdkMessageFromPump(message, activeQuery);
       return false;
     };
     const drainActiveQuery = async (): Promise<boolean> => {
@@ -4184,7 +4271,11 @@ class ClaudeAgentSession implements AgentSession {
     return this.isAssistantishMessage(message);
   }
 
-  private async routeSdkMessageFromPump(message: SDKMessage): Promise<void> {
+  private acceptsQueryEvents(query: Query): boolean {
+    return !this.closed && (this.query === query || this.retiringQueries.has(query));
+  }
+
+  private async routeSdkMessageFromPump(message: SDKMessage, query: Query): Promise<void> {
     if (this.shouldSuppressStaleResult(message)) {
       return;
     }
@@ -4215,6 +4306,7 @@ class ClaudeAgentSession implements AgentSession {
     );
 
     const events = await this.buildPumpedMessageEvents(message, identifiers.messageId, turnId);
+    if (!this.acceptsQueryEvents(query)) return;
 
     if (events.length === 0) {
       return;

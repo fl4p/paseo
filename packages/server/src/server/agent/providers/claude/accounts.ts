@@ -19,8 +19,8 @@ const ParamsSchema = z.object({
 export type ClaudeAccount = z.infer<typeof AccountSchema> & { id: string };
 
 export class ClaudeAccountError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
     this.name = "ClaudeAccountError";
   }
 }
@@ -64,7 +64,7 @@ export function claudeAccountFeature(
       type: "select",
       id: CLAUDE_ACCOUNT_FEATURE,
       label: "Account",
-      tooltip: "Choose a Claude subscription account (stop the current turn before switching)",
+      tooltip: "Choose a Claude subscription account (running subagents resume after switching)",
       value: account?.id ?? DEFAULT_CLAUDE_ACCOUNT,
       options: [
         { id: DEFAULT_CLAUDE_ACCOUNT, label: "Default account" },
@@ -182,4 +182,59 @@ async function copyOptionalDirectory(source: string, target: string): Promise<vo
       force: false,
     });
   }
+}
+
+/** Validate sidecars before stopping work, then again after the writer has exited. */
+export async function validateClaudeAccountSubagents(
+  sourcePath: string | null,
+  taskIds: readonly string[],
+): Promise<void> {
+  if (taskIds.length === 0) return;
+  if (!sourcePath)
+    throw new ClaudeAccountError("Cannot migrate subagents without a saved conversation.");
+  const sourceId = path.basename(sourcePath, ".jsonl");
+  for (const taskId of taskIds) {
+    if (!/^[a-zA-Z0-9_-]+$/.test(taskId)) {
+      throw new ClaudeAccountError("Cannot migrate a subagent with an invalid native ID.");
+    }
+    const transcriptPath = path.join(
+      path.dirname(sourcePath),
+      sourceId,
+      "subagents",
+      `agent-${taskId}.jsonl`,
+    );
+    try {
+      reidentifyTranscript(await fs.readFile(transcriptPath, "utf8"), sourceId);
+      const metadata = z
+        .object({
+          agentType: z.string().min(1),
+          toolUseId: z.string().min(1),
+          stoppedByUser: z.boolean().optional(),
+        })
+        .parse(
+          JSON.parse(await fs.readFile(transcriptPath.replace(/\.jsonl$/, ".meta.json"), "utf8")),
+        );
+      if (metadata.stoppedByUser)
+        throw new Error("This subagent was explicitly stopped by the user.");
+    } catch (error) {
+      throw new ClaudeAccountError(
+        `Cannot migrate subagent ${taskId}: its saved transcript is missing or incomplete. Wait for it to save or finish before switching.`,
+        { cause: error },
+      );
+    }
+  }
+}
+
+export function claudeAccountRecoveryPrompt(
+  taskIds: readonly string[],
+  interruptedTaskIds: readonly string[] = [],
+): string {
+  return [
+    "Paseo stopped the previous Claude process while changing accounts. Continue under the currently selected account.",
+    "You alone coordinate recovery: send exactly one SendMessage (to: ID) to each saved subagent in this list, including nested agents:",
+    JSON.stringify(taskIds),
+    "Send each one this instruction: Continue your original task from your saved context. Your previous process was stopped for an account switch. First inspect the outcome of any interrupted tool or shell command; do not blindly repeat it or duplicate side effects. The coordinator is recovering every listed descendant separately. Do not resume or message descendants as part of recovery, and do not launch replacements.",
+    `Background tasks created during shutdown and interrupted with the old process: ${JSON.stringify(interruptedTaskIds)}. Report these interruptions to the user and inspect their results; do not restart those commands or workflows automatically.`,
+    "Do not launch replacement agents or repeat their original prompts. If a saved agent cannot be resumed, report its ID and the error to the user. Do not claim recovery succeeded until Claude confirms the agent resumed.",
+  ].join("\n");
 }

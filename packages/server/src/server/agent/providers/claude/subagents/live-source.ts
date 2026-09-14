@@ -195,6 +195,7 @@ export class ClaudeTaskProtocolSource {
   private readonly presentationById = new Map<string, ClaudeSubagentPresentationFacts>();
   private readonly lastSubtitleById = new Map<string, string>();
   private readonly unsettledTaskIds = new Set<string>();
+  private readonly resumableTaskIds = new Set<string>();
   private sawTaskStarted = false;
   private sawAnyTask = false;
   private readonly getToolInput: (toolUseId: string) => AgentMetadata | null | undefined;
@@ -207,6 +208,22 @@ export class ClaudeTaskProtocolSource {
 
   get hasRunningTasks(): boolean {
     return this.unsettledTaskIds.size > 0;
+  }
+
+  isTaskCompleted(taskId: string): boolean {
+    const id = this.subagentIdByTaskId.get(taskId);
+    return id !== undefined && this.lastStatusById.get(id) === "completed";
+  }
+
+  /** Every live task must have a saved native agent identity before account migration. */
+  accountMigrationTasks(): { taskIds: string[]; blockedTaskIds: string[] } {
+    const taskIds: string[] = [];
+    const blockedTaskIds: string[] = [];
+    for (const taskId of this.unsettledTaskIds) {
+      if (this.resumableTaskIds.has(taskId)) taskIds.push(taskId);
+      else blockedTaskIds.push(taskId);
+    }
+    return { taskIds, blockedTaskIds };
   }
 
   /**
@@ -316,6 +333,7 @@ export class ClaudeTaskProtocolSource {
    */
   reset(): void {
     this.unsettledTaskIds.clear();
+    this.resumableTaskIds.clear();
     this.subagentIdByTaskId.clear();
     this.taskIdBySubagentId.clear();
     this.canonicalIdByToolUseId.clear();
@@ -381,6 +399,11 @@ export class ClaudeTaskProtocolSource {
     // skip_transcript marks ambient housekeeping the transcript should not show.
     if (!id || message.skip_transcript === true || !isProviderSubagentTask(message)) return [];
 
+    if (message.task_type === CLAUDE_SUBAGENT_TASK_TYPE) {
+      this.resumableTaskIds.add(message.task_id);
+    } else {
+      this.resumableTaskIds.delete(message.task_id);
+    }
     this.sawTaskStarted = true;
     const existingId = this.subagentIdByTaskId.get(message.task_id);
     if (existingId) {
