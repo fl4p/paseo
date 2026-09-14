@@ -724,3 +724,15 @@ describe("ClaudeTaskProtocolSource effort from hooks", () => {
     expect(source.observeHook({ agent_id: 42, effort: { level: 7 } } as never)).toEqual([]);
   });
 });
+
+it("keeps background shell work busy until an explicit terminal status", () => {
+  const source = new ClaudeTaskProtocolSource();
+  source.observe(taskStarted({ task_type: "local_bash", is_backgrounded: true }));
+  expect(source.hasRunningTasks).toBe(true);
+  source.observe(taskUpdated("paused"));
+  expect(source.hasRunningTasks).toBe(true);
+  source.observe(taskUpdated("unrecognized-status"));
+  expect(source.hasRunningTasks).toBe(true);
+  source.observe(taskNotification("completed"));
+  expect(source.hasRunningTasks).toBe(false);
+});

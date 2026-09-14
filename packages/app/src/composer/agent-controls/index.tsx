@@ -9,6 +9,7 @@ import {
   type RefObject,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useMutation } from "@tanstack/react-query";
 import { router } from "expo-router";
 import {
   View,
@@ -122,6 +123,7 @@ interface ControlledAgentControlsProps {
   onCreateAgentProfile?: (seed: AgentProfileSeed) => void;
   onEditAgentProfile?: (profileId: string) => void;
   features?: AgentFeature[];
+  featureStatus?: ReactElement;
   onSetFeature?: (featureId: string, value: unknown) => void;
   onDropdownClose?: () => void;
   onModelSelectorOpen?: () => void;
@@ -492,6 +494,7 @@ function ControlledAgentControls({
   onCreateAgentProfile,
   onEditAgentProfile,
   features,
+  featureStatus,
   onSetFeature,
   onDropdownClose,
   onModelSelectorOpen,
@@ -742,6 +745,7 @@ function ControlledAgentControls({
             thinkingOptions={formattedThinkingOptions}
             selectedThinkingOptionId={selectedThinkingOptionId}
             features={features}
+            featureStatus={featureStatus}
             onSetFeature={onSetFeature}
             onApplyAgentProfile={onApplyAgentProfile}
             onEditAgentProfiles={onEditAgentProfiles}
@@ -791,6 +795,7 @@ function ControlledAgentControls({
             selectedModelId={selectedModelId}
             selectedThinkingOptionId={selectedThinkingOptionId}
             features={features}
+            featureStatus={featureStatus}
             onSetFeature={onSetFeature}
             onApplyAgentProfile={onApplyAgentProfile}
             onEditAgentProfiles={onEditAgentProfiles}
@@ -837,6 +842,7 @@ interface DesktopAgentControlsContentProps {
   thinkingOptions?: AgentControlOption[];
   selectedThinkingOptionId?: string;
   features?: AgentFeature[];
+  featureStatus?: ReactElement;
   onSetFeature?: (featureId: string, value: unknown) => void;
   onApplyAgentProfile?: (profileId: string) => void;
   onEditAgentProfiles?: () => void;
@@ -899,6 +905,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
     thinkingOptions,
     selectedThinkingOptionId,
     features,
+    featureStatus,
     onSetFeature,
     onApplyAgentProfile,
     onEditAgentProfiles,
@@ -1075,6 +1082,7 @@ function DesktopAgentControlsContent(props: DesktopAgentControlsContentProps) {
             onClose={handleCloseSheet}
             testID="agent-features-sheet"
           >
+            {featureStatus}
             {features.map((feature) => (
               <SheetFeatureItem
                 key={`feature-${feature.id}`}
@@ -1109,6 +1117,7 @@ interface SheetAgentControlsContentProps {
   selectedModelId?: string;
   selectedThinkingOptionId?: string;
   features?: AgentFeature[];
+  featureStatus?: ReactElement;
   onSetFeature?: (featureId: string, value: unknown) => void;
   onApplyAgentProfile?: (profileId: string) => void;
   onEditAgentProfiles?: () => void;
@@ -1153,6 +1162,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
     selectedModelId,
     selectedThinkingOptionId,
     features,
+    featureStatus,
     onSetFeature,
     onApplyAgentProfile,
     onEditAgentProfiles,
@@ -1203,6 +1213,7 @@ function SheetAgentControlsContent(props: SheetAgentControlsContentProps) {
 
   const sheetControls = (
     <View style={styles.combinedSheetControls} testID="agent-controls-combined-sheet-controls">
+      {featureStatus}
       {hasThinking ? (
         <>
           <AgentControlTrigger
@@ -1534,6 +1545,27 @@ function ThinkingComboboxOption({
   );
 }
 
+interface FeatureUpdate {
+  featureId: string;
+  value: unknown;
+}
+
+interface FeatureMutationStatusProps {
+  isPending: boolean;
+  error: Error | null;
+}
+
+function FeatureMutationStatus({ isPending, error }: FeatureMutationStatusProps) {
+  if (isPending) return <Text style={styles.settingStatus}>Applying setting…</Text>;
+  if (error)
+    return (
+      <Text style={styles.settingStatus} accessibilityRole="alert">
+        {toErrorMessage(error)}
+      </Text>
+    );
+  return null;
+}
+
 export const AgentControls = memo(function AgentControls({
   agentId,
   serverId,
@@ -1684,30 +1716,31 @@ export const AgentControls = memo(function AgentControls({
     [activeModelId, agentId, agentProvider, client, toast, updatePreferences],
   );
 
-  const handleSetFeature = useCallback(
-    (featureId: string, value: unknown) => {
-      if (!client || !agentProvider) {
-        return;
-      }
-      void updatePreferences((current) =>
+  const featureMutation = useMutation({
+    mutationFn: async ({ featureId, value }: FeatureUpdate) => {
+      if (!client || !agentProvider)
+        throw new Error("Reconnect to the host to change this setting.");
+      await client.setAgentFeature(agentId, featureId, value);
+      await updatePreferences((current) =>
         mergeProviderPreferences({
           preferences: current,
           provider: agentProvider,
-          updates: {
-            featureValues: {
-              [featureId]: value,
-            },
-          },
+          updates: { featureValues: { [featureId]: value } },
         }),
-      ).catch((error) => {
-        console.warn("[AgentControls] persist feature preference failed", error);
-      });
-      void client.setAgentFeature(agentId, featureId, value).catch((error) => {
-        console.warn("[AgentControls] setAgentFeature failed", error);
-        toast.error(toErrorMessage(error));
-      });
+      );
     },
-    [agentId, agentProvider, client, toast, updatePreferences],
+  });
+  const { isPending: isSettingFeature, mutate: setFeature } = featureMutation;
+  const controlsEnabled = Boolean(client) && !isSettingFeature;
+  const featureStatus = useMemo(
+    () => <FeatureMutationStatus isPending={isSettingFeature} error={featureMutation.error} />,
+    [isSettingFeature, featureMutation.error],
+  );
+  const handleSetFeature = useCallback(
+    (featureId: string, value: unknown) => {
+      if (!isSettingFeature) setFeature({ featureId, value });
+    },
+    [isSettingFeature, setFeature],
   );
 
   const commandCenterControls = useMemo<AgentControlCommandCenterSource>(
@@ -1753,7 +1786,7 @@ export const AgentControls = memo(function AgentControls({
   const commandCenterRegistration = (
     <AgentControlCommandCenterRegistration
       sourceId={`agent:${serverId}:${agentId}`}
-      enabled={Boolean(client)}
+      enabled={controlsEnabled}
       controls={commandCenterControls}
     />
   );
@@ -1777,32 +1810,36 @@ export const AgentControls = memo(function AgentControls({
     <>
       {commandCenterRegistration}
       {profileEditor.element}
-      <ControlledAgentControls
-        provider={agent.provider}
-        modelSelectorProviders={agentModelSelectorProviders}
-        modelOptions={modelOptions}
-        selectedModelId={modelSelection.activeModelId ?? undefined}
-        onSelectModel={handleSelectModel}
-        agentProfiles={agentProfiles}
-        onApplyAgentProfile={agentProfiles?.applyProfile}
-        onEditAgentProfiles={handleEditAgentProfiles}
-        onCreateAgentProfile={profileActions.create}
-        onEditAgentProfile={profileActions.edit}
-        thinkingOptions={thinkingOptions.length > 1 ? thinkingOptions : undefined}
-        selectedThinkingOptionId={modelSelection.selectedThinkingId ?? undefined}
-        onSelectThinkingOption={handleSelectThinkingOption}
-        features={agent.features}
-        onSetFeature={handleSetFeature}
-        isModelLoading={snapshotIsLoading || selectedProviderIsLoading}
-        onModelSelectorOpen={handleModelSelectorOpen}
-        onRetryModelProvider={handleRetryModelProvider}
-        isRetryingModelProvider={snapshotIsRefreshing}
-        onDropdownClose={onDropdownClose}
-        disabled={!client}
-        modeControl={modeControl}
-        modelSelectorServerId={serverId}
-        isCompactLayout={isCompactLayout}
-      />
+      <View style={styles.liveControls}>
+        {featureStatus}
+        <ControlledAgentControls
+          provider={agent.provider}
+          modelSelectorProviders={agentModelSelectorProviders}
+          modelOptions={modelOptions}
+          selectedModelId={modelSelection.activeModelId ?? undefined}
+          onSelectModel={handleSelectModel}
+          agentProfiles={agentProfiles}
+          onApplyAgentProfile={agentProfiles?.applyProfile}
+          onEditAgentProfiles={handleEditAgentProfiles}
+          onCreateAgentProfile={profileActions.create}
+          onEditAgentProfile={profileActions.edit}
+          thinkingOptions={thinkingOptions.length > 1 ? thinkingOptions : undefined}
+          selectedThinkingOptionId={modelSelection.selectedThinkingId ?? undefined}
+          onSelectThinkingOption={handleSelectThinkingOption}
+          features={agent.features}
+          featureStatus={featureStatus}
+          onSetFeature={handleSetFeature}
+          isModelLoading={snapshotIsLoading || selectedProviderIsLoading}
+          onModelSelectorOpen={handleModelSelectorOpen}
+          onRetryModelProvider={handleRetryModelProvider}
+          isRetryingModelProvider={snapshotIsRefreshing}
+          onDropdownClose={onDropdownClose}
+          disabled={!controlsEnabled}
+          modeControl={modeControl}
+          modelSelectorServerId={serverId}
+          isCompactLayout={isCompactLayout}
+        />
+      </View>
     </>
   );
 });
@@ -1927,6 +1964,8 @@ export function DraftAgentControls({
 }
 
 const styles = StyleSheet.create((theme) => ({
+  liveControls: { flex: 1, minWidth: 0 },
+  settingStatus: { color: theme.colors.foregroundMuted, fontSize: theme.fontSize.sm },
   container: {
     minWidth: 0,
     flexGrow: 1,

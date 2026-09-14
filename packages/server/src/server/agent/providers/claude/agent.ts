@@ -77,7 +77,12 @@ import {
 } from "./options.js";
 import { renderPromptAttachmentAsText } from "../../prompt-attachments.js";
 import { claudeQuery, type ClaudeOptions, type ClaudeQueryFactory } from "./query.js";
-import { realClaudeRewindSdk, revertClaudeConversation, revertClaudeFiles } from "./rewind.js";
+import {
+  realClaudeRewindSdk,
+  scopedClaudeRewindSdk,
+  revertClaudeConversation,
+  revertClaudeFiles,
+} from "./rewind.js";
 import {
   createClaudeForkTranscriptStore,
   deleteForkedClaudeSession,
@@ -86,6 +91,16 @@ import {
 import { readClaudeCompactSummary } from "./compact-summary.js";
 import { normalizeProviderReplayTimestamp } from "../../provider-history-timestamps.js";
 import { claudeProjectDirSync } from "./project-dir.js";
+import {
+  CLAUDE_ACCOUNT_FEATURE,
+  DEFAULT_CLAUDE_ACCOUNT,
+  ClaudeAccountError,
+  claudeAccountEnv,
+  copyClaudeConversation,
+  parseClaudeAccounts,
+  resolveClaudeAccount,
+  type ClaudeAccount,
+} from "./accounts.js";
 import { THINKING_APPLIES_NEXT_TURN_NOTICE } from "../../provider-notices.js";
 import {
   isProviderImageMarkdown,
@@ -414,9 +429,11 @@ interface ClaudeAgentClientOptions {
   resolveBinary?: () => Promise<string>;
   resolveVersion?: (signal?: AbortSignal) => Promise<string>;
   configDir?: string;
+  providerParams?: unknown;
 }
 
 interface ClaudeAgentSessionOptions {
+  accounts: ClaudeAccount[];
   defaults?: { agents?: Record<string, AgentDefinition> };
   runtimeSettings?: ProviderRuntimeSettings;
   handle?: AgentPersistenceHandle;
@@ -985,6 +1002,9 @@ function coerceSessionMetadata(metadata: AgentMetadata | undefined): Partial<Age
   if (typeof metadata.modeId === "string") {
     result.modeId = metadata.modeId;
   }
+  if (isMetadata(metadata.featureValues)) {
+    result.featureValues = metadata.featureValues;
+  }
   if (typeof metadata.model === "string") {
     result.model = metadata.model;
   }
@@ -1540,6 +1560,7 @@ export class ClaudeAgentClient implements AgentClient {
   private readonly resolveBinary: () => Promise<string>;
   private readonly resolveVersion: (signal?: AbortSignal) => Promise<string>;
   private readonly configDir?: string;
+  private readonly accounts: ClaudeAccount[];
 
   constructor(options: ClaudeAgentClientOptions) {
     this.defaults = options.defaults;
@@ -1550,7 +1571,8 @@ export class ClaudeAgentClient implements AgentClient {
     this.resolveVersion =
       options.resolveVersion ??
       ((signal) => resolveClaudeCodeVersion(this.runtimeSettings, signal));
-    this.configDir = options.configDir;
+    this.configDir = options.configDir ?? options.runtimeSettings?.env?.CLAUDE_CONFIG_DIR;
+    this.accounts = parseClaudeAccounts(options.providerParams);
   }
 
   resolveConfiguredModel(model: AgentModelDefinition): AgentModelDefinition {
@@ -1565,6 +1587,7 @@ export class ClaudeAgentClient implements AgentClient {
     const claudeConfig = this.assertConfig(config);
     return new ClaudeAgentSession(claudeConfig, {
       defaults: this.defaults,
+      accounts: this.accounts,
       runtimeSettings: this.runtimeSettings,
       agentId: launchContext?.agentId,
       launchEnv: launchContext?.env,
@@ -1593,6 +1616,7 @@ export class ClaudeAgentClient implements AgentClient {
     const claudeConfig = this.assertConfig(mergedConfig);
     return new ClaudeAgentSession(claudeConfig, {
       defaults: this.defaults,
+      accounts: this.accounts,
       runtimeSettings: this.runtimeSettings,
       handle,
       agentId: launchContext?.agentId,
@@ -1647,13 +1671,16 @@ export class ClaudeAgentClient implements AgentClient {
     return buildClaudeFeatures({
       modelId: claudeConfig.model,
       fastModeEnabled: claudeConfig.featureValues?.fast_mode === true,
+      accounts: this.accounts,
+      account: claudeConfig.featureValues?.account,
     });
   }
 
   async listImportableSessions(
     options?: ListImportableSessionsOptions,
   ): Promise<ImportableProviderSession[]> {
-    const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    const configDir =
+      this.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
     const sessionsRoot = options?.cwd
       ? claudeProjectDirSync(options.cwd, { configDir })
       : path.join(configDir, "projects");
@@ -1722,6 +1749,7 @@ export class ClaudeAgentClient implements AgentClient {
     if (config.provider !== "claude") {
       throw new Error(`ClaudeAgentClient received config for provider '${config.provider}'`);
     }
+    resolveClaudeAccount(this.accounts, config.featureValues?.account);
     const model = config.model?.trim();
     const providerOptions = ClaudeProviderOptionsSchema.parse(config.providerOptions ?? {});
     return {
@@ -2073,6 +2101,8 @@ class ClaudeAgentSession implements AgentSession {
   readonly capabilities = CLAUDE_CAPABILITIES;
 
   private readonly config: ClaudeAgentConfig;
+  private readonly accounts: ClaudeAccount[];
+  private switchingAccount = false;
   private readonly launchEnv?: Record<string, string>;
   private readonly agentId?: string;
   private readonly defaults?: { agents?: Record<string, AgentDefinition> };
@@ -2163,6 +2193,7 @@ class ClaudeAgentSession implements AgentSession {
 
   constructor(config: ClaudeAgentConfig, options: ClaudeAgentSessionOptions) {
     this.config = config;
+    this.accounts = options.accounts;
     assertClaudeThinkingOptionSupported(config.model, config.thinkingOptionId);
     this.launchEnv = options.launchEnv;
     this.agentId = options.agentId;
@@ -2211,6 +2242,8 @@ class ClaudeAgentSession implements AgentSession {
     return buildClaudeFeatures({
       modelId: this.config.model,
       fastModeEnabled: this.config.featureValues?.fast_mode === true,
+      accounts: this.accounts,
+      account: this.config.featureValues?.account,
     });
   }
 
@@ -2263,6 +2296,9 @@ class ClaudeAgentSession implements AgentSession {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<{ turnId: string }> {
+    if (this.switchingAccount) {
+      throw new ClaudeAccountError("Account switch in progress. Try again when it finishes.");
+    }
     if (this.closed) {
       throw new Error("Claude session is closed");
     }
@@ -2575,6 +2611,10 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   async setFeature(featureId: string, value: unknown): Promise<void> {
+    if (featureId === CLAUDE_ACCOUNT_FEATURE) {
+      await this.switchAccount(value);
+      return;
+    }
     if (featureId !== "fast_mode") {
       throw new Error(`Unknown Claude feature: ${featureId}`);
     }
@@ -2587,6 +2627,58 @@ class ClaudeAgentSession implements AgentSession {
     }
 
     await this.applyFastModeFeature(enabled);
+  }
+
+  private async switchAccount(value: unknown): Promise<void> {
+    const account = resolveClaudeAccount(this.accounts, value);
+    const selectedId = account?.id ?? DEFAULT_CLAUDE_ACCOUNT;
+    const currentId = this.config.featureValues?.account ?? DEFAULT_CLAUDE_ACCOUNT;
+    if (this.switchingAccount) throw new ClaudeAccountError("Account switch already in progress.");
+    if (selectedId === currentId) return;
+    if (this.closed) throw new ClaudeAccountError("Claude session is closed.");
+    const hasActiveWork =
+      this.activeForegroundTurnId ||
+      this.autonomousTurn ||
+      this.pendingPermissions.size > 0 ||
+      this.taskProtocolSource.hasRunningTasks ||
+      this.sidechainTracker.hasActiveSidechains;
+    if (hasActiveWork) {
+      throw new ClaudeAccountError(
+        "Stop the current turn and background tasks before switching accounts.",
+      );
+    }
+    this.switchingAccount = true;
+    try {
+      const sourceConfigDir =
+        this.buildSdkEnv().CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+      const sourcePath = this.claudeSessionId
+        ? this.resolveHistoryPath(this.claudeSessionId)
+        : null;
+      // A retired process must finish writing before we copy its transcript.
+      await this.retireQuery();
+      const targetEnv = createProviderEnv({
+        runtimeSettings: this.runtimeSettings,
+        overlays: [this.launchEnv, claudeAccountEnv(account)],
+      });
+      const targetConfigDir = targetEnv.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+      let sessionId = this.claudeSessionId;
+      if (sourcePath && sourceConfigDir !== targetConfigDir) {
+        sessionId = await copyClaudeConversation({
+          sourcePath,
+          sourceConfigDir,
+          targetConfigDir,
+          cwd: this.config.cwd,
+        });
+      }
+      if (this.closed) throw new ClaudeAccountError("Claude session closed during account switch.");
+      this.config.featureValues = { ...this.config.featureValues, account: selectedId };
+      this.claudeSessionId = sessionId;
+      this.persistence = null;
+      this.cachedRuntimeInfo = null;
+      this.queryRestartNeeded = false;
+    } finally {
+      this.switchingAccount = false;
+    }
   }
 
   private async applyFastModeFeature(enabled: boolean, query?: Query): Promise<void> {
@@ -2849,6 +2941,11 @@ class ClaudeAgentSession implements AgentSession {
     return Array.from(commandMap.values()).sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  private rewindSdk() {
+    const configDir = this.buildSdkEnv().CLAUDE_CONFIG_DIR;
+    return configDir ? scopedClaudeRewindSdk(this.config.cwd, configDir) : realClaudeRewindSdk;
+  }
+
   async revertConversation(input: { messageId: string }): Promise<void> {
     const target = this.resolveConversationRewindTarget(input.messageId);
     if (target.kind === "fresh-session") {
@@ -2856,7 +2953,7 @@ class ClaudeAgentSession implements AgentSession {
       return;
     }
     await revertClaudeConversation({
-      sdk: realClaudeRewindSdk,
+      sdk: this.rewindSdk(),
       sessionId: this.claudeSessionId,
       messageId: target.messageId,
       resolveMessageId: (messageId) => this.resolveClaudeMessageId(messageId),
@@ -2890,7 +2987,7 @@ class ClaudeAgentSession implements AgentSession {
   }): Promise<{ providerHandleId: string }> {
     const sessionId = this.claudeSessionId;
     const fork = await forkClaudeSession({
-      sdk: realClaudeRewindSdk,
+      sdk: this.rewindSdk(),
       sessionId,
       boundaryMessageId: input.boundaryMessageId,
       // While a turn is running the transcript is a moving target: cut at the
@@ -2931,7 +3028,7 @@ class ClaudeAgentSession implements AgentSession {
    */
   async deleteForkedProviderSession(input: { providerHandleId: string }): Promise<void> {
     await deleteForkedClaudeSession({
-      sdk: realClaudeRewindSdk,
+      sdk: this.rewindSdk(),
       forkSessionId: input.providerHandleId,
       sourceSessionId: this.claudeSessionId,
     });
@@ -3277,51 +3374,64 @@ class ClaudeAgentSession implements AgentSession {
     return { kind: "fork", messageId: previousTurn.assistantMessageId };
   }
 
+  private async retireQuery(): Promise<void> {
+    const oldQuery = this.query;
+    const oldInput = this.input;
+    const retiredChild = this.childProcess;
+    // Detach before retiring so the old event pump cannot report a crash or
+    // fail a turn belonging to the replacement process.
+    this.query = null;
+    this.input = null;
+    this.queryPumpPromise = null;
+    this.queryRestartNeeded = false;
+    this.childProcess = null;
+    const [settled] = await Promise.allSettled([
+      Promise.resolve().then(() => {
+        oldInput?.end();
+        oldQuery?.close?.();
+        return oldQuery
+          ? withTimeout(oldQuery.return(), 3_000, "Claude did not finish closing its transcript")
+          : undefined;
+      }),
+    ]);
+    if (retiredChild) {
+      try {
+        const result = await terminateWithTreeKill(retiredChild, {
+          gracefulTimeoutMs: 2_000,
+          forceTimeoutMs: 2_000,
+        });
+        if (result === "kill-timeout") {
+          throw new ClaudeAccountError(
+            "Claude has not exited. Cannot safely restart or switch accounts.",
+          );
+        }
+      } catch (error) {
+        this.childProcess = retiredChild;
+        throw error;
+      }
+      this.failRunningRuntimeTasks();
+    }
+    if (settled.status === "rejected") throw settled.reason;
+  }
+
   private async ensureQuery(): Promise<Query> {
+    if (this.switchingAccount) throw new ClaudeAccountError("Account switch in progress.");
     if (this.query && !this.queryRestartNeeded) {
       return this.query;
     }
 
-    if (this.queryRestartNeeded && this.query) {
-      const oldQuery = this.query;
-      const oldInput = this.input;
-      // Null out query/input BEFORE awaiting the old iterator's return so the
-      // old pump sees this.query !== activeQuery and skips failActiveTurns.
-      this.query = null;
-      this.input = null;
-      this.queryPumpPromise = null;
-      this.queryRestartNeeded = false;
-      // Ending the input retires the process on purpose. Detach first so its
-      // exit is not reported as a crash.
-      const retiredChild = this.childProcess;
-      this.childProcess = null;
-      if (retiredChild) this.failRunningRuntimeTasks();
-      oldInput?.end();
-      oldQuery.close?.();
-      try {
-        await oldQuery.return?.();
-      } catch {
-        /* ignore */
-      }
-      // Tree-kill the old process tree now that the SDK has cleaned up.
-      // If we skip this, MCP children of the previous claude process can
-      // survive as orphans when the session spawns a replacement query.
-      if (retiredChild) {
-        await terminateWithTreeKill(retiredChild, {
-          gracefulTimeoutMs: 2_000,
-          forceTimeoutMs: 2_000,
-        }).catch(() => {
-          /* process may already be dead */
-        });
-      }
-    }
+    if (this.queryRestartNeeded || (!this.query && this.childProcess)) await this.retireQuery();
 
     // Preserve claudeSessionId across query recreation so buildOptions() passes
     // resume: sessionId and the new query continues the existing conversation.
     this.persistence = null;
 
     const input = createAsyncMessageInput<SDKUserMessage>();
+    const selectedAccount = this.config.featureValues?.account;
     const options = await this.buildOptions();
+    if (this.switchingAccount || selectedAccount !== this.config.featureValues?.account) {
+      throw new ClaudeAccountError("The account changed while Claude was starting. Please retry.");
+    }
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
     this.query = claudeQuery(
@@ -3329,6 +3439,9 @@ class ClaudeAgentSession implements AgentSession {
       {
         runtimeSettings: this.runtimeSettings,
         launchEnv: this.launchEnv,
+        accountEnv: claudeAccountEnv(
+          resolveClaudeAccount(this.accounts, this.config.featureValues?.account),
+        ),
         queryFactory: this.queryFactory,
         onChildProcess: (child) => {
           this.childProcess = child;
@@ -3425,7 +3538,10 @@ class ClaudeAgentSession implements AgentSession {
     return createProviderEnv({
       baseEnv: process.env,
       runtimeSettings: this.runtimeSettings,
-      overlays: [this.launchEnv],
+      overlays: [
+        this.launchEnv,
+        claudeAccountEnv(resolveClaudeAccount(this.accounts, this.config.featureValues?.account)),
+      ],
     });
   }
 
@@ -5366,7 +5482,7 @@ class ClaudeAgentSession implements AgentSession {
   private resolveHistoryPath(sessionId: string): string | null {
     const cwd = this.config.cwd;
     if (!cwd) return null;
-    const configDir = process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
+    const configDir = this.buildSdkEnv().CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
     const candidates = [cwd];
     try {
       const realCwd = fs.realpathSync(cwd);
