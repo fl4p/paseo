@@ -238,10 +238,42 @@ function isModelAvailableInClaudeCode(
   model: ClaudeModelManifestEntry,
   claudeCodeVersion: string | undefined,
 ): boolean {
-  if (!model.minimumClaudeCodeVersion || claudeCodeVersion === undefined) {
+  return isClaudeCodeVersionSufficient(model.minimumClaudeCodeVersion, claudeCodeVersion);
+}
+
+/**
+ * Whether an installed Claude Code satisfies a model's minimum version.
+ *
+ * An unknown minimum or an unknown installed version means "offer it": hiding a model because we
+ * could not read a version is worse than offering one Claude Code rejects with a clear error.
+ */
+export function isClaudeCodeVersionSufficient(
+  minimumClaudeCodeVersion: string | undefined,
+  claudeCodeVersion: string | undefined,
+): boolean {
+  if (!minimumClaudeCodeVersion || claudeCodeVersion === undefined) {
     return true;
   }
-  return compareVersions(claudeCodeVersion, model.minimumClaudeCodeVersion) >= 0;
+  return compareVersions(claudeCodeVersion, minimumClaudeCodeVersion) >= 0;
+}
+
+/**
+ * Build thinking options for a model described outside the compiled manifest, from the effort
+ * level IDs it reports. Unknown levels are dropped so a future effort name cannot reach the UI
+ * as an unlabelled option.
+ */
+export function buildClaudeEffortThinkingOptions(
+  effortLevelIds: readonly string[],
+): AgentSelectOption[] {
+  const effortLevels = effortLevelIds.filter(isClaudeEffortLevel);
+  if (effortLevels.length === 0) {
+    return [];
+  }
+  return buildThinkingOptions(effortLevels, false) ?? [];
+}
+
+function isClaudeEffortLevel(value: string): value is ClaudeEffortLevel {
+  return Object.hasOwn(CLAUDE_EFFORT_LABELS, value);
 }
 
 function compareVersions(left: string, right: string): number {

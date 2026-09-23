@@ -39,6 +39,57 @@ async function createClaudeConfigDirWithRawSettings(settings: string): Promise<s
   return configDir;
 }
 
+interface ServedCatalogModelFixture {
+  id: string;
+  name?: string;
+  description?: string;
+  min_claude_code_version?: string;
+  thinking?: unknown;
+}
+
+async function createClaudeConfigDirWithServedCatalog(
+  files: Record<string, unknown>,
+  settings?: unknown,
+): Promise<string> {
+  const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-models-"));
+  createdClaudeConfigDirs.push(configDir);
+  if (settings !== undefined) {
+    await fs.writeFile(path.join(configDir, "settings.json"), JSON.stringify(settings, null, 2));
+  }
+  const catalogDir = path.join(configDir, "cache", "model-catalog");
+  await fs.mkdir(catalogDir, { recursive: true });
+  for (const [name, contents] of Object.entries(files)) {
+    await fs.writeFile(
+      path.join(catalogDir, name),
+      typeof contents === "string" ? contents : JSON.stringify(contents),
+    );
+  }
+  return configDir;
+}
+
+function servedCatalogFile(
+  models: ServedCatalogModelFixture[],
+  fetchedAt = 1_790_000_000_000,
+): unknown {
+  return {
+    version: 1,
+    fetchedAt,
+    staleAt: fetchedAt + 3_600_000,
+    catalog: { surface: "cc", config: { id: "cc", models } },
+  };
+}
+
+const SERVED_EFFORT_THINKING = {
+  type: "effort",
+  effort_options: [
+    { id: "low", name: "Low" },
+    { id: "medium", name: "Medium" },
+    { id: "high", name: "High" },
+    { id: "xhigh", name: "Extra" },
+    { id: "max", name: "Max" },
+  ],
+};
+
 function createCatalogClient(claudeCodeVersion = "2.1.219"): ClaudeAgentClient {
   return new ClaudeAgentClient({
     logger: createTestLogger(),
@@ -349,6 +400,10 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
   });
 
   it("omits models that require a newer Claude Code version", async () => {
+    // An empty config dir, so a developer's own settings and model catalog stay out of the list.
+    const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-models-"));
+    createdClaudeConfigDirs.push(configDir);
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
     const client = createCatalogClient("2.1.218");
 
     const { models } = await client.fetchCatalog({
@@ -359,6 +414,146 @@ describe("ClaudeAgentClient.fetchCatalog", () => {
 
     expect(models.map((model) => model.id)).not.toContain("claude-opus-5[1m]");
     expect(models.map((model) => model.id)).not.toContain("claude-opus-5");
+  });
+});
+
+describe("ClaudeAgentClient.fetchCatalog served catalog", () => {
+  it("offers a model Claude Code serves that this build has never heard of", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "acct-hash-cc.json": servedCatalogFile([
+        {
+          id: "claude-opus-6",
+          name: "Opus 6",
+          description: "Most capable for ambitious work",
+          thinking: SERVED_EFFORT_THINKING,
+        },
+      ]),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    // First, so a newly released flagship is not buried under the models it supersedes.
+    expect(models[0]).toEqual({
+      provider: "claude",
+      id: "claude-opus-6",
+      label: "Opus 6",
+      description: "Most capable for ambitious work",
+      thinkingOptions: [
+        { id: "low", label: "Low" },
+        { id: "medium", label: "Medium" },
+        { id: "high", label: "High", isDefault: true },
+        { id: "xhigh", label: "Extra High" },
+        { id: "max", label: "Max" },
+        { id: CLAUDE_ULTRACODE_THINKING_OPTION_ID, label: "Ultra Code" },
+      ],
+      defaultThinkingOptionId: "high",
+    });
+    expect(models.slice(1)).toEqual(getClaudeModels("2.1.280"));
+  });
+
+  it("keeps the curated manifest entry for a model the served catalog also lists", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "acct-hash-cc.json": servedCatalogFile([
+        { id: "claude-opus-5", name: "Opus 5", thinking: SERVED_EFFORT_THINKING },
+        // Claude Code serves Haiku under its dated spelling; the manifest ships the short one.
+        { id: "claude-haiku-4-5-20251001", name: "Haiku 4.5" },
+      ]),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(models).toEqual(getClaudeModels("2.1.280"));
+  });
+
+  it("omits a served model that requires a newer Claude Code version", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "acct-hash-cc.json": servedCatalogFile([
+        { id: "claude-opus-6", name: "Opus 6", min_claude_code_version: "2.1.280" },
+      ]),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.279");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(models.map((model) => model.id)).not.toContain("claude-opus-6");
+  });
+
+  it("uses the most recently fetched catalog when several accounts cached one", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "old-cc.json": servedCatalogFile([{ id: "claude-opus-6", name: "Opus 6" }], 1),
+      "new-cc.json": servedCatalogFile([{ id: "claude-opus-7", name: "Opus 7" }], 2),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    const ids = models.map((model) => model.id);
+    expect(ids).toContain("claude-opus-7");
+    expect(ids).not.toContain("claude-opus-6");
+  });
+
+  it("falls back to the manifest when the cached catalog is unusable", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "broken-cc.json": "{ nope",
+      "published-floor.json": servedCatalogFile([{ id: "claude-opus-6", name: "Opus 6" }]),
+      "other-surface-cc.json": {
+        fetchedAt: 9,
+        catalog: { surface: "web", config: { models: [{ id: "claude-opus-8" }] } },
+      },
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(models).toEqual(getClaudeModels("2.1.280"));
+  });
+
+  it("still appends settings.json models alongside a served catalog", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog(
+      { "acct-hash-cc.json": servedCatalogFile([{ id: "claude-opus-6", name: "Opus 6" }]) },
+      { model: "glm-5.1" },
+    );
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(models.map((model) => model.id)).toEqual([
+      "claude-opus-6",
+      ...getClaudeModels("2.1.280").map((model) => model.id),
+      "glm-5.1",
+    ]);
   });
 });
 

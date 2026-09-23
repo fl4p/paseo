@@ -1,5 +1,4 @@
 import * as fs from "node:fs/promises";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { Logger } from "pino";
 
@@ -10,6 +9,7 @@ import {
   normalizeClaudeManifestModelId,
   normalizeClaudeRuntimeModelId as normalizeClaudeManifestRuntimeModelId,
 } from "./model-manifest.js";
+import { readClaudeServedCatalogModels, resolveClaudeConfigDir } from "./served-catalog.js";
 
 const CLAUDE_SETTINGS_MODEL_ENV_KEYS = [
   "ANTHROPIC_MODEL",
@@ -53,13 +53,20 @@ export async function getClaudeModelsWithSettings(
   configDir?: string,
   claudeCodeVersion?: string,
 ): Promise<AgentModelDefinition[]> {
-  const hardcodedModels = getClaudeModels(claudeCodeVersion);
+  const manifestModels = getClaudeModels(claudeCodeVersion);
+  const servedModels = await readClaudeServedCatalogModels(logger, configDir, claudeCodeVersion);
   const settingsModels = await readClaudeSettingsModels(logger, configDir);
-  if (settingsModels.length === 0) {
-    return hardcodedModels;
-  }
 
-  const models = [...hardcodedModels];
+  // Served rows the manifest already curates are dropped: the manifest knows the 1M variants,
+  // the fast-mode flag and the disabled-thinking capability, none of which the served rows carry.
+  // What is left is a model released after this build, and it goes first so a new flagship is not
+  // buried under models it supersedes.
+  // Dedupe against the whole manifest, not the version-filtered list: a served row must never
+  // resurrect a model the manifest deliberately hides on this Claude Code version.
+  const models = [...selectUnknownServedModels(servedModels, getClaudeModels()), ...manifestModels];
+  if (settingsModels.length === 0) {
+    return models;
+  }
 
   for (const model of settingsModels) {
     const existingIndex = models.findIndex((candidate) => candidate.id === model.id);
@@ -74,6 +81,24 @@ export async function getClaudeModelsWithSettings(
   }
 
   return models;
+}
+
+function selectUnknownServedModels(
+  servedModels: AgentModelDefinition[],
+  allManifestModels: AgentModelDefinition[],
+): AgentModelDefinition[] {
+  const knownIds = new Set(allManifestModels.map((model) => model.id));
+  const unknown: AgentModelDefinition[] = [];
+  for (const model of servedModels) {
+    // A served ID can be a dated spelling of a manifest entry (claude-haiku-4-5-20251001).
+    const manifestModelId = normalizeClaudeManifestModelId(model.id);
+    if (knownIds.has(model.id) || (manifestModelId && knownIds.has(manifestModelId))) {
+      continue;
+    }
+    knownIds.add(model.id);
+    unknown.push(model);
+  }
+  return unknown;
 }
 
 async function readClaudeSettingsModels(
@@ -113,10 +138,6 @@ async function readClaudeSettingsModels(
   }
 
   return models;
-}
-
-function resolveClaudeConfigDir(configDir?: string): string {
-  return configDir ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 }
 
 function addSettingsModel(
