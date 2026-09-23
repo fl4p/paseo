@@ -29,6 +29,7 @@ describe("readClaudePeerMessage", () => {
   test("reads the sender and the body without the envelope", () => {
     expect(readClaudePeerMessage(peerEntry())).toEqual({
       text: "I changed things under you on farmgw.",
+      msgId: null,
       origin: {
         kind: "peer",
         name: "dragino",
@@ -44,8 +45,22 @@ describe("readClaudePeerMessage", () => {
 
     expect(readClaudePeerMessage(entry)).toEqual({
       text: expect.stringContaining("<cross-session-message"),
+      msgId: null,
       origin: { kind: "peer", address: "uds:/tmp/cc-socks/65428.sock" },
     });
+  });
+
+  test("reads the delivery id that both carriers share", () => {
+    const entry = peerEntry({
+      origin: {
+        kind: "peer",
+        from: "uds:/tmp/cc-socks/65428.sock",
+        msg_id: "f1e8257d-5444-4c3f-8a17-07573bea4c61",
+        body: "I changed things under you on farmgw.",
+      },
+    });
+
+    expect(readClaudePeerMessage(entry)?.msgId).toBe("f1e8257d-5444-4c3f-8a17-07573bea4c61");
   });
 
   test("ignores every other origin, including the person at the keyboard", () => {
