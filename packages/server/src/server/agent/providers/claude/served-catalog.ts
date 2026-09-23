@@ -43,6 +43,26 @@ interface ServedCatalogModel {
   description?: string;
   minClaudeCodeVersion?: string;
   effortOptionIds?: string[];
+  supportsFastMode?: boolean;
+}
+
+/**
+ * Served model IDs that declared fast mode, from the last catalog read.
+ *
+ * Fast mode is answered synchronously from a model ID alone (a session's `features` getter), so
+ * the served answer cannot be fetched on demand and is snapshotted here instead. Empty until the
+ * first catalog read, and reset by every read including a failed one: a model that briefly loses
+ * the toggle is a much smaller error than one that offers a flag Claude Code will reject.
+ */
+let servedFastModeModelIds: ReadonlySet<string> = new Set();
+
+/**
+ * Whether the served catalog says this model supports fast mode. Callers must OR this with the
+ * manifest answer — the manifest, not the cache, is the source of truth for the models it ships.
+ */
+export function claudeServedModelSupportsFastMode(modelId: string | null | undefined): boolean {
+  const trimmed = typeof modelId === "string" ? modelId.trim() : "";
+  return trimmed.length > 0 && servedFastModeModelIds.has(trimmed);
 }
 
 /**
@@ -64,6 +84,7 @@ export async function readClaudeServedCatalogModels(
     entries = await fs.readdir(catalogDir);
   } catch (error) {
     logger.debug({ err: error, catalogDir }, "No Claude served model catalog cache");
+    servedFastModeModelIds = new Set();
     return [];
   }
 
@@ -80,16 +101,22 @@ export async function readClaudeServedCatalogModels(
       ? await readNewestServedCatalog(logger, catalogDir, accountEntries)
       : undefined) ?? (await readNewestServedCatalog(logger, catalogDir, entries));
   if (!newest) {
+    servedFastModeModelIds = new Set();
     return [];
   }
 
   const definitions: AgentModelDefinition[] = [];
+  const fastModeModelIds = new Set<string>();
   for (const model of newest) {
     if (!isClaudeCodeVersionSufficient(model.minClaudeCodeVersion, claudeCodeVersion)) {
       continue;
     }
+    if (model.supportsFastMode === true) {
+      fastModeModelIds.add(model.id);
+    }
     definitions.push(toModelDefinition(model));
   }
+  servedFastModeModelIds = fastModeModelIds;
   return definitions;
 }
 
@@ -227,6 +254,10 @@ function parseServedCatalogModel(rawModel: unknown): ServedCatalogModel | undefi
       return undefined;
     }
     model.minClaudeCodeVersion = rawModel.min_claude_code_version;
+  }
+
+  if (rawModel.fast_mode === true) {
+    model.supportsFastMode = true;
   }
 
   const thinking = rawModel.thinking;

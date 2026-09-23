@@ -13,6 +13,7 @@ import {
   parseClaudeCodeVersion,
   resolveClaudeDisabledThinkingForModel,
 } from "./model-manifest.js";
+import { claudeModelSupportsFastMode } from "./feature-definitions.js";
 import { findClaudeModel, getClaudeModels, normalizeClaudeRuntimeModelId } from "./models.js";
 
 const createdClaudeConfigDirs: string[] = [];
@@ -44,6 +45,7 @@ interface ServedCatalogModelFixture {
   name?: string;
   description?: string;
   min_claude_code_version?: string;
+  fast_mode?: boolean;
   thinking?: unknown;
 }
 
@@ -656,6 +658,73 @@ describe("ClaudeAgentClient.fetchCatalog served catalog", () => {
       ...getClaudeModels("2.1.280").map((model) => model.id),
       "glm-5.1",
     ]);
+  });
+});
+
+describe("fast mode from the served catalog", () => {
+  async function fetchWithServedModels(models: ServedCatalogModelFixture[]): Promise<void> {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "acct-hash-cc.json": servedCatalogFile(models),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    await createCatalogClient("2.1.280").fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+  }
+
+  it("offers fast mode on a served model that declares it", async () => {
+    await fetchWithServedModels([
+      { id: "claude-opus-6", name: "Opus 6", fast_mode: true },
+      { id: "claude-opus-7", name: "Opus 7" },
+    ]);
+
+    expect(claudeModelSupportsFastMode("claude-opus-6")).toBe(true);
+    expect(claudeModelSupportsFastMode("claude-opus-7")).toBe(false);
+  });
+
+  it("keeps fast mode on a manifest model the served catalog does not flag", async () => {
+    await fetchWithServedModels([{ id: "claude-opus-5", name: "Opus 5" }]);
+
+    expect(claudeModelSupportsFastMode("claude-opus-5")).toBe(true);
+  });
+
+  it("withdraws served fast mode once the catalog no longer offers it", async () => {
+    await fetchWithServedModels([{ id: "claude-opus-6", name: "Opus 6", fast_mode: true }]);
+    expect(claudeModelSupportsFastMode("claude-opus-6")).toBe(true);
+
+    const emptyConfigDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-models-"));
+    createdClaudeConfigDirs.push(emptyConfigDir);
+    vi.stubEnv("CLAUDE_CONFIG_DIR", emptyConfigDir);
+    await createCatalogClient("2.1.280").fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(claudeModelSupportsFastMode("claude-opus-6")).toBe(false);
+  });
+
+  it("does not offer fast mode on a served model gated behind a newer Claude Code", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "acct-hash-cc.json": servedCatalogFile([
+        {
+          id: "claude-opus-6",
+          name: "Opus 6",
+          fast_mode: true,
+          min_claude_code_version: "2.1.999",
+        },
+      ]),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    await createCatalogClient("2.1.280").fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(claudeModelSupportsFastMode("claude-opus-6")).toBe(false);
   });
 });
 
