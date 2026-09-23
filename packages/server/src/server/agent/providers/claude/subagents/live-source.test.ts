@@ -724,3 +724,47 @@ describe("ClaudeTaskProtocolSource effort from hooks", () => {
     expect(source.observeHook({ agent_id: 42, effort: { level: 7 } } as never)).toEqual([]);
   });
 });
+
+it("keeps background shell work busy until an explicit terminal status", () => {
+  const source = new ClaudeTaskProtocolSource();
+  source.observe(taskStarted({ task_type: "local_bash", is_backgrounded: true }));
+  expect(source.hasRunningTasks).toBe(true);
+  source.observe(taskUpdated("paused"));
+  expect(source.hasRunningTasks).toBe(true);
+  source.observe(taskUpdated("unrecognized-status"));
+  expect(source.hasRunningTasks).toBe(true);
+  source.observe(taskNotification("completed"));
+  expect(source.hasRunningTasks).toBe(false);
+});
+
+it("only migrates declared native agents, including nested ones, and forgets completed work", () => {
+  const source = new ClaudeTaskProtocolSource();
+  source.observe(taskStarted());
+  source.observe(taskStarted({ task_id: "nested", tool_use_id: "nested-tool", spawn_depth: 2 }));
+  expect(source.accountMigrationTasks()).toEqual({
+    taskIds: ["a1730a6215e1f5cf6", "nested"],
+    blockedTaskIds: [],
+  });
+  source.observe(taskNotification("completed"));
+  expect(source.accountMigrationTasks().taskIds).toEqual(["nested"]);
+  source.failRunningTasks();
+  expect(source.accountMigrationTasks()).toEqual({ taskIds: [], blockedTaskIds: [] });
+});
+
+it.each([
+  { task_type: "local_bash" },
+  { task_type: "local_workflow" },
+  { task_type: "unknown" },
+  { task_type: undefined },
+  { skip_transcript: true },
+  { tool_use_id: undefined },
+])("refuses migration of unevaluable or non-resumable live work: %j", (overrides) => {
+  const source = new ClaudeTaskProtocolSource();
+  source.observe(taskStarted(overrides));
+  expect(source.accountMigrationTasks()).toEqual({
+    taskIds: [],
+    blockedTaskIds: ["a1730a6215e1f5cf6"],
+  });
+  source.observe(taskNotification("stopped"));
+  expect(source.accountMigrationTasks().blockedTaskIds).toEqual([]);
+});

@@ -22,6 +22,42 @@ Install and sign in to the Claude Code CLI on the machine running Paseo. Paseo u
 
 If your Claude login expires, re-authenticate with the Claude Code CLI, then start a new Claude Code session in Paseo. Existing Paseo sessions keep the authentication they started with, so re-authenticating does not update a session that is already running.
 
+## Multiple subscription accounts
+
+Sign in once per account on the machine running Paseo. Use a different configuration directory for each account:
+
+```sh
+CLAUDE_CONFIG_DIR="$HOME/.claude-work" claude auth login
+CLAUDE_CONFIG_DIR="$HOME/.claude-personal" claude auth login
+```
+
+Complete each login with the intended Anthropic account. Keep API credentials and API-key helpers out of these directories and your project settings when using subscriptions; Claude still loads those settings. Then merge these entries into `$PASEO_HOME/config.json` (normally `~/.paseo/config.json`):
+
+```json
+{
+  "agents": {
+    "providers": {
+      "claude": {
+        "params": {
+          "accounts": {
+            "work": { "label": "Work", "configDir": "~/.claude-work" },
+            "personal": { "label": "Personal", "configDir": "~/.claude-personal" }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Reload the host configuration, or restart Paseo when your running sessions can be stopped. Keep account IDs stable: saved sessions reference them. `default` is reserved for your existing Claude configuration.
+
+Select **Account** in the new-session controls. You can run sessions on different accounts at the same time. To switch an existing conversation, stop its current turn, then select another account in the same controls. On macOS and Linux, running Claude subagents are stopped with the old process and Paseo starts a visible recovery turn under the selected account, asking Claude to resume their saved IDs and context. Keep that recovery turn running until Claude confirms the subagents resumed. On Windows, wait for subagents to finish before switching. Background shell jobs and workflows must finish or be stopped separately before switching; Paseo does not replay them. Paseo keeps the conversation, including compaction and file checkpoints. The selection survives reopening the conversation.
+
+The new account must already be signed in and have available usage. If recovery hits a quota or authentication error, the saved subagent histories remain available; switch to an account with available usage or resolve the error and ask Claude to continue the recovery. Paseo retains pending recovery IDs across switches and session reloads until Claude acknowledges resuming them. Agents explicitly stopped with **Stop subagent** are not automatically resumed. Each subscription keeps its own usage limits. Paseo does not rotate accounts automatically or move credentials between them. An account switch copies that conversation's local transcript and supporting files into the selected account's directory; its previous copy remains in the original directory. Account-specific settings, plugins, and permissions apply to the resumed Claude process.
+
+This requires a Paseo host with account selection support. Older hosts do not offer the Account control. The existing provider usage display reports the default account, not a combined pool or the selected account's balance.
+
 ## Use Claude Code in the Paseo terminal
 
 Claude Code also works great inside the Paseo terminal. If you prefer the standard CLI experience, open a terminal in your workspace and run `claude` as usual.

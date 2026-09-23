@@ -96,6 +96,8 @@ Alibaba's coding plan routes Claude Code to Qwen models via an Anthropic-compati
 
 ## Multiple profiles
 
+For Claude subscription logins with account switching inside a conversation, see [Multiple subscription accounts](/docs/claude-code#multiple-subscription-accounts). The example below uses separately billed API keys.
+
 Create as many entries as you want against the same first-class provider. Each one shows up as a separate option in the app with its own credentials and models.
 
 ```json

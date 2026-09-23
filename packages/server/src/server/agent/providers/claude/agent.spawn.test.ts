@@ -9,6 +9,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import * as spawnUtils from "../../../../utils/spawn.js";
+import * as treeKill from "../../../../utils/tree-kill.js";
 import { ClaudeAgentClient } from "./agent.js";
 import type { ClaudeQueryInput } from "./query.js";
 
@@ -36,6 +37,8 @@ function createQueryMock(events: unknown[]): Query {
 
 function createChildProcessStub(): ChildProcess {
   const child = new EventEmitter() as ChildProcess;
+  // This fixture never starts an OS process; cleanup must observe that fact.
+  child.exitCode = 0;
   child.stderr = new EventEmitter() as ChildProcess["stderr"];
   return child;
 }
@@ -44,6 +47,49 @@ describe("Claude spawn override", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
+
+  test.each(["timeout", "error"])(
+    "keeps the account unchanged if process termination is uncertain: %s",
+    async (failure) => {
+      const captured: Options[] = [];
+      vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(createChildProcessStub());
+      const terminate = vi.spyOn(treeKill, "terminateWithTreeKill");
+      if (failure === "timeout") terminate.mockResolvedValue("kill-timeout");
+      else terminate.mockRejectedValue(new Error("termination probe failed"));
+      const expectedError =
+        failure === "timeout" ? "Claude has not exited" : "termination probe failed";
+      const client = new ClaudeAgentClient({
+        logger: createTestLogger(),
+        resolveBinary: async () => "/test/claude",
+        queryFactory: ({ options }) => {
+          captured.push(options);
+          return createQueryMock([]);
+        },
+        providerParams: { accounts: { work: { label: "Work", configDir: "/tmp/claude-work" } } },
+      });
+      const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+      try {
+        await session.listCommands?.();
+        const launch = captured[0]?.spawnClaudeCodeProcess;
+        if (!launch) throw new Error("No Claude process launcher");
+        launch({
+          command: "/test/claude",
+          args: [],
+          cwd: process.cwd(),
+          env: {},
+          signal: new AbortController().signal,
+        });
+        await expect(session.setFeature?.("account", "work")).rejects.toThrow(expectedError);
+        expect(session.features).toContainEqual(
+          expect.objectContaining({ id: "account", value: "default" }),
+        );
+        await expect(session.listCommands?.()).rejects.toThrow(expectedError);
+      } finally {
+        terminate.mockResolvedValue("already-exited");
+        await session.close();
+      }
+    },
+  );
 
   test("bypasses the shell when spawning Claude Code", async () => {
     let capturedOptions: Options | undefined;
@@ -101,5 +147,6 @@ describe("Claude spawn override", () => {
     expect(claudeSpawnCall).toBeDefined();
     const spawnOptions = claudeSpawnCall?.[2];
     expect(spawnOptions?.shell).toBe(false);
+    expect(spawnOptions?.detached).toBe(process.platform !== "win32");
   });
 });

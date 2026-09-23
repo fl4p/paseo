@@ -629,6 +629,55 @@ async function startAndSteerThroughManager(
   return { manager, agentId: agent.id, workdir };
 }
 
+test("persists the native session identity changed by an account feature before another turn", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-account-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  class AccountSession extends TestAgentSession {
+    nativeId = "original-native-session";
+
+    async setFeature(): Promise<void> {
+      this.nativeId = "selected-account-native-session";
+    }
+
+    override describePersistence() {
+      return { provider: this.provider, sessionId: this.nativeId };
+    }
+
+    override async getRuntimeInfo() {
+      return { ...(await super.getRuntimeInfo()), sessionId: this.nativeId };
+    }
+  }
+  const session = new AccountSession({ provider: "codex", cwd: workdir });
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(): Promise<AgentSession> {
+          return session;
+        }
+      })(),
+    },
+    registry: storage,
+    logger,
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await manager.setAgentFeature(agent.id, "account", "personal");
+    await manager.flush();
+    expect(manager.getAgent(agent.id)?.persistence?.sessionId).toBe(session.nativeId);
+    expect(manager.getAgent(agent.id)?.runtimeInfo?.sessionId).toBe(session.nativeId);
+    const stored = await storage.get(agent.id);
+    expect(stored?.persistence?.sessionId).toBe(session.nativeId);
+    expect(stored?.config.featureValues?.account).toBe("personal");
+  } finally {
+    if (agentId) await manager.closeAgent(agentId);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("uses an injected timeline store without making it a production requirement", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-timeline-store-"));
   const store = new RecordingTimelineStore();

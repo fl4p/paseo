@@ -194,6 +194,8 @@ export class ClaudeTaskProtocolSource {
   /** Claude facts stay inside the provider boundary; clients receive one compact subtitle. */
   private readonly presentationById = new Map<string, ClaudeSubagentPresentationFacts>();
   private readonly lastSubtitleById = new Map<string, string>();
+  private readonly unsettledTaskIds = new Set<string>();
+  private readonly resumableTaskIds = new Set<string>();
   private sawTaskStarted = false;
   private sawAnyTask = false;
   private readonly getToolInput: (toolUseId: string) => AgentMetadata | null | undefined;
@@ -202,6 +204,26 @@ export class ClaudeTaskProtocolSource {
   constructor(input: ClaudeTaskProtocolSourceInput = {}) {
     this.getToolInput = input.getToolInput ?? (() => null);
     this.readWorkflowResult = input.readWorkflowResult ?? (() => undefined);
+  }
+
+  get hasRunningTasks(): boolean {
+    return this.unsettledTaskIds.size > 0;
+  }
+
+  isTaskCompleted(taskId: string): boolean {
+    const id = this.subagentIdByTaskId.get(taskId);
+    return id !== undefined && this.lastStatusById.get(id) === "completed";
+  }
+
+  /** Every live task must have a saved native agent identity before account migration. */
+  accountMigrationTasks(): { taskIds: string[]; blockedTaskIds: string[] } {
+    const taskIds: string[] = [];
+    const blockedTaskIds: string[] = [];
+    for (const taskId of this.unsettledTaskIds) {
+      if (this.resumableTaskIds.has(taskId)) taskIds.push(taskId);
+      else blockedTaskIds.push(taskId);
+    }
+    return { taskIds, blockedTaskIds };
   }
 
   /**
@@ -310,6 +332,8 @@ export class ClaudeTaskProtocolSource {
    * live — see `cancelRunningForegroundTasks`, which is what a turn ending actually warrants.
    */
   reset(): void {
+    this.unsettledTaskIds.clear();
+    this.resumableTaskIds.clear();
     this.subagentIdByTaskId.clear();
     this.taskIdBySubagentId.clear();
     this.canonicalIdByToolUseId.clear();
@@ -344,6 +368,8 @@ export class ClaudeTaskProtocolSource {
       if (this.backgroundedIds.has(id)) continue;
       if (this.lastStatusById.get(id) !== "running") continue;
       this.lastStatusById.set(id, "canceled");
+      const taskId = this.taskIdBySubagentId.get(id);
+      if (taskId) this.unsettledTaskIds.delete(taskId);
       observations.push({ kind: "status", id, status: "canceled" });
     }
     return observations;
@@ -351,6 +377,7 @@ export class ClaudeTaskProtocolSource {
 
   /** A lost Claude process terminates every task it owned, including backgrounded workflows. */
   failRunningTasks(): SubagentObservation[] {
+    this.unsettledTaskIds.clear();
     const observations: SubagentObservation[] = [];
     for (const id of this.declaredIds) {
       if (this.lastStatusById.get(id) !== "running") continue;
@@ -364,6 +391,7 @@ export class ClaudeTaskProtocolSource {
     // Recorded before the filter: what this proves is that the CLI announces its tasks, which is
     // true whether or not this particular one is a subagent.
     this.sawAnyTask = true;
+    this.unsettledTaskIds.add(message.task_id);
 
     const id = readString(message.tool_use_id);
     const parentSubagentId = id ? this.ownerSubagentIdByToolUseId.get(id) : undefined;
@@ -371,6 +399,11 @@ export class ClaudeTaskProtocolSource {
     // skip_transcript marks ambient housekeeping the transcript should not show.
     if (!id || message.skip_transcript === true || !isProviderSubagentTask(message)) return [];
 
+    if (message.task_type === CLAUDE_SUBAGENT_TASK_TYPE) {
+      this.resumableTaskIds.add(message.task_id);
+    } else {
+      this.resumableTaskIds.delete(message.task_id);
+    }
     this.sawTaskStarted = true;
     const existingId = this.subagentIdByTaskId.get(message.task_id);
     if (existingId) {
@@ -457,7 +490,15 @@ export class ClaudeTaskProtocolSource {
     return observations;
   }
 
+  private recordTaskSettled(taskId: string, status: string | undefined): void {
+    const mapped = mapTaskStatus(status);
+    if (mapped === "completed" || mapped === "failed" || mapped === "canceled") {
+      this.unsettledTaskIds.delete(taskId);
+    }
+  }
+
   private observeTaskUpdated(message: TaskUpdatedMessage): SubagentObservation[] {
+    this.recordTaskSettled(message.task_id, message.patch?.status);
     const id = this.subagentIdByTaskId.get(message.task_id);
     const backgrounded = message.patch?.is_backgrounded;
     if (id && typeof backgrounded === "boolean") {
@@ -468,6 +509,7 @@ export class ClaudeTaskProtocolSource {
   }
 
   private observeTaskNotification(message: TaskNotificationMessage): SubagentObservation[] {
+    this.recordTaskSettled(message.task_id, message.status);
     const observations = this.observeWorkflowResult(message);
     observations.push(...this.observeUsage(message.task_id, message.usage));
     observations.push(...this.observeStatus(message.task_id, message.status));

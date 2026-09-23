@@ -229,6 +229,14 @@ export class ClaudeSidechainTracker {
     this.activeSidechains.delete(toolUseId);
   }
 
+  get activeToolUseIds(): readonly string[] {
+    return [...this.activeSidechains.keys()];
+  }
+
+  get hasActiveSidechains(): boolean {
+    return this.activeSidechains.size > 0;
+  }
+
   clear(): void {
     this.activeSidechains.clear();
   }

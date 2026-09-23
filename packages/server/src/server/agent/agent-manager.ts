@@ -2014,6 +2014,10 @@ export class AgentManager {
     await agent.session.setFeature(featureId, value);
     await this.drainSessionEvents(agentId);
     agent.config.featureValues = { ...agent.config.featureValues, [featureId]: value };
+    // A feature such as account selection can replace the native conversation.
+    // Save its handle together with the selected feature before the next turn.
+    this.refreshSessionPersistence(agent);
+    await this.refreshRuntimeInfo(agent, { emit: false });
     this.touchUpdatedAt(agent);
     this.emitState(agent);
   }

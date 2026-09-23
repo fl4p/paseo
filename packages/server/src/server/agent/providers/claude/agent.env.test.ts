@@ -5,6 +5,7 @@ import { createTestLogger } from "../../../../test-utils/test-logger.js";
 import type { AgentLaunchContext } from "../../agent-sdk-types.js";
 import { ClaudeAgentClient } from "./agent.js";
 import type { ClaudeQueryInput } from "./query.js";
+import type { ClaudeOptions } from "./query.js";
 
 function createQueryMock(events: unknown[]): Query {
   let index = 0;
@@ -29,6 +30,68 @@ function createQueryMock(events: unknown[]): Query {
 }
 
 describe("Claude SDK env", () => {
+  test("the spawned process receives the selected account even when the SDK and launch context carry other credentials", async () => {
+    const captured: ClaudeOptions[] = [];
+    const client = new ClaudeAgentClient({
+      logger: createTestLogger(),
+      resolveBinary: async () => "/test/claude",
+      queryFactory: ({ options }) => {
+        captured.push(options);
+        return createQueryMock([]);
+      },
+      runtimeSettings: {
+        env: { CLAUDE_CONFIG_DIR: "/tmp/provider-account", ANTHROPIC_API_KEY: "provider-test-key" },
+      },
+      providerParams: { accounts: { work: { label: "Work", configDir: "/tmp/selected-account" } } },
+    });
+    const session = await client.createSession(
+      { provider: "claude", cwd: process.cwd(), featureValues: { account: "work" } },
+      {
+        env: {
+          CLAUDE_CONFIG_DIR: "/tmp/launch-account",
+          CLAUDE_CODE_OAUTH_TOKEN: "launch-test-token",
+        },
+      },
+    );
+    try {
+      await session.listCommands?.();
+      const options = captured[0];
+      if (!options?.spawnClaudeCodeProcess) throw new Error("Missing Claude process launcher");
+      const child = options.spawnClaudeCodeProcess({
+        command: process.execPath,
+        args: [
+          "-e",
+          "process.stdout.write(JSON.stringify({configDir:process.env.CLAUDE_CONFIG_DIR,hasApiKey:!!process.env.ANTHROPIC_API_KEY,hasToken:!!process.env.CLAUDE_CODE_OAUTH_TOKEN}))",
+        ],
+        cwd: process.cwd(),
+        env: {
+          ...process.env,
+          CLAUDE_CONFIG_DIR: "/tmp/sdk-account",
+          ANTHROPIC_API_KEY: "sdk-test-key",
+        },
+        signal: new AbortController().signal,
+      });
+      let output = "";
+      child.stdout.on("data", (chunk) => {
+        output += String(chunk);
+      });
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code) => {
+          if (code === 0) resolve();
+          else reject(new Error(`Child exited ${code}`));
+        });
+      });
+      expect(JSON.parse(output)).toEqual({
+        configDir: "/tmp/selected-account",
+        hasApiKey: false,
+        hasToken: false,
+      });
+    } finally {
+      await session.close();
+    }
+  });
+
   test("forwards launch-context env through Claude process env", async () => {
     let capturedEnv: Record<string, string | undefined> | undefined;
     const launchContext: AgentLaunchContext = {

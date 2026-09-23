@@ -261,7 +261,9 @@ You can create multiple entries that extend the same built-in provider. Each get
 
 "Profile" here means a provider alias, and it is not an **Agent profile** — that is a named bundle of provider, model, mode, thinking option and features, stored under `daemon.agentProfiles`. See [glossary.md](glossary.md) for all four senses of the word.
 
-Example: two different Anthropic accounts as separate profiles:
+For Claude subscription accounts, configure `agents.providers.claude.params.accounts` and use the Account session control. Setup is in [the Claude Code guide](../public-docs/claude-code.md#multiple-subscription-accounts). Provider aliases below are separate API-key providers; they cannot switch a running conversation between aliases.
+
+Example: two API accounts as separate profiles:
 
 ```json
 {
@@ -711,6 +713,12 @@ Each entry in the `models` array:
 | `label`       | `string`  | Yes      | Display name                        |
 | `description` | `string`  | No       | Short description                   |
 | `isDefault`   | `boolean` | No       | Mark as the default thinking option |
+
+### Claude subscription isolation
+
+Claude's Account control uses isolated `CLAUDE_CONFIG_DIR` directories. Credential refresh stays in the Claude CLI. Account switches retire the old process before copying only the current conversation into a fresh native session ID; the Paseo agent ID is unchanged. Fresh IDs avoid overwriting a newer branch when switching back. Never change the daemon's environment to select an account: concurrent sessions and SDK filesystem operations share it.
+
+Source check (2026-09-14): Anthropic's [environment variable reference](https://code.claude.com/docs/en/env-vars), `CLAUDE_CONFIG_DIR`, and [authentication guide](https://code.claude.com/docs/en/authentication), “Credential management”, were inspected through an isolated Playwright browser. The rendered pages identify the setting as supporting concurrent accounts and state that it also scopes macOS Keychain entries. Both pages returned their documentation content on the first navigation; browser launch required execution outside the filesystem sandbox. The local CLI identified itself as 2.1.270. No credentials were read for this check.
 
 ### Claude settings.json model discovery
 

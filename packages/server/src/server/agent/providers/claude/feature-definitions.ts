@@ -1,4 +1,5 @@
 import type { AgentFeature, AgentFeatureToggle } from "../../agent-sdk-types.js";
+import { claudeAccountFeature, type ClaudeAccount } from "./accounts.js";
 import { claudeManifestModelSupportsFastMode } from "./model-manifest.js";
 import { claudeServedModelSupportsFastMode } from "./served-catalog.js";
 
@@ -19,12 +20,16 @@ export function claudeModelSupportsFastMode(modelId: string | null | undefined):
 export function buildClaudeFeatures(input: {
   modelId: string | null | undefined;
   fastModeEnabled: boolean;
+  accounts?: ClaudeAccount[];
+  account?: unknown;
 }): AgentFeature[] {
+  const accounts = claudeAccountFeature(input.accounts ?? [], input.account);
   if (!claudeModelSupportsFastMode(input.modelId)) {
-    return [];
+    return accounts;
   }
 
   return [
+    ...accounts,
     {
       ...CLAUDE_FAST_MODE_FEATURE,
       value: input.fastModeEnabled,

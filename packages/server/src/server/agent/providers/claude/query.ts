@@ -20,6 +20,7 @@ export type ClaudeQueryFactory = (input: ClaudeQueryInput) => Query;
 export interface ClaudeQueryContext {
   runtimeSettings?: ProviderRuntimeSettings;
   launchEnv?: Record<string, string>;
+  accountEnv?: NodeJS.ProcessEnv;
   queryFactory?: ClaudeQueryFactory;
   /** Called with the spawned child process so the caller can tree-kill it on close. */
   onChildProcess?: (child: ChildProcess) => void;
@@ -58,7 +59,7 @@ function applyRuntimeSettingsToClaudeOptions(
   options: ClaudeOptions,
   context: ClaudeQueryContext,
 ): ClaudeOptions {
-  const { runtimeSettings, launchEnv, onChildProcess } = context;
+  const { runtimeSettings, launchEnv, accountEnv, onChildProcess } = context;
   return {
     ...options,
     spawnClaudeCodeProcess: (spawnOptions) => {
@@ -72,12 +73,12 @@ function applyRuntimeSettingsToClaudeOptions(
       const providerEnvSpec = createProviderEnvSpec({
         baseEnv: spawnOptions.env,
         runtimeSettings,
-        overlays: [launchEnv],
+        overlays: [launchEnv, accountEnv],
       });
       const providerEnv = createProviderEnv({
         baseEnv: spawnOptions.env,
         runtimeSettings,
-        overlays: [launchEnv],
+        overlays: [launchEnv, accountEnv],
       });
       const selfNodeCommand = isDefaultRuntime
         ? buildSelfNodeCommand(resolved.args, providerEnv)
@@ -95,6 +96,8 @@ function applyRuntimeSettingsToClaudeOptions(
         // containing double quotes, which cmd.exe mangles (strips quotes, breaks parsing).
         // The command is always a resolved binary path, so shell routing is unnecessary.
         shell: false,
+        // Keep inherited tools in an owned group even if the CLI exits first.
+        detached: process.platform !== "win32",
       });
       onChildProcess?.(child);
       if (typeof options.stderr === "function") {
