@@ -26,6 +26,13 @@ const SERVED_CATALOG_FILE_SUFFIX = "-cc.json";
 
 const SERVED_CATALOG_SURFACE = "cc";
 
+/**
+ * Cache files are ~9 kB. The cap is not a security boundary — the file is as trusted as the rest
+ * of the Claude config — it just stops a symlink to something unbounded from being read into
+ * memory during a catalog refresh.
+ */
+const SERVED_CATALOG_MAX_BYTES = 2 * 1024 * 1024;
+
 export function resolveClaudeConfigDir(configDir?: string): string {
   return configDir ?? process.env.CLAUDE_CONFIG_DIR ?? path.join(os.homedir(), ".claude");
 }
@@ -49,7 +56,8 @@ export async function readClaudeServedCatalogModels(
   configDir?: string,
   claudeCodeVersion?: string,
 ): Promise<AgentModelDefinition[]> {
-  const catalogDir = path.join(resolveClaudeConfigDir(configDir), ...SERVED_CATALOG_DIR_SEGMENTS);
+  const resolvedConfigDir = resolveClaudeConfigDir(configDir);
+  const catalogDir = path.join(resolvedConfigDir, ...SERVED_CATALOG_DIR_SEGMENTS);
 
   let entries: string[];
   try {
@@ -59,7 +67,18 @@ export async function readClaudeServedCatalogModels(
     return [];
   }
 
-  const newest = await readNewestServedCatalog(logger, catalogDir, entries);
+  // Cache files are named `<organizationUuid>-<hash>-<surface>.json`, and one machine can hold a
+  // catalog per account. Whoever Claude Code is signed in as decides which one is the truth;
+  // the newest fetch is only a fallback for when we cannot tell.
+  const organizationUuid = await readActiveOrganizationUuid(logger, resolvedConfigDir);
+  const accountEntries = organizationUuid
+    ? entries.filter((entry) => entry.startsWith(`${organizationUuid}-`))
+    : [];
+
+  const newest =
+    (accountEntries.length > 0
+      ? await readNewestServedCatalog(logger, catalogDir, accountEntries)
+      : undefined) ?? (await readNewestServedCatalog(logger, catalogDir, entries));
   if (!newest) {
     return [];
   }
@@ -72,6 +91,39 @@ export async function readClaudeServedCatalogModels(
     definitions.push(toModelDefinition(model));
   }
   return definitions;
+}
+
+/**
+ * The organization UUID Claude Code is currently signed in as, which prefixes its cache files.
+ */
+async function readActiveOrganizationUuid(
+  logger: Logger,
+  resolvedConfigDir: string,
+): Promise<string | undefined> {
+  // With CLAUDE_CONFIG_DIR set, that directory is the configuration home and holds the state
+  // file; by default it is ~/.claude and the state file is its sibling ~/.claude.json.
+  const statePaths = [
+    path.join(resolvedConfigDir, ".claude.json"),
+    path.join(path.dirname(resolvedConfigDir), ".claude.json"),
+  ];
+
+  for (const statePath of statePaths) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await fs.readFile(statePath, "utf8"));
+    } catch (error) {
+      logger.debug({ err: error, statePath }, "Failed to read the active Claude account");
+      continue;
+    }
+    if (!isRecord(parsed) || !isRecord(parsed.oauthAccount)) {
+      continue;
+    }
+    const organizationUuid = parsed.oauthAccount.organizationUuid;
+    if (typeof organizationUuid === "string" && organizationUuid.length > 0) {
+      return organizationUuid;
+    }
+  }
+  return undefined;
 }
 
 async function readNewestServedCatalog(
@@ -88,11 +140,26 @@ async function readNewestServedCatalog(
     }
     const filePath = path.join(catalogDir, entry);
 
-    let parsed: unknown;
+    let contents: string;
     try {
-      parsed = JSON.parse(await fs.readFile(filePath, "utf8"));
+      // lstat, so a symlink is skipped rather than followed to something unbounded.
+      const stats = await fs.lstat(filePath);
+      if (!stats.isFile() || stats.size > SERVED_CATALOG_MAX_BYTES) {
+        logger.debug({ filePath, size: stats.size }, "Skipping Claude served model catalog entry");
+        continue;
+      }
+      contents = await fs.readFile(filePath, "utf8");
     } catch (error) {
       logger.debug({ err: error, filePath }, "Failed to read Claude served model catalog");
+      continue;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(contents);
+    } catch {
+      // Deliberately not the parser's message: it quotes the offending input back at us.
+      logger.debug({ filePath }, "Claude served model catalog is not valid JSON");
       continue;
     }
 
@@ -153,7 +220,12 @@ function parseServedCatalogModel(rawModel: unknown): ServedCatalogModel | undefi
   if (typeof rawModel.description === "string" && rawModel.description.trim().length > 0) {
     model.description = rawModel.description.trim();
   }
-  if (typeof rawModel.min_claude_code_version === "string") {
+  if (rawModel.min_claude_code_version !== undefined) {
+    // A gate we cannot evaluate is not an absent gate: drop the row rather than offer a model
+    // this Claude Code may not accept.
+    if (typeof rawModel.min_claude_code_version !== "string") {
+      return undefined;
+    }
     model.minClaudeCodeVersion = rawModel.min_claude_code_version;
   }
 

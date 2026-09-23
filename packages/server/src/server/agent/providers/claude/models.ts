@@ -90,15 +90,35 @@ function selectUnknownServedModels(
   const knownIds = new Set(allManifestModels.map((model) => model.id));
   const unknown: AgentModelDefinition[] = [];
   for (const model of servedModels) {
-    // A served ID can be a dated spelling of a manifest entry (claude-haiku-4-5-20251001).
-    const manifestModelId = normalizeClaudeManifestModelId(model.id);
-    if (knownIds.has(model.id) || (manifestModelId && knownIds.has(manifestModelId))) {
+    if (isKnownManifestSpelling(model.id, knownIds)) {
       continue;
     }
     knownIds.add(model.id);
     unknown.push(model);
   }
   return unknown;
+}
+
+function isKnownManifestSpelling(servedModelId: string, knownIds: Set<string>): boolean {
+  if (knownIds.has(servedModelId)) {
+    return true;
+  }
+  // A served ID can be another spelling of a manifest entry (claude-haiku-4-5-20251001).
+  const manifestModelId = normalizeClaudeManifestModelId(servedModelId);
+  if (!manifestModelId) {
+    return false;
+  }
+  // That normalizer answers "which manifest entry's capabilities apply", so it falls back to the
+  // 200K entry for a `[1m]` spelling the manifest has no entry for. Treating that as a match
+  // would hide a newly served 1M variant behind the short-context model it is not.
+  if (hasOneMillionContextSuffix(servedModelId) && !hasOneMillionContextSuffix(manifestModelId)) {
+    return false;
+  }
+  return knownIds.has(manifestModelId);
+}
+
+function hasOneMillionContextSuffix(modelId: string): boolean {
+  return modelId.toLowerCase().includes("[1m]");
 }
 
 async function readClaudeSettingsModels(

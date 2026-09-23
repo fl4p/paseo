@@ -50,11 +50,18 @@ interface ServedCatalogModelFixture {
 async function createClaudeConfigDirWithServedCatalog(
   files: Record<string, unknown>,
   settings?: unknown,
+  organizationUuid?: string,
 ): Promise<string> {
   const configDir = await fs.mkdtemp(path.join(os.tmpdir(), "paseo-claude-models-"));
   createdClaudeConfigDirs.push(configDir);
   if (settings !== undefined) {
     await fs.writeFile(path.join(configDir, "settings.json"), JSON.stringify(settings, null, 2));
+  }
+  if (organizationUuid !== undefined) {
+    await fs.writeFile(
+      path.join(configDir, ".claude.json"),
+      JSON.stringify({ oauthAccount: { organizationUuid } }),
+    );
   }
   const catalogDir = path.join(configDir, "cache", "model-catalog");
   await fs.mkdir(catalogDir, { recursive: true });
@@ -512,6 +519,101 @@ describe("ClaudeAgentClient.fetchCatalog served catalog", () => {
     const ids = models.map((model) => model.id);
     expect(ids).toContain("claude-opus-7");
     expect(ids).not.toContain("claude-opus-6");
+  });
+
+  it("keeps a served 1M variant the manifest only has a short-context entry for", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "acct-hash-cc.json": servedCatalogFile([
+        { id: "claude-haiku-4-5[1m]", name: "Haiku 4.5 1M" },
+      ]),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    // The capability normalizer maps this onto claude-haiku-4-5; that must not hide it.
+    const ids = models.map((model) => model.id);
+    expect(ids).toContain("claude-haiku-4-5[1m]");
+    expect(ids).toContain("claude-haiku-4-5");
+  });
+
+  it("prefers the signed-in account's catalog over a more recently fetched one", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog(
+      {
+        "11111111-1111-1111-1111-111111111111-hash-cc.json": servedCatalogFile(
+          [{ id: "claude-opus-6", name: "Opus 6" }],
+          1,
+        ),
+        "22222222-2222-2222-2222-222222222222-hash-cc.json": servedCatalogFile(
+          [{ id: "claude-opus-7", name: "Opus 7" }],
+          2,
+        ),
+      },
+      undefined,
+      "11111111-1111-1111-1111-111111111111",
+    );
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    const ids = models.map((model) => model.id);
+    expect(ids).toContain("claude-opus-6");
+    expect(ids).not.toContain("claude-opus-7");
+  });
+
+  it("drops a served model whose minimum version cannot be evaluated", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "acct-hash-cc.json": servedCatalogFile([
+        { id: "claude-opus-6", name: "Opus 6", min_claude_code_version: 2.1 as never },
+        { id: "claude-opus-7", name: "Opus 7", min_claude_code_version: "not a version" },
+      ]),
+    });
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(models).toEqual(getClaudeModels("2.1.280"));
+  });
+
+  it("skips a cache entry that is a symlink or larger than the cap", async () => {
+    const configDir = await createClaudeConfigDirWithServedCatalog({
+      "big-cc.json": JSON.stringify({
+        version: 1,
+        fetchedAt: 5,
+        catalog: {
+          surface: "cc",
+          config: { id: "cc", models: [{ id: "claude-opus-6", name: "Opus 6" }] },
+        },
+        padding: "x".repeat(3 * 1024 * 1024),
+      }),
+    });
+    const catalogDir = path.join(configDir, "cache", "model-catalog");
+    await fs.symlink(path.join(catalogDir, "big-cc.json"), path.join(catalogDir, "link-cc.json"));
+    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
+    const client = createCatalogClient("2.1.280");
+
+    const { models } = await client.fetchCatalog({
+      scope: "workspace",
+      cwd: os.tmpdir(),
+      force: true,
+    });
+
+    expect(models).toEqual(getClaudeModels("2.1.280"));
   });
 
   it("falls back to the manifest when the cached catalog is unusable", async () => {
