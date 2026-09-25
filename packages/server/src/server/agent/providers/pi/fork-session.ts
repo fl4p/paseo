@@ -155,9 +155,12 @@ export function readPiToolBlockIds(entry: PiTranscriptEntry): {
     return { opened, closed };
   }
   if (entry.message.role === "assistant" && Array.isArray(entry.message.content)) {
-    for (const block of entry.message.content) {
-      const id = extractToolCallId(block);
-      if (id) opened.push(id);
+    const stopReason = readString(entry.message.stopReason)?.toLowerCase();
+    if (stopReason !== "error" && stopReason !== "aborted") {
+      for (const block of entry.message.content) {
+        const id = extractToolCallId(block);
+        if (id) opened.push(id);
+      }
     }
   } else if (entry.message.role === "toolResult") {
     const id = readString(entry.message.toolCallId);
@@ -200,6 +203,31 @@ function buildBranchPath(
   return pathEntries.toReversed();
 }
 
+function scanBranchForSafeCandidate(
+  pathEntries: readonly PiTranscriptEntry[],
+  requireTurnEnd?: boolean,
+): PiTranscriptEntry | null {
+  const open = new Set<string>();
+  let safeCandidate: PiTranscriptEntry | null = null;
+
+  for (const entry of pathEntries) {
+    if (entry.type === "message" && entry.message?.role === "user") {
+      open.clear();
+    }
+    const { opened, closed } = readPiToolBlockIds(entry);
+    for (const id of closed) open.delete(id);
+    for (const id of opened) open.add(id);
+
+    const endsTurn = endsPiAssistantTurn(entry);
+    const isSafe = open.size === 0 && (!requireTurnEnd || endsTurn);
+    if (isSafe) {
+      safeCandidate = entry;
+    }
+  }
+
+  return safeCandidate;
+}
+
 /**
  * Find the safest entry to cut at.
  *
@@ -235,21 +263,7 @@ export function resolveSafePiForkEntry(
   }
 
   const pathEntries = buildBranchPath(targetEntry, entriesById);
-  const open = new Set<string>();
-  let safeCandidate: PiTranscriptEntry | null = null;
-
-  for (const entry of pathEntries) {
-    const { opened, closed } = readPiToolBlockIds(entry);
-    for (const id of closed) open.delete(id);
-    for (const id of opened) open.add(id);
-
-    const endsTurn = endsPiAssistantTurn(entry);
-    const isSafe = open.size === 0 && (!options.requireTurnEnd || endsTurn);
-    if (isSafe) {
-      safeCandidate = entry;
-    }
-  }
-
+  const safeCandidate = scanBranchForSafeCandidate(pathEntries, options.requireTurnEnd);
   const safeId = safeCandidate ? readString(safeCandidate.id) : null;
   return safeCandidate && safeId ? { entryId: safeId, entry: safeCandidate } : null;
 }

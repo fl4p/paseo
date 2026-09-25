@@ -214,6 +214,38 @@ describe("resolveSafePiForkEntry", () => {
     expect(safeTurnEnd?.entryId).toBe("a3");
   });
 
+  it("does not leak open tool calls across an errored assistant turn or new user turn", () => {
+    const withErroredTurn = parsePiTranscriptEntries(
+      `${IN_FLIGHT_PI_TRANSCRIPT}\n${JSON.stringify({
+        type: "message",
+        id: "a-err",
+        parentId: "a2",
+        message: {
+          role: "assistant",
+          content: [{ type: "toolCall", id: "call_aborted_1", name: "bash", arguments: {} }],
+          stopReason: "error",
+        },
+      })}\n${JSON.stringify({
+        type: "message",
+        id: "u3",
+        parentId: "a-err",
+        message: { role: "user", content: "retry task" },
+      })}\n${JSON.stringify({
+        type: "message",
+        id: "a4",
+        parentId: "u3",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "all good now" }],
+          stopReason: "stop",
+        },
+      })}`,
+    );
+
+    const safe = resolveSafePiForkEntry(withErroredTurn, { boundaryMessageId: "a4" });
+    expect(safe?.entryId).toBe("a4");
+  });
+
   it("returns null if requireTurnEnd is true but no assistant turn completed yet", () => {
     const userOnly = parsePiTranscriptEntries(
       `${JSON.stringify(HEADER)}\n${JSON.stringify({
