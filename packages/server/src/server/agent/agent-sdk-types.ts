@@ -723,6 +723,16 @@ export interface AgentSession {
   stopProviderSubagent?(subagentId: string): Promise<boolean>;
   /** Release live runtime resources without archiving or deleting the durable native session. */
   close(): Promise<void>;
+  /**
+   * Kill the live runtime without its cooperation, for a turn the provider will not cancel.
+   *
+   * Optional: implement it only when every process the session started can be killed
+   * unilaterally and its death confirmed. Resolves only once that is confirmed; rejects otherwise,
+   * leaving the session as it was so the caller can retry. A provider that cannot promise this (a
+   * server shared with other sessions, a close that first awaits the provider) leaves it out, and
+   * Stop keeps refusing rather than resume a thread something may still be writing.
+   */
+  terminate?(): Promise<void>;
   listCommands?(): Promise<AgentSlashCommand[]>;
   setModel?(modelId: string | null): Promise<void>;
   setThinkingOption?(thinkingOptionId: string | null): Promise<void | AgentProviderNotice>;

@@ -1708,6 +1708,11 @@ export class PiRpcAgentSession implements AgentSession {
     }
   }
 
+  /** A pi turn blocked in a tool that ignores pi's abort ends only by killing the tree. */
+  async terminate(): Promise<void> {
+    await this.runtimeSession.terminate();
+  }
+
   async listCommands(): Promise<AgentSlashCommand[]> {
     if (this.commandCache) {
       return this.commandCache;

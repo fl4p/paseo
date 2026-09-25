@@ -14,7 +14,7 @@ export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   hasInFlightRun(agentId: string): boolean;
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
-  /** Cancel that kills the provider when it will not acknowledge; never returns "refused". */
+  /** Cancel that terminates a provider that will not acknowledge, when the provider can be. */
   forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
   /** Drop prompts queued behind a compaction; returns how many were discarded. */
   discardHeldPrompts(agentId: string, reason: string): number;
@@ -104,8 +104,9 @@ async function requestAgentRunCancellation(
 /**
  * Stop, as the user means it. A prompt held behind a compaction is discarded BEFORE the cancel:
  * cancelling ends the compaction, which would otherwise release the hold and start exactly the
- * work the user just stopped. Stop itself is never held, and never refused: a provider that will
- * not acknowledge the cancel is killed and the agent resumed on a fresh session.
+ * work the user just stopped. Stop itself is never held. A provider that will not acknowledge the
+ * cancel is terminated and the agent resumed on a fresh session, when the provider supports it
+ * (AgentSession.terminate); otherwise Stop is refused as before.
  */
 export async function cancelAgentRunCommand(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "logger">,

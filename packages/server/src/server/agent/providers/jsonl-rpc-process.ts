@@ -2,6 +2,11 @@ import { type ChildProcess, type ChildProcessWithoutNullStreams } from "node:chi
 import type { Logger } from "pino";
 
 import { spawnProcess } from "../../../utils/spawn.js";
+import {
+  captureProcessTree,
+  terminateCapturedProcessTree,
+  type ProcessTreeSnapshot,
+} from "../../../utils/process-tree.js";
 import { terminateWithTreeKill } from "../../../utils/tree-kill.js";
 import { JsonlFrameDecoder } from "./jsonl-frame-decoder.js";
 export { supportsJsonlRpcProtocolV2 } from "./jsonl-frame-decoder.js";
@@ -81,6 +86,7 @@ export class JsonlRpcProcess {
   private stderrBuffer = "";
   private nextRequestId = 1;
   private disposed = false;
+  private terminationTree: Promise<ProcessTreeSnapshot> | null = null;
   private readonly frameDecoder: JsonlFrameDecoder;
 
   constructor(private readonly options: JsonlRpcProcessOptions) {
@@ -213,6 +219,59 @@ export class JsonlRpcProcess {
         { timeoutMs: FORCE_SHUTDOWN_TIMEOUT_MS },
         `${this.diagnosticName} process did not report exit after SIGKILL`,
       );
+    }
+  }
+
+  /**
+   * Kill the process and every descendant it started, and confirm they are gone. Unlike close(),
+   * root exit is not taken as proof: a tool or MCP server that ignores SIGTERM outlives the root
+   * and is reparented, so the tree is captured first and each captured process is tracked to its
+   * death. Rejects when that cannot be confirmed; the captured tree is kept, so a retry resumes
+   * the same kill.
+   */
+  async terminate(
+    error = new Error(`${this.diagnosticName} process was terminated`),
+  ): Promise<void> {
+    this.terminationTree ??= this.captureTerminationTree();
+    let tree: ProcessTreeSnapshot;
+    try {
+      tree = await this.terminationTree;
+    } catch (captureError) {
+      this.terminationTree = null;
+      throw captureError;
+    }
+    this.failAll(error);
+    try {
+      this.child.stdin.end();
+    } catch {
+      // Ignore cleanup races.
+    }
+    const result = await terminateCapturedProcessTree(tree, {
+      gracefulTimeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS,
+      forceTimeoutMs: FORCE_SHUTDOWN_TIMEOUT_MS,
+      onForceSignal: () => {
+        this.options.logger.warn(
+          { timeoutMs: GRACEFUL_SHUTDOWN_TIMEOUT_MS },
+          `${this.diagnosticName} process tree did not exit after SIGTERM; sending SIGKILL`,
+        );
+      },
+    });
+    if (result === "kill-timeout") {
+      throw new Error(`${this.diagnosticName} process tree did not exit after SIGKILL`);
+    }
+  }
+
+  private async captureTerminationTree(): Promise<ProcessTreeSnapshot> {
+    const pid = this.child.pid;
+    if (pid === undefined || this.child.exitCode !== null || this.child.signalCode !== null) {
+      throw new Error(
+        `${this.diagnosticName} process already exited; its descendants cannot be identified`,
+      );
+    }
+    try {
+      return await captureProcessTree(pid);
+    } catch (error) {
+      throw new Error(`Cannot capture the ${this.diagnosticName} process tree`, { cause: error });
     }
   }
 

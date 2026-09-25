@@ -6815,9 +6815,13 @@ test("force stop kills a provider that never acknowledges the cancel and resumes
   // A pi turn blocked in a tool whose child ignores the abort: interrupt() never returns.
   class StuckTurnSession extends SteeringTestSession {
     closed = false;
+    terminated = false;
     override async interrupt(): Promise<void> {
       this.interruptCount += 1;
       await new Promise<never>(() => {});
+    }
+    async terminate(): Promise<void> {
+      this.terminated = true;
     }
     override async close(): Promise<void> {
       this.closed = true;
@@ -6852,6 +6856,7 @@ test("force stop kills a provider that never acknowledges the cancel and resumes
     await expect(manager.forceStopAgentRun(agent.id)).resolves.toEqual({ status: "settled" });
     await drained;
 
+    expect(stuck.terminated).toBe(true);
     expect(stuck.closed).toBe(true);
     expect(client.resumeOverrides).toHaveLength(1);
     expect(manager.hasInFlightRun(agent.id)).toBe(false);
@@ -6860,6 +6865,89 @@ test("force stop kills a provider that never acknowledges the cancel and resumes
     await expect(manager.runAgent(agent.id, "next")).resolves.toMatchObject({ canceled: false });
   } finally {
     await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+async function startStuckRun(session: AgentSession): Promise<{
+  manager: AgentManager;
+  client: TestAgentClient;
+  agentId: string;
+  workdir: string;
+}> {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-force-stop-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    rescueTimeouts: { interruptSessionMs: 10 },
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  const run = manager.streamAgent(agent.id, "stuck");
+  void (async () => {
+    for await (const _event of run) {
+    }
+  })().catch(() => undefined);
+  await manager.waitForAgentRunStart(agent.id);
+  return { manager, client, agentId: agent.id, workdir };
+}
+
+class UnacknowledgingSession extends SteeringTestSession {
+  closed = false;
+  override async interrupt(): Promise<void> {
+    await new Promise<never>(() => {});
+  }
+  override async close(): Promise<void> {
+    this.closed = true;
+  }
+}
+
+test("force stop keeps refusing when the provider cannot terminate its runtime", async () => {
+  const session = new UnacknowledgingSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, client, agentId, workdir } = await startStuckRun(session);
+  try {
+    await expect(manager.forceStopAgentRun(agentId)).resolves.toEqual({ status: "refused" });
+    expect(session.closed).toBe(false);
+    expect(client.resumeOverrides).toHaveLength(0);
+    expect(manager.hasInFlightRun(agentId)).toBe(true);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a rejected terminate leaves the stuck run in place so Stop can be retried", async () => {
+  class FlakyTerminateSession extends UnacknowledgingSession {
+    terminateCalls = 0;
+    async terminate(): Promise<void> {
+      this.terminateCalls += 1;
+      if (this.terminateCalls === 1) {
+        throw new Error("process tree did not exit after SIGKILL");
+      }
+    }
+  }
+  const session = new FlakyTerminateSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, client, agentId, workdir } = await startStuckRun(session);
+  try {
+    await expect(manager.forceStopAgentRun(agentId)).rejects.toThrow(
+      "process tree did not exit after SIGKILL",
+    );
+    expect(session.closed).toBe(false);
+    expect(client.resumeOverrides).toHaveLength(0);
+    expect(manager.hasInFlightRun(agentId)).toBe(true);
+
+    await expect(manager.forceStopAgentRun(agentId)).resolves.toEqual({ status: "settled" });
+    expect(session.terminateCalls).toBe(2);
+    expect(session.closed).toBe(true);
+    expect(client.resumeOverrides).toHaveLength(1);
+    expect(manager.getAgent(agentId)?.lifecycle).toBe("idle");
+  } finally {
+    await manager.closeAgent(agentId);
     rmSync(workdir, { recursive: true, force: true });
   }
 });

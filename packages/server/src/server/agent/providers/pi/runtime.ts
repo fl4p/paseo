@@ -73,6 +73,8 @@ export interface PiRuntimeSession {
   ): void;
   cancelExtensionUiRequest(id: string): void;
   close(): Promise<void>;
+  /** Kill the pi process tree and confirm it is gone; see AgentSession.terminate. */
+  terminate(): Promise<void>;
 }
 
 export interface PiRuntime {

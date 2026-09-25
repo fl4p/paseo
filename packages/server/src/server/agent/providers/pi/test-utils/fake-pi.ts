@@ -385,6 +385,12 @@ export class FakePiSession implements PiRuntimeSession {
 
   async close(): Promise<void> {}
 
+  terminated = false;
+
+  async terminate(): Promise<void> {
+    this.terminated = true;
+  }
+
   emit(event: PiRuntimeEvent): void {
     for (const subscriber of this.subscribers) {
       subscriber(event);

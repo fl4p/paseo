@@ -463,7 +463,7 @@ test("DaemonClient rejects a replacement prompt when cancellation is not acknowl
   }
 }, 30_000);
 
-test("DaemonClient Stop force-stops a run whose cancellation is not acknowledged", async () => {
+test("DaemonClient rejects Stop when cancellation is not acknowledged", async () => {
   const cwd = tmpCwd();
   const daemon = await createTestPaseoDaemon({
     agentClients: { codex: createUninterruptibleClient() },
@@ -475,11 +475,9 @@ test("DaemonClient Stop force-stops a run whose cancellation is not acknowledged
     const agent = await client.createAgent({ provider: "codex", cwd });
     await client.sendMessage(agent.id, "Keep working until stopped.");
 
-    await expect(client.cancelAgent(agent.id)).resolves.toBeUndefined();
-    const stopped = await client.fetchAgent(agent.id);
-    expect(stopped?.agent.status).toBe("idle");
-    // The agent was resumed on a fresh session and accepts the next prompt.
-    await expect(client.sendMessage(agent.id, "Carry on.")).resolves.toBeUndefined();
+    await expect(client.cancelAgent(agent.id)).rejects.toThrow(
+      `Cannot stop agent ${agent.id} because its active run cancellation was not acknowledged`,
+    );
   } finally {
     await client.close();
     await daemon.close();

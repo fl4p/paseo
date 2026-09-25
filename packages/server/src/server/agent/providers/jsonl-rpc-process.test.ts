@@ -89,6 +89,37 @@ function createInMemoryChildProcess(): InMemoryChildProcess {
   return child;
 }
 
+// A tool that ignores SIGTERM: the root exits on SIGTERM, its grandchild does not.
+const TERM_IGNORING_GRANDCHILD_SOURCE = String.raw`
+const { spawn } = require("node:child_process");
+const grandchild = spawn(process.execPath, [
+  "-e",
+  "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
+], { stdio: "ignore" });
+process.stdout.write(JSON.stringify({ type: "grandchild", pid: grandchild.pid }) + "\n");
+setInterval(() => {}, 1000);
+`;
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function nextGrandchildPid(transport: JsonlRpcProcess): Promise<number> {
+  return new Promise((resolve) => {
+    const unsubscribe = transport.onMessage((message) => {
+      if (message.type === "grandchild" && typeof message.pid === "number") {
+        unsubscribe();
+        resolve(message.pid);
+      }
+    });
+  });
+}
+
 function startProcess(options: StartProcessOptions = {}): JsonlRpcProcess {
   const child = options.child;
   return new JsonlRpcProcess({
@@ -229,6 +260,38 @@ describe("JsonlRpcProcess", () => {
     await transport.close();
 
     await rejection;
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "terminate kills a descendant that ignores SIGTERM, which close leaves running",
+    async () => {
+      const closed = startProcess({ source: TERM_IGNORING_GRANDCHILD_SOURCE });
+      const closedGrandchild = await nextGrandchildPid(closed);
+      const terminated = startProcess({ source: TERM_IGNORING_GRANDCHILD_SOURCE });
+      const terminatedGrandchild = await nextGrandchildPid(terminated);
+      try {
+        await closed.close();
+        await terminated.terminate();
+
+        // close() takes the root's exit as proof; the reparented grandchild survives it.
+        expect(isAlive(closedGrandchild)).toBe(true);
+        expect(isAlive(terminatedGrandchild)).toBe(false);
+      } finally {
+        for (const pid of [closedGrandchild, terminatedGrandchild]) {
+          if (isAlive(pid)) process.kill(pid, "SIGKILL");
+        }
+      }
+    },
+    20_000,
+  );
+
+  test("terminate refuses to vouch for a process that already exited", async () => {
+    const transport = startProcess();
+    const exited = nextExit(transport);
+    await expect(transport.request({ type: "exit" })).rejects.toThrow();
+    await exited;
+
+    await expect(transport.terminate()).rejects.toThrow("already exited");
   });
 
   test("closes the transport when a direct send synchronously throws EPIPE", async () => {

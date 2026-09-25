@@ -754,6 +754,8 @@ export class AgentManager {
   /** Per agent, the prompts held behind a compaction, oldest first. */
   private readonly heldPrompts = new Map<string, HeldPrompt[]>();
   private readonly runs = new AgentRunState();
+  /** Sessions force-stopped by terminate(); a later Stop must resume the agent, not cancel again. */
+  private readonly terminatedSessions = new WeakSet<AgentSession>();
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
@@ -3425,31 +3427,42 @@ export class AgentManager {
   }
 
   /**
-   * Stop that cannot be refused. Tries the graceful cancel first; if the provider never
-   * acknowledges it (a pi turn blocked in a tool whose child ignores the abort), kill the
-   * provider's process tree, settle the turn as canceled, and resume the agent on a fresh
-   * session from its persisted thread. Only the stuck turn is lost.
+   * Stop for a turn the provider will not cancel. Tries the graceful cancel first; if the
+   * provider never acknowledges it (a pi turn blocked in a tool whose child ignores the abort),
+   * kill the provider's runtime via AgentSession.terminate, settle the turn as canceled, and
+   * resume the agent on a fresh session from its persisted thread. Only the stuck turn is lost.
+   *
+   * A provider without terminate() keeps the refusal: closing it would not prove its runner
+   * stopped, and resuming a thread something may still be writing is worse than refusing.
+   * A terminate() that rejects leaves the agent untouched, so Stop can be retried; a retry after
+   * a kill whose resume failed goes straight to the resume.
    */
   forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, async () => {
         const graceful = await this.cancelAgentRun(agentId);
-        if (graceful.status !== "refused") {
+        const agent = this.requireSessionAgent(agentId);
+        const alreadyTerminated = this.terminatedSessions.has(agent.session);
+        if (graceful.status !== "refused" && !alreadyTerminated) {
           return graceful;
         }
-        const agent = this.requireSessionAgent(agentId);
-        this.logger.warn(
-          { agentId, provider: agent.provider },
-          "forceStopAgentRun: cancellation not acknowledged, killing the provider session",
-        );
-        // Kill first: nothing may keep writing to the thread once the turn is declared over.
-        await this.closeReloadedSession(agent.session, agentId);
+        if (!alreadyTerminated) {
+          if (!agent.session.terminate) {
+            return graceful;
+          }
+          this.logger.warn(
+            { agentId, provider: agent.provider },
+            "forceStopAgentRun: cancellation not acknowledged, terminating the provider runtime",
+          );
+          await agent.session.terminate();
+          this.terminatedSessions.add(agent.session);
+        }
         await this.drainSessionEvents(agentId);
         await this.runForegroundMutation(agentId, async () => {
           const run = this.runs.getRun(agentId);
           // The provider may have ended the turn itself while dying.
           if (run && !run.settled) {
-            await this.forceSettleRun(agent, run, "forceStopAgentRun: killed provider,");
+            await this.forceSettleRun(agent, run, "forceStopAgentRun: terminated provider,");
           }
           this.finishCanceledRun(agent);
         });
