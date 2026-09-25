@@ -3457,7 +3457,34 @@ describe("workspace-layout-store actions", () => {
     expect(findPaneContainingTab(settled.root, drafts[0]!.tabId)?.id).not.toBe("explorer");
   });
 
-  it("reconcileTabs heals a persisted layout that lost every canvas pane", () => {
+  const emptyHydratedSnapshot = {
+    agentsHydrated: true,
+    terminalsHydrated: true,
+    activeAgentIds: [],
+    autoOpenAgentIds: [],
+    knownAgentIds: [],
+    knownTerminalIds: [],
+    standaloneTerminalIds: [],
+    hasActivePendingDraftCreate: false,
+  };
+
+  function reconcileTwiceAndExpectSettled(workspaceKey: string) {
+    workspaceLayoutStore.getState().reconcileTabs(workspaceKey, emptyHydratedSnapshot);
+    const settled = workspaceLayoutStore.getState().layoutByWorkspace[workspaceKey];
+    workspaceLayoutStore.getState().reconcileTabs(workspaceKey, emptyHydratedSnapshot);
+    expect(workspaceLayoutStore.getState().layoutByWorkspace[workspaceKey]).toBe(settled);
+    return settled;
+  }
+
+  function tabsInPane(layout: { root: SplitNode }, paneId: string): WorkspaceTab[] {
+    return collectAllTabs(layout.root).filter(
+      (tab) => findPaneContainingTab(layout.root, tab.tabId)?.id === paneId,
+    );
+  }
+
+  it("reconcileTabs heals a persisted layout whose only pane is the hidden Explorer", () => {
+    // The shape a crashed workspace was persisted in: one hidden Explorer pane that had
+    // collected a seeded draft per render, and no focused pane.
     const workspaceKey = createWorkspaceKey();
     workspaceLayoutStore.setState((state) => ({
       layoutByWorkspace: {
@@ -3466,7 +3493,8 @@ describe("workspace-layout-store actions", () => {
           root: createPane({
             id: "explorer",
             tabIds: ["files", "changes_tree", "draft_msg_1", "draft_msg_2"],
-            focusedTabId: "changes_tree",
+            focusedTabId: "draft_msg_2",
+            hidden: true,
             targetsByTabId: {
               files: { kind: "files" },
               changes_tree: { kind: "changes_tree" },
@@ -3481,27 +3509,98 @@ describe("workspace-layout-store actions", () => {
       },
     }));
 
-    const emptySnapshot = {
-      agentsHydrated: true,
-      terminalsHydrated: true,
-      activeAgentIds: [],
-      autoOpenAgentIds: [],
-      knownAgentIds: [],
-      knownTerminalIds: [],
-      standaloneTerminalIds: [],
-      hasActivePendingDraftCreate: false,
-    };
-    workspaceLayoutStore.getState().reconcileTabs(workspaceKey, emptySnapshot);
-    const healed = workspaceLayoutStore.getState().layoutByWorkspace[workspaceKey];
-    workspaceLayoutStore.getState().reconcileTabs(workspaceKey, emptySnapshot);
-    expect(workspaceLayoutStore.getState().layoutByWorkspace[workspaceKey]).toBe(healed);
+    const healed = reconcileTwiceAndExpectSettled(workspaceKey);
 
-    expect(findPaneById(healed.root, "explorer")?.tabIds).toEqual(["files", "changes_tree"]);
-    const mainTabs = collectAllTabs(healed.root).filter(
-      (tab) => findPaneContainingTab(healed.root, tab.tabId)?.id === "main",
-    );
-    expect(mainTabs.map((tab) => tab.target.kind)).toEqual(["draft"]);
+    // Explorer drafts may be the user's; the repair keeps them where they were.
+    expect(findPaneById(healed.root, "explorer")?.tabIds).toEqual([
+      "files",
+      "changes_tree",
+      "draft_msg_1",
+      "draft_msg_2",
+    ]);
+    expect(tabsInPane(healed, "main").map((tab) => tab.target.kind)).toEqual(["draft"]);
     expect(healed.focusedPaneId).toBe("main");
+  });
+
+  it("reconcileTabs keeps a canvas pane beside an Explorer registered under a generated id", () => {
+    const workspaceKey = createWorkspaceKey();
+    workspaceLayoutStore.setState((state) => ({
+      layoutByWorkspace: {
+        ...state.layoutByWorkspace,
+        [workspaceKey]: {
+          root: {
+            kind: "group",
+            group: {
+              id: "root",
+              direction: "horizontal",
+              sizes: [0.78, 0.22],
+              children: [
+                createPane({
+                  id: "pane_canvas",
+                  tabIds: ["agent_agent-1"],
+                  targetsByTabId: { "agent_agent-1": { kind: "agent", agentId: "agent-1" } },
+                }),
+                createPane({
+                  id: "pane_registered",
+                  tabIds: ["files"],
+                  targetsByTabId: { files: { kind: "files" } },
+                }),
+              ],
+            },
+          },
+          focusedPaneId: "pane_canvas",
+        },
+      },
+      explorerSidebarPaneIdByWorkspace: {
+        ...state.explorerSidebarPaneIdByWorkspace,
+        [workspaceKey]: "pane_registered",
+      },
+    }));
+
+    const settled = reconcileTwiceAndExpectSettled(workspaceKey);
+
+    expect(findPaneById(settled.root, "main")).toBeNull();
+    expect(tabsInPane(settled, "pane_canvas").map((tab) => tab.target.kind)).toEqual(["draft"]);
+    expect(findPaneById(settled.root, "pane_registered")?.tabIds).toEqual(["files"]);
+  });
+
+  it("reconcileTabs keeps hidden canvas panes when it restores a visible one", () => {
+    const workspaceKey = createWorkspaceKey();
+    workspaceLayoutStore.setState((state) => ({
+      layoutByWorkspace: {
+        ...state.layoutByWorkspace,
+        [workspaceKey]: {
+          root: {
+            kind: "group",
+            group: {
+              id: "root",
+              direction: "horizontal",
+              sizes: [0.5, 0.5],
+              children: [
+                createPane({ id: "pane_hidden", tabIds: ["draft-kept"], hidden: true }),
+                createPane({
+                  id: "explorer",
+                  tabIds: ["files"],
+                  targetsByTabId: { files: { kind: "files" } },
+                }),
+              ],
+            },
+          },
+          focusedPaneId: "explorer",
+        },
+      },
+      explorerSidebarPaneIdByWorkspace: {
+        ...state.explorerSidebarPaneIdByWorkspace,
+        [workspaceKey]: "explorer",
+      },
+    }));
+
+    const settled = reconcileTwiceAndExpectSettled(workspaceKey);
+
+    expect(findPaneById(settled.root, "pane_hidden")?.tabIds).toEqual(["draft-kept"]);
+    expect(findPaneById(settled.root, "explorer")?.tabIds).toEqual(["files"]);
+    expect(findPaneById(settled.root, "main")?.hidden).not.toBe(true);
+    expect(settled.focusedPaneId).toBe("main");
   });
 
   it("reconcileTabs stays stable when startup removes a duplicate agent kept in Explorer", () => {

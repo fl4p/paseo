@@ -1078,6 +1078,7 @@ export function createWorkspaceLayoutStore(
               layout,
               tabId: normalizedTabId,
               preserveEmptyPaneId,
+              explorerSidebarPaneId,
             });
             const nextLayoutBeforeFocusNormalization =
               closedLayout &&

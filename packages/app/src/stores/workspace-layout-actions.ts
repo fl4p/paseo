@@ -180,6 +180,7 @@ interface CloseTabInLayoutInput {
   layout: WorkspaceLayout;
   tabId: string;
   preserveEmptyPaneId?: string | null;
+  explorerSidebarPaneId?: string | null;
 }
 
 interface ClosePaneInLayoutInput {
@@ -1473,14 +1474,14 @@ export function closeTabInLayout(input: CloseTabInLayoutInput): WorkspaceLayout 
   }
   // The last canvas pane stays even when it is a split pane that outlived `main`:
   // dropping it leaves only the Explorer, and nothing can open a tab on the canvas.
+  const isExplorerPane = (paneId: string) =>
+    paneId === EXPLORER_SIDEBAR_PANE_ID || paneId === input.explorerSidebarPaneId;
   const isLastCanvasPane = collectAllPanes(internalLayout.root).every(
-    (candidate) => candidate.id === pane.id || candidate.id === EXPLORER_SIDEBAR_PANE_ID,
+    (candidate) => candidate.id === pane.id || isExplorerPane(candidate.id),
   );
   const preserveEmptyPaneId =
     input.preserveEmptyPaneId ??
-    (pane.id === DEFAULT_PANE_ID || pane.id === EXPLORER_SIDEBAR_PANE_ID || isLastCanvasPane
-      ? pane.id
-      : null);
+    (pane.id === DEFAULT_PANE_ID || isExplorerPane(pane.id) || isLastCanvasPane ? pane.id : null);
 
   const closeSuccessorTabId = getCloseSuccessorTabId({
     pane,
@@ -2308,8 +2309,9 @@ function collapseStaleEntityTabs(input: {
   snapshot: WorkspaceTabSnapshot;
   visibleAgentIds: Set<string>;
   knownTerminalIds: Set<string>;
+  explorerSidebarPaneId: string | null;
 }): WorkspaceLayout {
-  const { snapshot, visibleAgentIds, knownTerminalIds } = input;
+  const { snapshot, visibleAgentIds, knownTerminalIds, explorerSidebarPaneId } = input;
   let nextLayout = input.layout;
   for (const tab of collectAllTabs(nextLayout.root)) {
     if (isAgentTab(tab) && snapshot.agentsHydrated && !visibleAgentIds.has(tab.target.agentId)) {
@@ -2317,6 +2319,7 @@ function collapseStaleEntityTabs(input: {
         closeTabInLayout({
           layout: nextLayout,
           tabId: tab.tabId,
+          explorerSidebarPaneId,
         }) ?? nextLayout;
     }
     if (
@@ -2328,6 +2331,7 @@ function collapseStaleEntityTabs(input: {
         closeTabInLayout({
           layout: nextLayout,
           tabId: tab.tabId,
+          explorerSidebarPaneId,
         }) ?? nextLayout;
     }
   }
@@ -2418,46 +2422,58 @@ function seedDraftForEmptyWorkspace(input: {
   }
 
   const draftId = generateDraftId();
-  return (
-    createTabInLayout({
-      layout: input.layout,
-      target: { kind: "draft", draftId },
-      now: Date.now(),
-      placement: FOCUSED_PANE_PLACEMENT,
-      explorerSidebarPaneId: input.explorerSidebarPaneId,
-      createTabId: () => draftId,
-    })?.layout ?? input.layout
-  );
+  const seeded = createTabInLayout({
+    layout: input.layout,
+    target: { kind: "draft", draftId },
+    now: Date.now(),
+    placement: FOCUSED_PANE_PLACEMENT,
+    explorerSidebarPaneId: input.explorerSidebarPaneId,
+    createTabId: () => draftId,
+  })?.layout;
+  // A draft in the Explorer does not count as content, so seeding one there would
+  // leave the workspace just as empty and every later reconcile would add another.
+  if (
+    !seeded ||
+    findPaneContainingTab(asInternalNode(seeded.root), draftId)?.id === input.explorerSidebarPaneId
+  ) {
+    return input.layout;
+  }
+  return seeded;
 }
 
 /**
- * Gives back a canvas pane to a layout that has only the Explorer sidebar left.
- * Such a layout cannot settle: the empty-workspace draft lands in the Explorer, which
- * does not count as content, so every reconcile seeds another one. The drafts it
- * piled up there were never the user's, so they go with the repair.
+ * Gives back a canvas pane to a layout that has only the Explorer sidebar left on
+ * screen. Such a layout cannot settle: the empty-workspace draft has nowhere to go but
+ * the Explorer, which does not count as content. The existing tree is kept whole,
+ * hidden panes and Explorer tabs included, and a `main` pane is put beside it.
  */
 function restoreCanvasPane(
   layout: WorkspaceLayout,
   explorerSidebarPaneId: string | null,
 ): WorkspaceLayout {
-  const panes = collectAllPanes(layout.root);
-  const explorerPane = panes.find((pane) => pane.id === explorerSidebarPaneId);
-  if (!explorerPane || panes.some((pane) => pane.id !== explorerSidebarPaneId)) {
+  if (!explorerSidebarPaneId || !findPaneById(layout.root, explorerSidebarPaneId)) {
     return layout;
   }
-  const internalExplorerPane = explorerPane as SplitPaneInternal;
+  const hasVisibleCanvasPane = collectAllPanes(layout.root).some(
+    (pane) => pane.id !== explorerSidebarPaneId,
+  );
+  if (hasVisibleCanvasPane) {
+    return layout;
+  }
+  if (explorerSidebarPaneId !== DEFAULT_PANE_ID && findPaneById(layout.root, DEFAULT_PANE_ID)) {
+    const revealed = setPaneHiddenInLayout({ layout, paneId: DEFAULT_PANE_ID, hidden: false });
+    return revealed ? { ...revealed, focusedPaneId: DEFAULT_PANE_ID } : layout;
+  }
+  if (explorerSidebarPaneId === DEFAULT_PANE_ID) {
+    return layout;
+  }
   return withNormalizedParentTabMap({
     root: createGroupNode({
       id: DEFAULT_LAYOUT_GROUP_ID,
       direction: "horizontal",
       children: [
         createPaneNode({ id: DEFAULT_PANE_ID, tabs: [createNewWorkspaceTab()] }),
-        createPaneNode({
-          id: internalExplorerPane.id,
-          tabs: internalExplorerPane.tabs.filter((tab) => tab.target.kind !== "draft"),
-          focusedTabId: internalExplorerPane.focusedTabId,
-          hidden: internalExplorerPane.hidden,
-        }),
+        asInternalLayout(layout).root,
       ],
       sizes: [0.78, 0.22],
     }),
@@ -2533,6 +2549,7 @@ export function reconcileWorkspaceTabs(
         closeTabInLayout({
           layout: nextLayout,
           tabId: tab.tabId,
+          explorerSidebarPaneId: state.explorerSidebarPaneId,
         }) ?? nextLayout;
     }
   }
@@ -2542,6 +2559,7 @@ export function reconcileWorkspaceTabs(
     snapshot,
     visibleAgentIds,
     knownTerminalIds,
+    explorerSidebarPaneId: state.explorerSidebarPaneId,
   });
 
   nextLayout = addMissingEntityTabs({
