@@ -1707,6 +1707,11 @@ export class PiRpcAgentSession implements AgentSession {
     this.usagePoller.close();
     try {
       await this.runtimeSession.close();
+    } catch (error) {
+      // A runtime whose force-stop kill is still unconfirmed fails its close; the next close must
+      // retry that kill, not return early as if it had succeeded.
+      this.closed = false;
+      throw error;
     } finally {
       this.rejectAllExtensionResults(new Error("Pi session closed"));
       this.cleanup?.();

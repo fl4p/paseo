@@ -94,6 +94,7 @@ export class JsonlRpcProcess {
   private nextRequestId = 1;
   private disposed = false;
   private terminationTree: Promise<ProcessTreeSnapshot> | null = null;
+  private terminationAttempted = false;
   private terminationConfirmed = false;
   private spawnTreeCapture: Promise<ProcessTreeSnapshot> | null = null;
   private processGroupId: number | undefined;
@@ -215,7 +216,7 @@ export class JsonlRpcProcess {
   }
 
   async close(error = new Error(`${this.diagnosticName} process is closed`)): Promise<void> {
-    if (this.terminationTree && !this.terminationConfirmed) {
+    if (this.terminationAttempted && !this.terminationConfirmed) {
       // A terminate() that could not confirm the kill already disposed the transport; closing must
       // not report success over it. Retry the same kill, and fail the close if it still cannot.
       await this.terminate(error);
@@ -260,6 +261,7 @@ export class JsonlRpcProcess {
   async terminate(
     error = new Error(`${this.diagnosticName} process was terminated`),
   ): Promise<void> {
+    this.terminationAttempted = true;
     this.terminationTree ??= this.spawnTreeCapture ?? this.captureTerminationTree();
     let tree: ProcessTreeSnapshot;
     try {
@@ -267,7 +269,10 @@ export class JsonlRpcProcess {
     } catch (captureError) {
       this.terminationTree = null;
       this.spawnTreeCapture = null;
-      throw captureError;
+      if (this.processGroupId === undefined) throw captureError;
+      await this.terminateProcessGroupWithoutCapture(this.processGroupId, error, captureError);
+      this.terminationConfirmed = true;
+      return;
     }
     this.failAll(error);
     try {
@@ -289,6 +294,37 @@ export class JsonlRpcProcess {
       throw new Error(`${this.diagnosticName} process tree did not exit after SIGKILL`);
     }
     this.terminationConfirmed = true;
+  }
+
+  /**
+   * The tree could not be read, but the process group is still ours to judge. While the root is
+   * alive its pid is the group id and cannot be reused, so the group is SIGKILLed until it is
+   * empty. Once the root has exited the id may be reused by an unrelated group, so it is only
+   * probed: an empty group confirms the kill, anything else stays unconfirmed.
+   */
+  private async terminateProcessGroupWithoutCapture(
+    groupId: number,
+    error: Error,
+    captureError: unknown,
+  ): Promise<void> {
+    const rootAlive = this.child.exitCode === null && this.child.signalCode === null;
+    this.failAll(error);
+    const deadline = Date.now() + GRACEFUL_SHUTDOWN_TIMEOUT_MS + FORCE_SHUTDOWN_TIMEOUT_MS;
+    for (;;) {
+      try {
+        process.kill(-groupId, rootAlive ? "SIGKILL" : 0);
+      } catch (killError) {
+        if ((killError as NodeJS.ErrnoException).code === "ESRCH") return;
+        throw killError;
+      }
+      if (!rootAlive || Date.now() >= deadline) {
+        throw new Error(
+          `${this.diagnosticName} process group ${groupId} could not be confirmed empty`,
+          { cause: captureError },
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
   }
 
   private async captureTerminationTree(): Promise<ProcessTreeSnapshot> {

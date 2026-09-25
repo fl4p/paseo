@@ -14,6 +14,29 @@ import { JsonlRpcProcess } from "./jsonl-rpc-process.js";
 
 const children: ChildProcessWithoutNullStreams[] = [];
 
+// Root in its own group, with a grandchild that ignores SIGTERM and reports its pid once ready.
+const GROUP_WITH_STUBBORN_GRANDCHILD = String.raw`
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+const grandchild = spawn(process.execPath, [
+  "-e",
+  "process.on('SIGTERM', () => {}); console.log(process.pid); setInterval(() => {}, 1000);",
+], { stdio: ["ignore", "pipe", "ignore"] });
+readline.createInterface({ input: grandchild.stdout }).on("line", (line) => {
+  process.stdout.write(JSON.stringify({ type: "grandchild", pid: Number(line) }) + "\n");
+});
+setInterval(() => {}, 1000);
+`;
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function startIdleProcess(): JsonlRpcProcess {
   return new JsonlRpcProcess({
     launch: { command: process.execPath, args: [], cwd: process.cwd() },
@@ -49,6 +72,42 @@ describe("JsonlRpcProcess close after an unconfirmed terminate", () => {
 
     expect(processTree.terminateCapturedProcessTree).toHaveBeenCalledTimes(2);
   });
+
+  test.skipIf(process.platform === "win32")(
+    "kills the process group when the tree cannot be captured, and close then confirms",
+    async () => {
+      processTree.captureProcessTree.mockRejectedValue(new Error("ps timed out"));
+      const transport = new JsonlRpcProcess({
+        launch: { command: process.execPath, args: [], cwd: process.cwd(), ownProcessGroup: true },
+        logger: pino({ level: "silent" }),
+        spawn: () => {
+          const child = spawn(process.execPath, ["-e", GROUP_WITH_STUBBORN_GRANDCHILD], {
+            stdio: ["pipe", "pipe", "pipe"],
+            detached: true,
+          });
+          children.push(child);
+          return child;
+        },
+      });
+      const grandchild = await new Promise<number>((resolve) => {
+        const unsubscribe = transport.onMessage((message) => {
+          if (message.type === "grandchild" && typeof message.pid === "number") {
+            unsubscribe();
+            resolve(message.pid);
+          }
+        });
+      });
+      try {
+        await expect(transport.terminate()).resolves.toBeUndefined();
+        expect(isAlive(grandchild)).toBe(false);
+        await expect(transport.close()).resolves.toBeUndefined();
+        expect(processTree.terminateCapturedProcessTree).not.toHaveBeenCalled();
+      } finally {
+        if (isAlive(grandchild)) process.kill(grandchild, "SIGKILL");
+      }
+    },
+    20_000,
+  );
 
   test("fails the close while the kill still cannot be confirmed", async () => {
     processTree.captureProcessTree.mockResolvedValue({ processes: new Map() });

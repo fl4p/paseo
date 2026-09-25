@@ -1178,6 +1178,22 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("a close whose runtime kill is unconfirmed is retried by the next close", async () => {
+    const { pi, session } = await createSession();
+    const fakeSession = pi.latestSession();
+    let runtimeCloses = 0;
+    fakeSession.close = async () => {
+      runtimeCloses += 1;
+      if (runtimeCloses === 1) throw new Error("Pi RPC process tree did not exit after SIGKILL");
+    };
+
+    await expect(session.close()).rejects.toThrow("did not exit after SIGKILL");
+    await expect(session.close()).resolves.toBeUndefined();
+    await expect(session.close()).resolves.toBeUndefined();
+
+    expect(runtimeCloses).toBe(2);
+  });
+
   test("terminate leaves the active turn alone when the kill never started", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();
