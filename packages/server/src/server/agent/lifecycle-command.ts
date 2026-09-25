@@ -14,6 +14,8 @@ export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   hasInFlightRun(agentId: string): boolean;
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
+  /** Cancel that kills the provider when it will not acknowledge; never returns "refused". */
+  forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
   /** Drop prompts queued behind a compaction; returns how many were discarded. */
   discardHeldPrompts(agentId: string, reason: string): number;
   clearAgentAttention(agentId: string): Promise<void>;
@@ -60,6 +62,7 @@ interface RequestedAgentRunCancellation extends CancelAgentRunResult {
 async function requestAgentRunCancellation(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "logger">,
   agentId: string,
+  mode: "graceful" | "force" = "graceful",
 ): Promise<RequestedAgentRunCancellation> {
   const { agentManager, logger } = dependencies;
   const agent = agentManager.getAgent(agentId);
@@ -82,7 +85,10 @@ async function requestAgentRunCancellation(
     "cancelAgentRunCommand: interrupting",
   );
   const startedAt = Date.now();
-  const cancellation = await agentManager.cancelAgentRun(agentId);
+  const cancellation =
+    mode === "force"
+      ? await agentManager.forceStopAgentRun(agentId)
+      : await agentManager.cancelAgentRun(agentId);
   logger.debug(
     { agentId, cancellation: cancellation.status, durationMs: Date.now() - startedAt },
     "cancelAgentRunCommand: cancelAgentRun completed",
@@ -98,7 +104,8 @@ async function requestAgentRunCancellation(
 /**
  * Stop, as the user means it. A prompt held behind a compaction is discarded BEFORE the cancel:
  * cancelling ends the compaction, which would otherwise release the hold and start exactly the
- * work the user just stopped. Stop itself is never held.
+ * work the user just stopped. Stop itself is never held, and never refused: a provider that will
+ * not acknowledge the cancel is killed and the agent resumed on a fresh session.
  */
 export async function cancelAgentRunCommand(
   dependencies: Pick<AgentLifecycleCommandDependencies, "agentManager" | "logger">,
@@ -114,7 +121,7 @@ export async function cancelAgentRunCommand(
       "cancelAgentRunCommand: discarded held prompts",
     );
   }
-  const result = await requestAgentRunCancellation(dependencies, agentId);
+  const result = await requestAgentRunCancellation(dependencies, agentId, "force");
   if (result.cancellation.status === "refused") {
     dependencies.logger.warn(
       { agentId },

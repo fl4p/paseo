@@ -74,6 +74,7 @@ import {
   AgentRunState,
   type ForegroundTurnWaiter,
   type PendingForegroundRun,
+  type TrackedAgentRun,
 } from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { ProviderForkUnsupportedError } from "./provider-fork.js";
@@ -3416,11 +3417,59 @@ export class AgentManager {
       return { status: settlement === "completed" ? "settled" : "refused" };
     }
 
+    if (settlement === "timed_out") {
+      await this.forceSettleRun(agent, run, "cancelAgentRun: acknowledged");
+    }
+    this.finishCanceledRun(agent);
+    return { status: "settled" };
+  }
+
+  /**
+   * Stop that cannot be refused. Tries the graceful cancel first; if the provider never
+   * acknowledges it (a pi turn blocked in a tool whose child ignores the abort), kill the
+   * provider's process tree, settle the turn as canceled, and resume the agent on a fresh
+   * session from its persisted thread. Only the stuck turn is lost.
+   */
+  forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
+    return this.trackAgentRegistrationOperation(
+      this.runLifecycleMutation(agentId, async () => {
+        const graceful = await this.cancelAgentRun(agentId);
+        if (graceful.status !== "refused") {
+          return graceful;
+        }
+        const agent = this.requireSessionAgent(agentId);
+        this.logger.warn(
+          { agentId, provider: agent.provider },
+          "forceStopAgentRun: cancellation not acknowledged, killing the provider session",
+        );
+        // Kill first: nothing may keep writing to the thread once the turn is declared over.
+        await this.closeReloadedSession(agent.session, agentId);
+        await this.drainSessionEvents(agentId);
+        await this.runForegroundMutation(agentId, async () => {
+          const run = this.runs.getRun(agentId);
+          // The provider may have ended the turn itself while dying.
+          if (run && !run.settled) {
+            await this.forceSettleRun(agent, run, "forceStopAgentRun: killed provider,");
+          }
+          this.finishCanceledRun(agent);
+        });
+        await this.reloadAgentSessionInternal(agentId);
+        return { status: "settled" };
+      }),
+    );
+  }
+
+  private async forceSettleRun(
+    agent: ActiveManagedAgent,
+    run: TrackedAgentRun,
+    logPrefix: string,
+  ): Promise<void> {
+    const agentId = agent.id;
     const runTurnId = this.runs.getTurnId(agentId);
-    if (settlement === "timed_out" && runTurnId) {
+    if (runTurnId) {
       this.logger.warn(
         { agentId, turnId: runTurnId, kind: run.kind },
-        "cancelAgentRun: acknowledged turn still active after timeout, force-canceling",
+        `${logPrefix} turn still active after timeout, force-canceling`,
       );
       await this.dispatchSessionEvent(agent, {
         type: "turn_canceled",
@@ -3429,10 +3478,10 @@ export class AgentManager {
         turnId: runTurnId,
       });
       await run.settledPromise;
-    } else if (settlement === "timed_out" && run.kind === "foreground") {
+    } else if (run.kind === "foreground") {
       this.logger.warn(
         { agentId, kind: run.kind },
-        "cancelAgentRun: acknowledged pending turn still active after timeout, clearing it",
+        `${logPrefix} pending turn still active after timeout, clearing it`,
       );
       this.runs.settleForegroundRun(agentId, run.token);
       if (!agent.pendingReplacement) {
@@ -3440,10 +3489,10 @@ export class AgentManager {
         this.touchUpdatedAt(agent);
         this.emitState(agent);
       }
-    } else if (settlement === "timed_out" && run.kind === "autonomous") {
+    } else {
       this.logger.warn(
         { agentId, kind: run.kind },
-        "cancelAgentRun: acknowledged turn still active after timeout, force-canceling",
+        `${logPrefix} turn still active after timeout, force-canceling`,
       );
       await this.dispatchSessionEvent(agent, {
         type: "turn_canceled",
@@ -3451,7 +3500,9 @@ export class AgentManager {
         reason: "interrupted",
       });
     }
+  }
 
+  private finishCanceledRun(agent: ActiveManagedAgent): void {
     if (agent.pendingPermissions.size > 0) {
       this.resolvePendingPermissionsForAgent(agent, agent.provider, undefined, "Interrupted");
       this.touchUpdatedAt(agent);
@@ -3459,8 +3510,7 @@ export class AgentManager {
     }
     // A settled cancel ended any compaction the run was doing, even on a path that published no
     // terminal event. Release its held prompts rather than leave them waiting on an idle agent.
-    this.releaseCompactionGate(agentId);
-    return { status: "settled" };
+    this.releaseCompactionGate(agent.id);
   }
 
   private async cancelAgentRunBefore(

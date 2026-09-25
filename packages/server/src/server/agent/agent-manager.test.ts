@@ -6811,6 +6811,97 @@ test("failed replacement cancellation preserves an autonomous running state", as
   }
 });
 
+test("force stop kills a provider that never acknowledges the cancel and resumes the agent", async () => {
+  // A pi turn blocked in a tool whose child ignores the abort: interrupt() never returns.
+  class StuckTurnSession extends SteeringTestSession {
+    closed = false;
+    override async interrupt(): Promise<void> {
+      this.interruptCount += 1;
+      await new Promise<never>(() => {});
+    }
+    override async close(): Promise<void> {
+      this.closed = true;
+    }
+  }
+  const stuck = new StuckTurnSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-force-stop-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return stuck;
+    }
+  })();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    logger,
+    rescueTimeouts: { interruptSessionMs: 10 },
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const run = manager.streamAgent(agent.id, "grep the whole disk");
+    const drained = (async () => {
+      for await (const _event of run) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+
+    await expect(manager.cancelAgentRun(agent.id)).resolves.toEqual({ status: "refused" });
+    expect(manager.hasInFlightRun(agent.id)).toBe(true);
+
+    await expect(manager.forceStopAgentRun(agent.id)).resolves.toEqual({ status: "settled" });
+    await drained;
+
+    expect(stuck.closed).toBe(true);
+    expect(client.resumeOverrides).toHaveLength(1);
+    expect(manager.hasInFlightRun(agent.id)).toBe(false);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+    // The resumed session takes the next prompt normally.
+    await expect(manager.runAgent(agent.id, "next")).resolves.toMatchObject({ canceled: false });
+  } finally {
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("force stop leaves the session alone when the provider acknowledges the cancel", async () => {
+  class ClosableSteeringSession extends SteeringTestSession {
+    closed = false;
+    override async close(): Promise<void> {
+      this.closed = true;
+    }
+  }
+  const session = new ClosableSteeringSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-force-stop-graceful-"));
+  const client = new (class extends TestAgentClient {
+    override async createSession(): Promise<AgentSession> {
+      return session;
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const run = manager.streamAgent(agent.id, "initial");
+    void (async () => {
+      for await (const _event of run) {
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+
+    await expect(manager.forceStopAgentRun(agent.id)).resolves.toEqual({ status: "settled" });
+
+    expect(session.interruptCount).toBe(1);
+    expect(session.closed).toBe(false);
+    expect(client.resumeOverrides).toHaveLength(0);
+    expect(manager.getAgent(agent.id)?.lifecycle).toBe("idle");
+  } finally {
+    await manager.closeAgent(agent.id);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("waitForAgentEvent waitForActive resolves for autonomous live-event run", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-wait-"));
   const storagePath = join(workdir, "agents");

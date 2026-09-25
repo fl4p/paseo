@@ -120,7 +120,40 @@ test("interruptAgentIfRunning rejects when graceful cancellation is refused", as
   );
 });
 
-test("cancel_agent_request reports refusal only through its response", async () => {
+test("cancel_agent_request force-stops when graceful cancellation is refused", async () => {
+  const agentId = "11111111-1111-4111-8111-111111111111";
+  const messages: SessionOutboundMessage[] = [];
+  const forceStopAgentRun = vi.fn(async () => ({ status: "settled" as const }));
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      getAgent: vi
+        .fn()
+        .mockReturnValueOnce({ id: agentId, lifecycle: "running" })
+        .mockReturnValue(null),
+      hasInFlightRun: vi.fn(() => true),
+      cancelAgentRun: vi.fn(async () => ({ status: "refused" as const })),
+      forceStopAgentRun,
+      discardHeldPrompts: vi.fn(() => 0),
+    },
+  });
+
+  await session.handleMessage({
+    type: "cancel_agent_request",
+    agentId,
+    requestId: "cancel-forced",
+  });
+
+  expect(forceStopAgentRun).toHaveBeenCalledWith(agentId);
+  expect(messages).toEqual([
+    {
+      type: "cancel_agent_response",
+      payload: { requestId: "cancel-forced", agentId, agent: null, error: null },
+    },
+  ]);
+});
+
+test("cancel_agent_request reports a failed force stop only through its response", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";
   const messages: SessionOutboundMessage[] = [];
   const getAgent = vi
@@ -132,31 +165,33 @@ test("cancel_agent_request reports refusal only through its response", async () 
     agentManager: {
       getAgent,
       hasInFlightRun: vi.fn(() => true),
-      cancelAgentRun: vi.fn(async () => ({ status: "refused" as const })),
+      forceStopAgentRun: vi.fn(async () => {
+        throw new Error("provider process did not exit");
+      }),
+      discardHeldPrompts: vi.fn(() => 0),
     },
   });
 
   await session.handleMessage({
     type: "cancel_agent_request",
     agentId,
-    requestId: "cancel-refused",
+    requestId: "cancel-failed",
   });
 
   expect(messages).toEqual([
     {
       type: "cancel_agent_response",
       payload: {
-        requestId: "cancel-refused",
+        requestId: "cancel-failed",
         agentId,
         agent: null,
-        error:
-          "Cannot stop agent 11111111-1111-4111-8111-111111111111 because its active run cancellation was not acknowledged",
+        error: "provider process did not exit",
       },
     },
   ]);
 });
 
-test("legacy cancel_agent_request reports refusal through the activity log", async () => {
+test("legacy cancel_agent_request reports a failed force stop through the activity log", async () => {
   const agentId = "11111111-1111-4111-8111-111111111111";
   const messages: SessionOutboundMessage[] = [];
   const session = createSessionForTest({
@@ -164,7 +199,10 @@ test("legacy cancel_agent_request reports refusal through the activity log", asy
     agentManager: {
       getAgent: vi.fn(() => ({ id: agentId, provider: "codex", lifecycle: "running" })),
       hasInFlightRun: vi.fn(() => true),
-      cancelAgentRun: vi.fn(async () => ({ status: "refused" as const })),
+      forceStopAgentRun: vi.fn(async () => {
+        throw new Error("provider process did not exit");
+      }),
+      discardHeldPrompts: vi.fn(() => 0),
     },
   });
 
@@ -177,8 +215,7 @@ test("legacy cancel_agent_request reports refusal through the activity log", asy
         id: expect.any(String),
         timestamp: expect.any(Date),
         type: "error",
-        content:
-          "Failed to cancel running agent on request: Cannot stop agent 11111111-1111-4111-8111-111111111111 because its active run cancellation was not acknowledged",
+        content: "Failed to cancel running agent on request: provider process did not exit",
       },
     },
   ]);

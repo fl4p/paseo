@@ -70,6 +70,18 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
       : ({ status: "not_running" } as const);
   }
 
+  readonly forceStoppedAgentIds: string[] = [];
+
+  async forceStopAgentRun(agentId: string) {
+    const graceful = await this.cancelAgentRun(agentId);
+    if (graceful.status !== "refused") {
+      return graceful;
+    }
+    this.forceStoppedAgentIds.push(agentId);
+    this.inFlightAgentIds.delete(agentId);
+    return { status: "settled" } as const;
+  }
+
   readonly discardedHeldPromptAgentIds: string[] = [];
 
   discardHeldPrompts(agentId: string): number {
@@ -201,6 +213,22 @@ describe("agent lifecycle commands", () => {
     });
   });
 
+  test("force-stops when the provider does not acknowledge the graceful cancel", async () => {
+    const storage = new FakeLifecycleAgentStorage();
+    const manager = new FakeLifecycleAgentManager(storage);
+    manager.liveAgents.set("agent-1", managedAgent("agent-1", "running"));
+    manager.inFlightAgentIds.add("agent-1");
+    manager.rejectedCancellationAgentIds.add("agent-1");
+
+    await expect(
+      cancelAgentRunCommand({ agentManager: manager, logger }, "agent-1"),
+    ).resolves.toEqual({
+      agent: manager.liveAgents.get("agent-1"),
+      cancelled: true,
+    });
+    expect(manager.forceStoppedAgentIds).toEqual(["agent-1"]);
+  });
+
   test("archives a live agent after canceling and clearing attention", async () => {
     const storage = new FakeLifecycleAgentStorage();
     const manager = new FakeLifecycleAgentManager(storage);
@@ -238,6 +266,7 @@ describe("agent lifecycle commands", () => {
       archiveAgentCommand({ agentManager: manager, agentStorage: storage, logger }, "agent-1"),
     ).resolves.toMatchObject({ agentId: "agent-1" });
     expect(manager.cancelledAgentIds).toEqual(["agent-1"]);
+    expect(manager.forceStoppedAgentIds).toEqual([]);
     expect(manager.archivedAgentIds).toEqual(["agent-1"]);
   });
 
