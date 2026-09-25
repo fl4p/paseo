@@ -3894,6 +3894,36 @@ describe("processAgentStreamEvent", () => {
       }),
     ]);
   });
+
+  it("merges reasoning chunks streamed before bootstrap into one thought per block", () => {
+    const events: AgentStreamEventPayload[] = [
+      makeTimelineEvent("Let me ", "reasoning"),
+      makeTimelineEvent("check the ", "reasoning"),
+      makeTimelineEvent("file.", "reasoning"),
+      makeToolCallTimelineEvent("call-1"),
+      makeTimelineEvent("Now ", "reasoning"),
+      makeTimelineEvent("edit it.", "reasoning"),
+    ];
+    let tail: StreamItem[] = [makeAssistantItem("painted replica")];
+    let head: StreamItem[] = [];
+    events.forEach((event, index) => {
+      const result = processAgentStreamEvent({
+        ...baseStreamInput,
+        event,
+        seq: 51 + index,
+        epoch: "epoch-1",
+        currentTail: tail,
+        currentHead: head,
+        hasAuthoritativeBaseline: false,
+      });
+      tail = result.tail;
+      head = result.head;
+    });
+
+    expect(
+      head.map((item) => (item.kind === "thought" ? `thought:${item.text}` : item.kind)),
+    ).toEqual(["thought:Let me check the file.", "tool_call", "thought:Now edit it."]);
+  });
 });
 
 describe("processAgentStreamEvents", () => {

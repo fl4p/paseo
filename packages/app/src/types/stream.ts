@@ -1864,6 +1864,23 @@ function getTailAssistantToResume(params: {
   return params.tailAssistant;
 }
 
+// A thought still streaming at the end of the tail (e.g. applied through the
+// no-baseline overlay, which hands the live rows in as `tail`) must keep taking
+// chunks; otherwise every reasoning delta renders as its own "Thinking" row.
+function getTailThoughtToResume(params: {
+  incomingKind: StreamItem["kind"] | null;
+  nextHead: StreamItem[];
+  tailItem: StreamItem | undefined;
+}): ThoughtItem | null {
+  if (params.incomingKind !== "thought" || params.nextHead.length !== 0) {
+    return null;
+  }
+  if (params.tailItem?.kind !== "thought" || params.tailItem.status === "ready") {
+    return null;
+  }
+  return params.tailItem;
+}
+
 function promoteCompletedAssistantBlocks(params: { tail: StreamItem[]; head: StreamItem[] }): {
   tail: StreamItem[];
   head: StreamItem[];
@@ -2164,9 +2181,11 @@ export function applyStreamEvent(params: {
     nextHead,
     tailAssistant: nextTail.at(-1),
   });
-  if (tailAssistant) {
+  const tailStreamable =
+    tailAssistant ?? getTailThoughtToResume({ incomingKind, nextHead, tailItem: nextTail.at(-1) });
+  if (tailStreamable) {
     nextTail = nextTail.slice(0, -1);
-    nextHead = [tailAssistant];
+    nextHead = [tailStreamable];
     changedTail = true;
     changedHead = true;
   }
