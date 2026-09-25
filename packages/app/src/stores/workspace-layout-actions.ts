@@ -1471,9 +1471,16 @@ export function closeTabInLayout(input: CloseTabInLayoutInput): WorkspaceLayout 
   if (!pane) {
     return null;
   }
+  // The last canvas pane stays even when it is a split pane that outlived `main`:
+  // dropping it leaves only the Explorer, and nothing can open a tab on the canvas.
+  const isLastCanvasPane = collectAllPanes(internalLayout.root).every(
+    (candidate) => candidate.id === pane.id || candidate.id === EXPLORER_SIDEBAR_PANE_ID,
+  );
   const preserveEmptyPaneId =
     input.preserveEmptyPaneId ??
-    (pane.id === DEFAULT_PANE_ID || pane.id === EXPLORER_SIDEBAR_PANE_ID ? pane.id : null);
+    (pane.id === DEFAULT_PANE_ID || pane.id === EXPLORER_SIDEBAR_PANE_ID || isLastCanvasPane
+      ? pane.id
+      : null);
 
   const closeSuccessorTabId = getCloseSuccessorTabId({
     pane,
@@ -2423,11 +2430,47 @@ function seedDraftForEmptyWorkspace(input: {
   );
 }
 
+/**
+ * Gives back a canvas pane to a layout that has only the Explorer sidebar left.
+ * Such a layout cannot settle: the empty-workspace draft lands in the Explorer, which
+ * does not count as content, so every reconcile seeds another one. The drafts it
+ * piled up there were never the user's, so they go with the repair.
+ */
+function restoreCanvasPane(
+  layout: WorkspaceLayout,
+  explorerSidebarPaneId: string | null,
+): WorkspaceLayout {
+  const panes = collectAllPanes(layout.root);
+  const explorerPane = panes.find((pane) => pane.id === explorerSidebarPaneId);
+  if (!explorerPane || panes.some((pane) => pane.id !== explorerSidebarPaneId)) {
+    return layout;
+  }
+  const internalExplorerPane = explorerPane as SplitPaneInternal;
+  return withNormalizedParentTabMap({
+    root: createGroupNode({
+      id: DEFAULT_LAYOUT_GROUP_ID,
+      direction: "horizontal",
+      children: [
+        createPaneNode({ id: DEFAULT_PANE_ID, tabs: [createNewWorkspaceTab()] }),
+        createPaneNode({
+          id: internalExplorerPane.id,
+          tabs: internalExplorerPane.tabs.filter((tab) => tab.target.kind !== "draft"),
+          focusedTabId: internalExplorerPane.focusedTabId,
+          hidden: internalExplorerPane.hidden,
+        }),
+      ],
+      sizes: [0.78, 0.22],
+    }),
+    focusedPaneId: DEFAULT_PANE_ID,
+    parentTabIdByTabId: layout.parentTabIdByTabId,
+  });
+}
+
 export function reconcileWorkspaceTabs(
   state: WorkspaceTabReconcileState,
   snapshot: WorkspaceTabSnapshot,
 ): WorkspaceTabReconcileState {
-  let nextLayout = state.layout;
+  let nextLayout = restoreCanvasPane(state.layout, state.explorerSidebarPaneId);
   const originalFocusedTabId =
     findPaneById(nextLayout.root, nextLayout.focusedPaneId)?.focusedTabId ?? null;
   let reconciledFocusedTabId = originalFocusedTabId;
