@@ -71,6 +71,22 @@ describe("execCommand", () => {
     expect(result.stderr).toBe("");
   });
 
+  test("sets PWD to the provided cwd instead of inheriting the parent's", async () => {
+    const cwd = realpathSync(mkdtempSync(path.join(tmpdir(), "spawn-test-")));
+    tempDirs.push(cwd);
+    const printPwd = ["-e", "console.log(process.env.PWD)"];
+    const baseEnv = { PATH: process.env.PATH, PWD: path.parse(cwd).root };
+
+    const exec = await execCommand(process.execPath, printPwd, { cwd, baseEnv });
+    expect(exec.stdout.trim()).toBe(cwd);
+
+    const child = spawnProcess(process.execPath, printPwd, { cwd, baseEnv, envMode: "internal" });
+    let stdout = "";
+    child.stdout?.on("data", (chunk) => (stdout += chunk));
+    await new Promise((resolveExit) => child.on("close", resolveExit));
+    expect(stdout.trim()).toBe(cwd);
+  });
+
   test("treats env as the replacement base and finalizes external command env", async () => {
     const result = await execCommand(process.execPath, ["-e", printEnvScript], {
       baseEnv: {

@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { extname } from "node:path";
+import { extname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { createExternalCommandProcessEnv, type ProcessEnvRecord } from "../server/paseo-env.js";
@@ -52,6 +53,18 @@ function shouldUseWindowsShell(
   return process.platform === "win32" && !hasPathSeparator(command) && !extname(command);
 }
 
+/**
+ * Point PWD at the child's real cwd, as a shell does on `cd`. Otherwise the child inherits the
+ * daemon's PWD (often `/` under launchd), and tools that prefer $PWD over getcwd() — context-mode
+ * resolves its project dir that way — run everything from the wrong directory.
+ */
+function withChildPwd(env: NodeJS.ProcessEnv, cwd: string | URL | undefined): NodeJS.ProcessEnv {
+  if (cwd === undefined) {
+    return env;
+  }
+  return { ...env, PWD: resolve(typeof cwd === "string" ? cwd : fileURLToPath(cwd)) };
+}
+
 export function spawnProcess(
   command: string,
   args: string[],
@@ -76,7 +89,7 @@ export function spawnProcess(
 
   return spawn(resolvedCommand, resolvedArgs, {
     ...spawnOptions,
-    env: childEnv,
+    env: withChildPwd(childEnv, spawnOptions.cwd),
     shell,
     signal: options?.signal,
     windowsHide: true,
@@ -106,7 +119,7 @@ export async function execCommand(
 
   return execFileAsync(resolvedCommand, resolvedArgs, {
     cwd: options?.cwd,
-    env: childEnv,
+    env: withChildPwd(childEnv, options?.cwd),
     encoding: options?.encoding ?? "utf8",
     killSignal: options?.killSignal,
     timeout: options?.timeout,
