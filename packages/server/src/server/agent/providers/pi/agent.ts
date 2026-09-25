@@ -1708,8 +1708,26 @@ export class PiRpcAgentSession implements AgentSession {
     }
   }
 
-  /** A pi turn blocked in a tool that ignores pi's abort ends only by killing the tree. */
+  /**
+   * A pi turn blocked in a tool that ignores pi's abort ends only by killing the tree. The turn is
+   * ended as canceled first, so the prompt rejection and process exit the kill causes find no
+   * active turn and do not report it as failed.
+   */
   async terminate(): Promise<void> {
+    if (this.activeTurnId || this.activeTurnStarted) {
+      const turnId = this.activeTurnId ?? undefined;
+      this.usagePoller.stopTurn();
+      this.activeTurnId = null;
+      this.activeClientMessageId = null;
+      this.activeTurnStarted = false;
+      this.activeTurnStartedEmitted = false;
+      this.pendingSettledMessages = null;
+      this.activeAssistantMessageId = null;
+      this.pendingSteerSubmissions.length = 0;
+      this.clearNoTurnBuffers();
+      this.interruptingTurn = null;
+      this.emit({ type: "turn_canceled", provider: this.provider, reason: "interrupted", turnId });
+    }
     await this.runtimeSession.terminate();
   }
 

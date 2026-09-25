@@ -754,8 +754,12 @@ export class AgentManager {
   /** Per agent, the prompts held behind a compaction, oldest first. */
   private readonly heldPrompts = new Map<string, HeldPrompt[]>();
   private readonly runs = new AgentRunState();
-  /** Sessions force-stopped by terminate(); a later Stop must resume the agent, not cancel again. */
-  private readonly terminatedSessions = new WeakSet<AgentSession>();
+  /**
+   * Sessions force stop has started to terminate. "pending": terminate() began but did not confirm
+   * the runtime dead, so the session must not be reused or resumed over until a retry confirms it.
+   * "done": dead; a later Stop must resume the agent, not cancel again.
+   */
+  private readonly sessionTerminations = new WeakMap<AgentSession, "pending" | "done">();
   private readonly subscribers = new Set<SubscriptionRecord>();
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
@@ -1572,8 +1576,7 @@ export class AgentManager {
     let closedExisting: ManagedAgentClosed | undefined;
     let handedToRegistration = false;
     try {
-      // A persisted thread can have only one writer, even when its turn is idle.
-      await this.closeReloadedSession(existing.session, agentId);
+      await this.releaseSessionForReload(existing.session, agentId);
       await this.drainSessionEvents(agentId);
       this.cancelRunningProviderSubagents(agentId);
       closedExisting = this.prepareAgentForClosure(existing, "agent reloaded");
@@ -1596,9 +1599,12 @@ export class AgentManager {
         }
       }
 
-      // Preserve existing labels and timeline during reload.
+      // Preserve existing labels and timeline during reload. Awaited so a failed registration
+      // reaches the catch below, and registered as a replacement so its unwind keeps the agent's
+      // durable record and timeline instead of deleting them like a failed new agent's.
       handedToRegistration = true;
-      return this.registerSession(session, storedConfig, agentId, {
+      return await this.registerSession(session, storedConfig, agentId, {
+        replacesExistingAgent: true,
         labels: existing.labels,
         workspaceId: existing.workspaceId,
         owner: existing.owner,
@@ -1631,6 +1637,17 @@ export class AgentManager {
         }
       }
     }
+  }
+
+  /**
+   * A persisted thread can have only one writer, even when its turn is idle. A runtime a force
+   * stop could not confirm dead may still be writing it, so that kill is finished before closing.
+   */
+  private async releaseSessionForReload(session: AgentSession, agentId: string): Promise<void> {
+    if (this.sessionTerminations.get(session) === "pending") {
+      await this.terminateSession(session);
+    }
+    await this.closeReloadedSession(session, agentId);
   }
 
   private async closeReloadedSession(session: AgentSession, agentId: string): Promise<void> {
@@ -3440,22 +3457,24 @@ export class AgentManager {
   forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, async () => {
+        if (this.agents.get(agentId)?.session == null) {
+          return { status: "not_running" };
+        }
         const graceful = await this.cancelAgentRun(agentId);
         const agent = this.requireSessionAgent(agentId);
-        const alreadyTerminated = this.terminatedSessions.has(agent.session);
-        if (graceful.status !== "refused" && !alreadyTerminated) {
+        const termination = this.sessionTerminations.get(agent.session);
+        if (graceful.status !== "refused" && termination === undefined) {
           return graceful;
         }
-        if (!alreadyTerminated) {
-          if (!agent.session.terminate) {
-            return graceful;
-          }
+        if (termination === undefined && !agent.session.terminate) {
+          return graceful;
+        }
+        if (termination !== "done") {
           this.logger.warn(
-            { agentId, provider: agent.provider },
+            { agentId, provider: agent.provider, retry: termination === "pending" },
             "forceStopAgentRun: cancellation not acknowledged, terminating the provider runtime",
           );
-          await agent.session.terminate();
-          this.terminatedSessions.add(agent.session);
+          await this.terminateSession(agent.session);
         }
         await this.drainSessionEvents(agentId);
         await this.runForegroundMutation(agentId, async () => {
@@ -3470,6 +3489,16 @@ export class AgentManager {
         return { status: "settled" };
       }),
     );
+  }
+
+  /** Kill a session's runtime; the "pending" mark survives a rejection and blocks its reuse. */
+  private async terminateSession(session: AgentSession): Promise<void> {
+    if (!session.terminate) {
+      throw new Error(`Provider '${session.provider}' cannot terminate its runtime`);
+    }
+    this.sessionTerminations.set(session, "pending");
+    await session.terminate();
+    this.sessionTerminations.set(session, "done");
   }
 
   private async forceSettleRun(
@@ -3982,6 +4011,7 @@ export class AgentManager {
       publishWhenReady?: boolean;
       workspaceId?: string;
       owner?: AgentOwner;
+      replacesExistingAgent?: boolean;
     },
   ): Promise<ManagedAgent> {
     let registeredAgent: ActiveManagedAgent | null = null;
@@ -4039,7 +4069,9 @@ export class AgentManager {
       return { ...managed };
     } catch (error) {
       if (registeredAgent) {
-        await this.unwindFailedRegistration(registeredAgent, session);
+        await this.unwindFailedRegistration(registeredAgent, session, {
+          keepDurableState: options?.replacesExistingAgent === true,
+        });
       } else {
         await this.closeUnregisteredSession(session);
       }
@@ -4070,6 +4102,7 @@ export class AgentManager {
   private async unwindFailedRegistration(
     agent: ActiveManagedAgent,
     session: AgentSession,
+    options?: { keepDurableState?: boolean },
   ): Promise<void> {
     if (this.agents.get(agent.id) !== agent) {
       return;
@@ -4078,6 +4111,15 @@ export class AgentManager {
     // must end up as if it had never been registered, not as a closed one.
     this.prepareAgentForClosure(agent, "agent registration failed");
     await this.closeUnregisteredSession(session);
+    if (options?.keepDurableState) {
+      // A reload replaced an agent that already existed; its closed snapshot and timeline are
+      // what the next load resumes from, so only the failed live registration is undone.
+      this.logger.warn(
+        { agentId: agent.id },
+        "agent.register.unwound: removed the live registration of a failed reload",
+      );
+      return;
+    }
     try {
       await this.deleteAgentState(agent.id);
     } catch (error) {

@@ -63,6 +63,8 @@ export class PiCliRuntime implements PiRuntime {
       args,
       cwd: launch.cwd,
       env: launch.env,
+      // Force stop kills the whole tree, including MCP servers and tools pi started.
+      ownProcessGroup: true,
     };
     const spawn = this.spawnProcess;
     const processOptions = {

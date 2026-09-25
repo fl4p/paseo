@@ -1160,6 +1160,24 @@ describe("PiRpcAgentSession", () => {
     await expect(events.nextTurnFailure()).resolves.toMatchObject({ error: "Pi process exited" });
   });
 
+  test("terminate ends the active turn as canceled, not failed, when the kill exits Pi", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.terminate = async () => {
+      fakeSession.emit({ type: "process_exit", error: "Pi process exited" });
+    };
+    const { turnId } = await session.startTurn("grep the whole disk");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+
+    await session.terminate();
+
+    expect(events.turnLifecycleEvents()).toEqual([
+      { type: "turn_started", turnId },
+      { type: "turn_canceled", turnId },
+    ]);
+  });
+
   test("preserves the autonomous terminal error when abort rejects", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();

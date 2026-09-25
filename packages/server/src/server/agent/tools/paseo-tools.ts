@@ -2068,7 +2068,8 @@ export function createPaseoToolCatalog(options: PaseoToolHostDependencies): Pase
     "cancel_agent",
     {
       title: "Cancel agent run",
-      description: "Abort the agent's current run but keep the agent alive for future tasks.",
+      description:
+        "Abort the agent's current run but keep the agent alive for future tasks. If the provider does not acknowledge the abort and can be killed (pi), its runtime is terminated and the agent resumes on a fresh session; the stopped turn is lost.",
       inputSchema: {
         agentId: z.string(),
       },

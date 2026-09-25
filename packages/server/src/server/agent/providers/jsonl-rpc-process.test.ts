@@ -72,6 +72,7 @@ interface StartProcessOptions {
   child?: ChildProcessWithoutNullStreams;
   defaultRequestTimeoutMs?: number;
   source?: string;
+  ownProcessGroup?: boolean;
 }
 
 function createInMemoryChildProcess(): InMemoryChildProcess {
@@ -92,11 +93,32 @@ function createInMemoryChildProcess(): InMemoryChildProcess {
 // A tool that ignores SIGTERM: the root exits on SIGTERM, its grandchild does not.
 const TERM_IGNORING_GRANDCHILD_SOURCE = String.raw`
 const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+// The grandchild reports its pid only once its SIGTERM handler is installed.
 const grandchild = spawn(process.execPath, [
   "-e",
-  "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);",
-], { stdio: "ignore" });
-process.stdout.write(JSON.stringify({ type: "grandchild", pid: grandchild.pid }) + "\n");
+  "process.on('SIGTERM', () => {}); console.log(process.pid); setInterval(() => {}, 1000);",
+], { stdio: ["ignore", "pipe", "ignore"] });
+readline.createInterface({ input: grandchild.stdout }).on("line", (line) => {
+  process.stdout.write(JSON.stringify({ type: "grandchild", pid: Number(line) }) + "\n");
+});
+setInterval(() => {}, 1000);
+`;
+
+// A tool that daemonizes by double fork: the intermediate exits at once, so the worker is
+// reparented before any kill and is reachable only through its process group. The worker
+// reports its pid only after its SIGTERM handler is installed.
+const ORPHANED_WORKER_SOURCE = String.raw`
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+const worker = "process.on('SIGTERM', () => {}); console.log(process.pid); setInterval(() => {}, 1000);";
+const intermediate = spawn(process.execPath, [
+  "-e",
+  "require('node:child_process').spawn(process.execPath, ['-e', " + JSON.stringify(worker) + "], { stdio: ['ignore', 'inherit', 'ignore'] }); process.exit(0);",
+], { stdio: ["ignore", "pipe", "ignore"] });
+readline.createInterface({ input: intermediate.stdout }).on("line", (line) => {
+  process.stdout.write(JSON.stringify({ type: "grandchild", pid: Number(line) }) + "\n");
+});
 setInterval(() => {}, 1000);
 `;
 
@@ -128,6 +150,7 @@ function startProcess(options: StartProcessOptions = {}): JsonlRpcProcess {
       args: ["-e", options.source ?? CHILD_SOURCE, "--", "resolved-arg"],
       cwd: process.cwd(),
       env: { JSONL_RPC_TEST_VALUE: "resolved-env" },
+      ...(options.ownProcessGroup ? { ownProcessGroup: true } : {}),
     },
     logger: pino({ level: "silent" }),
     defaultRequestTimeoutMs: options.defaultRequestTimeoutMs,
@@ -278,6 +301,30 @@ describe("JsonlRpcProcess", () => {
         expect(isAlive(terminatedGrandchild)).toBe(false);
       } finally {
         for (const pid of [closedGrandchild, terminatedGrandchild]) {
+          if (isAlive(pid)) process.kill(pid, "SIGKILL");
+        }
+      }
+    },
+    20_000,
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "terminate reaches a worker orphaned before the kill only through its own process group",
+    async () => {
+      const ungrouped = startProcess({ source: ORPHANED_WORKER_SOURCE });
+      const ungroupedWorker = await nextGrandchildPid(ungrouped);
+      const grouped = startProcess({ source: ORPHANED_WORKER_SOURCE, ownProcessGroup: true });
+      const groupedWorker = await nextGrandchildPid(grouped);
+      try {
+        await grouped.terminate();
+        expect(isAlive(groupedWorker)).toBe(false);
+
+        // Without the group the orphan is outside every ancestry walk: terminate either misses
+        // it (and wrongly succeeds) or cannot confirm it. Either way it survives.
+        await ungrouped.terminate().catch(() => undefined);
+        expect(isAlive(ungroupedWorker)).toBe(true);
+      } finally {
+        for (const pid of [ungroupedWorker, groupedWorker]) {
           if (isAlive(pid)) process.kill(pid, "SIGKILL");
         }
       }

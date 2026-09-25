@@ -28,6 +28,12 @@ export interface JsonlRpcLaunch {
   args: string[];
   cwd: string;
   env?: Record<string, string>;
+  /**
+   * Start the process as the leader of its own process group, and capture its tree at spawn, so
+   * terminate() also reaches descendants that are reparented before or during the kill (a
+   * double fork, a child spawned from a SIGTERM handler). Ignored on Windows.
+   */
+  ownProcessGroup?: boolean;
 }
 
 interface JsonlRpcResponse {
@@ -72,6 +78,7 @@ function spawnJsonlRpcProcess(launch: JsonlRpcLaunch): ChildProcessWithoutNullSt
     cwd: launch.cwd,
     envOverlay: launch.env,
     stdio: ["pipe", "pipe", "pipe"],
+    detached: launch.ownProcessGroup === true && process.platform !== "win32",
   });
   assertChildWithPipes(child);
   return child;
@@ -87,6 +94,7 @@ export class JsonlRpcProcess {
   private nextRequestId = 1;
   private disposed = false;
   private terminationTree: Promise<ProcessTreeSnapshot> | null = null;
+  private spawnTreeCapture: Promise<ProcessTreeSnapshot> | null = null;
   private readonly frameDecoder: JsonlFrameDecoder;
 
   constructor(private readonly options: JsonlRpcProcessOptions) {
@@ -101,6 +109,13 @@ export class JsonlRpcProcess {
       },
     });
     this.child = (options.spawn ?? spawnJsonlRpcProcess)(options.launch);
+    const pid = this.child.pid;
+    if (options.launch.ownProcessGroup && pid !== undefined) {
+      const groupId = process.platform === "win32" ? undefined : pid;
+      this.spawnTreeCapture = captureProcessTree(pid, groupId);
+      // A capture failure must reach terminate(), never an unhandled rejection.
+      void this.spawnTreeCapture.catch(() => undefined);
+    }
     this.child.stdout.on("data", (chunk) => {
       this.handleStdoutChunk(chunk.toString());
     });
@@ -232,12 +247,13 @@ export class JsonlRpcProcess {
   async terminate(
     error = new Error(`${this.diagnosticName} process was terminated`),
   ): Promise<void> {
-    this.terminationTree ??= this.captureTerminationTree();
+    this.terminationTree ??= this.spawnTreeCapture ?? this.captureTerminationTree();
     let tree: ProcessTreeSnapshot;
     try {
       tree = await this.terminationTree;
     } catch (captureError) {
       this.terminationTree = null;
+      this.spawnTreeCapture = null;
       throw captureError;
     }
     this.failAll(error);
