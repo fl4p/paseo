@@ -6979,6 +6979,12 @@ test("a kill that ended the turn but was not confirmed blocks resume until a Sto
 
     // The session takes no new work while its kill is unconfirmed.
     expect(() => manager.streamAgent(agentId, "next")).toThrow("being force-stopped");
+    expect(() => manager.tryRunOutOfBand(agentId, "/autocompact off")).toThrow(
+      "being force-stopped",
+    );
+    await expect(manager.steerOrReplaceActiveTurn(agentId, "steer")).rejects.toThrow(
+      "being force-stopped",
+    );
     await expect(manager.reloadAgentSession(agentId)).rejects.toThrow("did not exit after SIGKILL");
     expect(session.terminateCalls).toBe(2);
     expect(session.closed).toBe(false);
@@ -7099,6 +7105,124 @@ test("Stop on an idle agent does not wait behind a reload in progress", async ()
   } finally {
     resumeHeld.resolve();
     await manager.closeAgent(agent.id).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("an escalation queued behind the lifecycle lane does not kill a run started after the refusal", async () => {
+  class KillRecordingSession extends UnacknowledgingSession {
+    terminateCalls = 0;
+    override async interrupt(): Promise<void> {
+      this.interruptCount += 1;
+      await new Promise<never>(() => {});
+    }
+    async terminate(): Promise<void> {
+      this.terminateCalls += 1;
+    }
+  }
+  const session = new KillRecordingSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, client, agentId, workdir } = await startStuckRun(session);
+  const laneHeld = deferred<void>();
+  const lane = manager as unknown as {
+    runLifecycleMutation(id: string, mutation: () => Promise<void>): Promise<void>;
+  };
+  try {
+    const holder = lane.runLifecycleMutation(agentId, () => laneHeld.promise);
+    const stop = manager.forceStopAgentRun(agentId);
+    await vi.waitFor(() => expect(session.interruptCount).toBeGreaterThan(0));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Run A ends on its own; the user starts run B before the escalation gets the lane.
+    session.pushEvent({ type: "turn_completed", provider: "codex", turnId: "active-turn-1" });
+    await vi.waitFor(() => expect(manager.hasInFlightRun(agentId)).toBe(false));
+    const runB = manager.streamAgent(agentId, "healthy");
+    void (async () => {
+      for await (const _event of runB) {
+      }
+    })().catch(() => undefined);
+    await manager.waitForAgentRunStart(agentId);
+
+    laneHeld.resolve();
+    await holder;
+    await expect(stop).resolves.toEqual({ status: "settled" });
+    expect(session.terminateCalls).toBe(0);
+    expect(client.resumeOverrides).toHaveLength(0);
+    expect(manager.hasInFlightRun(agentId)).toBe(true);
+  } finally {
+    laneHeld.resolve();
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("archiving an agent whose force-stop kill is unconfirmed commits nothing", async () => {
+  class UnkillableSession extends UnacknowledgingSession {
+    async terminate(): Promise<void> {
+      throw new Error("process tree did not exit after SIGKILL");
+    }
+  }
+  const session = new UnkillableSession({ provider: "codex", cwd: process.cwd() });
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-force-stop-archive-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(): Promise<AgentSession> {
+          return session;
+        }
+      })(),
+    },
+    registry: storage,
+    logger,
+    rescueTimeouts: { interruptSessionMs: 10 },
+  });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const run = manager.streamAgent(agent.id, "stuck");
+    void (async () => {
+      for await (const _event of run) {
+      }
+    })().catch(() => undefined);
+    await manager.waitForAgentRunStart(agent.id);
+    await expect(manager.forceStopAgentRun(agent.id)).rejects.toThrow("did not exit");
+
+    await expect(manager.archiveAgent(agent.id)).rejects.toThrow("did not exit");
+    expect((await storage.get(agent.id))?.archivedAt ?? null).toBeNull();
+    expect(manager.getAgent(agent.id)).not.toBeNull();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a first-time resume whose registration fails leaves no record behind", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-fresh-"));
+  class SecondSnapshotFailingStorage extends AgentStorage {
+    snapshots = 0;
+    override async applySnapshot(
+      ...args: Parameters<AgentStorage["applySnapshot"]>
+    ): ReturnType<AgentStorage["applySnapshot"]> {
+      this.snapshots += 1;
+      if (this.snapshots === 2) throw new Error("disk full");
+      return super.applySnapshot(...args);
+    }
+  }
+  const storage = new SecondSnapshotFailingStorage(join(workdir, "agents"), logger);
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000321",
+  });
+  try {
+    await expect(
+      manager.resumeAgentFromPersistence(
+        { provider: "codex", sessionId: "native-session" },
+        { cwd: workdir },
+      ),
+    ).rejects.toThrow("disk full");
+    await expect(storage.get("00000000-0000-4000-8000-000000000321")).resolves.toBeNull();
+  } finally {
     rmSync(workdir, { recursive: true, force: true });
   }
 });

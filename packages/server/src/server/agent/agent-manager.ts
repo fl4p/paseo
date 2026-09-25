@@ -1413,11 +1413,14 @@ export class AgentManager {
       resumeOptions,
     );
     await this.requireExternalMcpSupport(session, storedConfig);
-    // The agent already exists durably; a failed registration must not delete its record.
+    // Reopening an agent that already exists durably must not let a failed registration delete
+    // its record; a first-time resume under a fresh id has nothing to keep.
+    const replacesExistingAgent =
+      agentId !== undefined && (await this.registry?.get(resolvedAgentId)) != null;
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
       persistence: handle,
-      replacesExistingAgent: true,
+      replacesExistingAgent,
     });
   }
 
@@ -1749,18 +1752,14 @@ export class AgentManager {
       "the agent was closed while the message waited for a compaction",
     );
     this.releaseCompactionGate(agentId);
-    if (agent.session && this.sessionTerminations.get(agent.session) === "pending") {
-      // Closing would drop the only handle through which a force stop's unconfirmed kill can be
-      // finished. Finish it; if that still fails, refuse the close unless the daemon is exiting.
-      try {
-        await this.terminateSession(agent.session);
-      } catch (error) {
-        if (this.acceptingAgentRegistrations) throw error;
-        this.logger.error(
-          { err: error, agentId },
-          "agent.manager.close: shutting down with a force-stopped runtime not confirmed dead",
-        );
-      }
+    try {
+      await this.finishPendingTermination(agent);
+    } catch (error) {
+      if (this.acceptingAgentRegistrations) throw error;
+      this.logger.error(
+        { err: error, agentId },
+        "agent.manager.close: shutting down with a force-stopped runtime not confirmed dead",
+      );
     }
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
@@ -1817,6 +1816,8 @@ export class AgentManager {
     if (!this.registry) {
       throw new Error("Agent storage is not configured");
     }
+    // Before anything is committed: an archive the close below would refuse must not half-apply.
+    await this.finishPendingTermination(agent);
 
     await this.registry.applySnapshot(agent, {
       internal: agent.internal,
@@ -2399,7 +2400,7 @@ export class AgentManager {
    * broadcast like normal timeline events.
    */
   tryRunOutOfBand(agentId: string, prompt: AgentPromptInput, options?: AgentRunOptions): boolean {
-    const agent = this.requireSessionAgent(agentId);
+    const agent = this.requireUsableSessionAgent(agentId);
     const handler = agent.session.tryHandleOutOfBand?.(prompt);
     if (!handler) {
       return false;
@@ -3126,7 +3127,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentSteerOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
-    const agent = this.requireSessionAgent(agentId);
+    const agent = this.requireUsableSessionAgent(agentId);
     const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
     if (!expectedTurnId) {
       return { status: "inactive" };
@@ -3482,23 +3483,33 @@ export class AgentManager {
         return { status: "not_running" };
       }
       const graceful = await this.cancelAgentRun(agentId);
-      if (graceful.status !== "refused" || !this.requireSessionAgent(agentId).session.terminate) {
+      const refusing = this.requireSessionAgent(agentId);
+      if (graceful.status !== "refused" || !refusing.session.terminate) {
         return graceful;
       }
+      // Escalate against exactly the session and run that refused, never whatever runs later.
+      const target = { session: refusing.session, run: this.runs.getRun(agentId) };
+      return this.trackAgentRegistrationOperation(
+        this.runLifecycleMutation(agentId, () => this.escalateStop(agentId, target)),
+      );
     }
     return this.trackAgentRegistrationOperation(
-      this.runLifecycleMutation(agentId, () => this.escalateStop(agentId)),
+      this.runLifecycleMutation(agentId, () => this.escalateStop(agentId, null)),
     );
   }
 
-  private async escalateStop(agentId: string): Promise<AgentRunCancellationResult> {
+  private async escalateStop(
+    agentId: string,
+    target: { session: AgentSession; run: TrackedAgentRun | null } | null,
+  ): Promise<AgentRunCancellationResult> {
     const agent = this.agents.get(agentId);
     if (!agent || agent.session == null) {
       return { status: "not_running" };
     }
     const termination = this.sessionTerminations.get(agent.session);
-    if (termination === undefined && !this.hasInFlightRun(agentId)) {
-      // The run ended while this Stop waited for the lane.
+    if (termination === undefined && !this.isStillRefusing(agentId, agent.session, target)) {
+      // The refused run ended (or the session was replaced) while this Stop waited for the lane;
+      // a run started since then is healthy and is not this Stop's to kill.
       return { status: "settled" };
     }
     if (termination !== "done") {
@@ -3519,6 +3530,30 @@ export class AgentManager {
     });
     await this.reloadAgentSessionInternal(agentId);
     return { status: "settled" };
+  }
+
+  private isStillRefusing(
+    agentId: string,
+    session: AgentSession,
+    target: { session: AgentSession; run: TrackedAgentRun | null } | null,
+  ): boolean {
+    if (!target || target.session !== session) {
+      return false;
+    }
+    if (target.run) {
+      return !target.run.settled && this.runs.getRun(agentId) === target.run;
+    }
+    return this.hasInFlightRun(agentId);
+  }
+
+  /**
+   * Closing would drop the only handle through which a force stop's unconfirmed kill can be
+   * finished, so a close or archive finishes it first and fails if it still cannot.
+   */
+  private async finishPendingTermination(agent: ManagedAgent): Promise<void> {
+    if (agent.session && this.sessionTerminations.get(agent.session) === "pending") {
+      await this.terminateSession(agent.session);
+    }
   }
 
   /** Kill a session's runtime; the "pending" mark survives a rejection and blocks its reuse. */
