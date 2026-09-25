@@ -2441,11 +2441,26 @@ function seedDraftForEmptyWorkspace(input: {
   return seeded;
 }
 
+function collectPanesIncludingHidden(node: SplitNodeInternal): SplitPaneInternal[] {
+  if (node.kind === "pane") {
+    return [node.pane];
+  }
+  return node.group.children.flatMap((child) => collectPanesIncludingHidden(child));
+}
+
+function collectGroupIds(node: SplitNodeInternal): string[] {
+  if (node.kind === "pane") {
+    return [];
+  }
+  return [node.group.id, ...node.group.children.flatMap((child) => collectGroupIds(child))];
+}
+
 /**
  * Gives back a canvas pane to a layout that has only the Explorer sidebar left on
  * screen. Such a layout cannot settle: the empty-workspace draft has nowhere to go but
- * the Explorer, which does not count as content. The existing tree is kept whole,
- * hidden panes and Explorer tabs included, and a `main` pane is put beside it.
+ * the Explorer, which does not count as content. A hidden canvas pane is revealed when
+ * one exists, so the tree keeps its shape; only a tree with no canvas pane at all gets a
+ * new `main` beside it. Nothing already in the tree is dropped.
  */
 function restoreCanvasPane(
   layout: WorkspaceLayout,
@@ -2460,20 +2475,31 @@ function restoreCanvasPane(
   if (hasVisibleCanvasPane) {
     return layout;
   }
-  if (explorerSidebarPaneId !== DEFAULT_PANE_ID && findPaneById(layout.root, DEFAULT_PANE_ID)) {
-    const revealed = setPaneHiddenInLayout({ layout, paneId: DEFAULT_PANE_ID, hidden: false });
-    return revealed ? { ...revealed, focusedPaneId: DEFAULT_PANE_ID } : layout;
+  const internalRoot = asInternalLayout(layout).root;
+  const hiddenCanvasPanes = collectPanesIncludingHidden(internalRoot).filter(
+    (pane) => pane.id !== explorerSidebarPaneId && pane.id !== EXPLORER_SIDEBAR_PANE_ID,
+  );
+  const paneToReveal =
+    hiddenCanvasPanes.find((pane) => pane.id === DEFAULT_PANE_ID) ?? hiddenCanvasPanes[0];
+  if (paneToReveal) {
+    const revealed = setPaneHiddenInLayout({ layout, paneId: paneToReveal.id, hidden: false });
+    return revealed ? { ...revealed, focusedPaneId: paneToReveal.id } : layout;
   }
   if (explorerSidebarPaneId === DEFAULT_PANE_ID) {
     return layout;
   }
+  const groupIds = new Set(collectGroupIds(internalRoot));
+  let groupId = DEFAULT_LAYOUT_GROUP_ID;
+  for (let suffix = 2; groupIds.has(groupId); suffix += 1) {
+    groupId = `${DEFAULT_LAYOUT_GROUP_ID}-${suffix}`;
+  }
   return withNormalizedParentTabMap({
     root: createGroupNode({
-      id: DEFAULT_LAYOUT_GROUP_ID,
+      id: groupId,
       direction: "horizontal",
       children: [
         createPaneNode({ id: DEFAULT_PANE_ID, tabs: [createNewWorkspaceTab()] }),
-        asInternalLayout(layout).root,
+        internalRoot,
       ],
       sizes: [0.78, 0.22],
     }),

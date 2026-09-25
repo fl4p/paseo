@@ -3564,7 +3564,7 @@ describe("workspace-layout-store actions", () => {
     expect(findPaneById(settled.root, "pane_registered")?.tabIds).toEqual(["files"]);
   });
 
-  it("reconcileTabs keeps hidden canvas panes when it restores a visible one", () => {
+  it("reconcileTabs reveals a hidden canvas pane instead of adding one", () => {
     const workspaceKey = createWorkspaceKey();
     workspaceLayoutStore.setState((state) => ({
       layoutByWorkspace: {
@@ -3597,10 +3597,14 @@ describe("workspace-layout-store actions", () => {
 
     const settled = reconcileTwiceAndExpectSettled(workspaceKey);
 
+    // The hidden canvas pane is revealed in place rather than wrapped in a new group,
+    // so the tree keeps its depth and its group ids.
+    expect(findPaneById(settled.root, "main")).toBeNull();
+    expect(findPaneById(settled.root, "pane_hidden")?.hidden).not.toBe(true);
     expect(findPaneById(settled.root, "pane_hidden")?.tabIds).toEqual(["draft-kept"]);
     expect(findPaneById(settled.root, "explorer")?.tabIds).toEqual(["files"]);
-    expect(findPaneById(settled.root, "main")?.hidden).not.toBe(true);
-    expect(settled.focusedPaneId).toBe("main");
+    expect(expectGroup(settled.root).group.id).toBe("root");
+    expect(settled.focusedPaneId).toBe("pane_hidden");
   });
 
   it("reconcileTabs stays stable when startup removes a duplicate agent kept in Explorer", () => {
