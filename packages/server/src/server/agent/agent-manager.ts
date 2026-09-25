@@ -1413,9 +1413,11 @@ export class AgentManager {
       resumeOptions,
     );
     await this.requireExternalMcpSupport(session, storedConfig);
+    // The agent already exists durably; a failed registration must not delete its record.
     return this.registerSession(session, storedConfig, resolvedAgentId, {
       ...options,
       persistence: handle,
+      replacesExistingAgent: true,
     });
   }
 
@@ -1747,6 +1749,19 @@ export class AgentManager {
       "the agent was closed while the message waited for a compaction",
     );
     this.releaseCompactionGate(agentId);
+    if (agent.session && this.sessionTerminations.get(agent.session) === "pending") {
+      // Closing would drop the only handle through which a force stop's unconfirmed kill can be
+      // finished. Finish it; if that still fails, refuse the close unless the daemon is exiting.
+      try {
+        await this.terminateSession(agent.session);
+      } catch (error) {
+        if (this.acceptingAgentRegistrations) throw error;
+        this.logger.error(
+          { err: error, agentId },
+          "agent.manager.close: shutting down with a force-stopped runtime not confirmed dead",
+        );
+      }
+    }
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
     let closeError: unknown;
     try {
@@ -1963,7 +1978,7 @@ export class AgentManager {
   }
 
   async setAgentMode(agentId: string, modeId: string): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
+    const agent = this.requireUsableSessionAgent(agentId);
     const notice = (await agent.session.setMode(modeId)) ?? null;
     await this.drainSessionEvents(agentId);
     const currentMode = (await agent.session.getCurrentMode()) ?? modeId;
@@ -1979,7 +1994,7 @@ export class AgentManager {
   }
 
   async setAgentModel(agentId: string, modelId: string | null): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
+    const agent = this.requireUsableSessionAgent(agentId);
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId : null;
 
@@ -2000,7 +2015,7 @@ export class AgentManager {
     agentId: string,
     thinkingOptionId: string | null,
   ): Promise<AgentProviderNotice | null> {
-    const agent = this.requireSessionAgent(agentId);
+    const agent = this.requireUsableSessionAgent(agentId);
     const normalizedThinkingOptionId =
       typeof thinkingOptionId === "string" && thinkingOptionId.trim().length > 0
         ? thinkingOptionId
@@ -2026,6 +2041,7 @@ export class AgentManager {
 
   async setAgentFeature(agentId: string, featureId: string, value: unknown): Promise<void> {
     const agent = this.requireAgent(agentId);
+    if (agent.session) this.requireUsableSessionAgent(agentId);
 
     if (!agent.session.setFeature) {
       throw new Error("Agent session does not support setting features");
@@ -2504,7 +2520,7 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): AsyncGenerator<AgentStreamEvent> {
-    const existingAgent = this.requireSessionAgent(agentId);
+    const existingAgent = this.requireUsableSessionAgent(agentId);
     this.logger.trace(
       {
         agentId,
@@ -3454,41 +3470,55 @@ export class AgentManager {
    * A terminate() that rejects leaves the agent untouched, so Stop can be retried; a retry after
    * a kill whose resume failed goes straight to the resume.
    */
-  forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
+  async forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult> {
+    // The ordinary Stop stays where it always was: the foreground lane only, never queued behind a
+    // reload or an archive. Only an escalation takes the lifecycle lane.
+    const current = this.agents.get(agentId);
+    if (!current || current.session == null) {
+      return { status: "not_running" };
+    }
+    if (!this.sessionTerminations.has(current.session)) {
+      if (!this.hasInFlightRun(agentId)) {
+        return { status: "not_running" };
+      }
+      const graceful = await this.cancelAgentRun(agentId);
+      if (graceful.status !== "refused" || !this.requireSessionAgent(agentId).session.terminate) {
+        return graceful;
+      }
+    }
     return this.trackAgentRegistrationOperation(
-      this.runLifecycleMutation(agentId, async () => {
-        if (this.agents.get(agentId)?.session == null) {
-          return { status: "not_running" };
-        }
-        const graceful = await this.cancelAgentRun(agentId);
-        const agent = this.requireSessionAgent(agentId);
-        const termination = this.sessionTerminations.get(agent.session);
-        if (graceful.status !== "refused" && termination === undefined) {
-          return graceful;
-        }
-        if (termination === undefined && !agent.session.terminate) {
-          return graceful;
-        }
-        if (termination !== "done") {
-          this.logger.warn(
-            { agentId, provider: agent.provider, retry: termination === "pending" },
-            "forceStopAgentRun: cancellation not acknowledged, terminating the provider runtime",
-          );
-          await this.terminateSession(agent.session);
-        }
-        await this.drainSessionEvents(agentId);
-        await this.runForegroundMutation(agentId, async () => {
-          const run = this.runs.getRun(agentId);
-          // The provider may have ended the turn itself while dying.
-          if (run && !run.settled) {
-            await this.forceSettleRun(agent, run, "forceStopAgentRun: terminated provider,");
-          }
-          this.finishCanceledRun(agent);
-        });
-        await this.reloadAgentSessionInternal(agentId);
-        return { status: "settled" };
-      }),
+      this.runLifecycleMutation(agentId, () => this.escalateStop(agentId)),
     );
+  }
+
+  private async escalateStop(agentId: string): Promise<AgentRunCancellationResult> {
+    const agent = this.agents.get(agentId);
+    if (!agent || agent.session == null) {
+      return { status: "not_running" };
+    }
+    const termination = this.sessionTerminations.get(agent.session);
+    if (termination === undefined && !this.hasInFlightRun(agentId)) {
+      // The run ended while this Stop waited for the lane.
+      return { status: "settled" };
+    }
+    if (termination !== "done") {
+      this.logger.warn(
+        { agentId, provider: agent.provider, retry: termination === "pending" },
+        "forceStopAgentRun: cancellation not acknowledged, terminating the provider runtime",
+      );
+      await this.terminateSession(agent.session);
+    }
+    await this.drainSessionEvents(agentId);
+    await this.runForegroundMutation(agentId, async () => {
+      const run = this.runs.getRun(agentId);
+      // The provider may have ended the turn itself while dying.
+      if (run && !run.settled) {
+        await this.forceSettleRun(agent, run, "forceStopAgentRun: terminated provider,");
+      }
+      this.finishCanceledRun(agent);
+    });
+    await this.reloadAgentSessionInternal(agentId);
+    return { status: "settled" };
   }
 
   /** Kill a session's runtime; the "pending" mark survives a rejection and blocks its reuse. */
@@ -3695,7 +3725,7 @@ export class AgentManager {
   }
 
   async rewind(agentId: string, messageId: string, mode: RewindMode): Promise<void> {
-    const agent = this.requireSessionAgent(agentId);
+    const agent = this.requireUsableSessionAgent(agentId);
     const submittedRow = this.timelineStore
       .getRows(agentId)
       .find(
@@ -5905,6 +5935,27 @@ export class AgentManager {
     const agent = this.agents.get(normalizedId);
     if (!agent) {
       throw new Error(`Unknown agent '${normalizedId}'`);
+    }
+    return agent;
+  }
+
+  /**
+   * A session force stop has started to kill takes no new work: its runtime may be dying or, when
+   * the kill could not be confirmed, still alive. Only Stop (to finish the kill) and reload (which
+   * finishes it before resuming) may touch it.
+   */
+  private requireUsableSessionAgent(id: string): ActiveManagedAgent {
+    const agent = this.requireSessionAgent(id);
+    const termination = this.sessionTerminations.get(agent.session);
+    if (termination === "pending") {
+      throw new Error(
+        `Agent ${id} is being force-stopped and its runtime is not confirmed dead yet; press Stop again`,
+      );
+    }
+    if (termination === "done") {
+      throw new Error(
+        `Agent ${id} was force-stopped and is being resumed; press Stop or reload it`,
+      );
     }
     return agent;
   }

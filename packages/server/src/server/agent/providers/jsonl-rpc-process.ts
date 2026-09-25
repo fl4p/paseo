@@ -95,6 +95,7 @@ export class JsonlRpcProcess {
   private disposed = false;
   private terminationTree: Promise<ProcessTreeSnapshot> | null = null;
   private spawnTreeCapture: Promise<ProcessTreeSnapshot> | null = null;
+  private processGroupId: number | undefined;
   private readonly frameDecoder: JsonlFrameDecoder;
 
   constructor(private readonly options: JsonlRpcProcessOptions) {
@@ -111,8 +112,9 @@ export class JsonlRpcProcess {
     this.child = (options.spawn ?? spawnJsonlRpcProcess)(options.launch);
     const pid = this.child.pid;
     if (options.launch.ownProcessGroup && pid !== undefined) {
-      const groupId = process.platform === "win32" ? undefined : pid;
-      this.spawnTreeCapture = captureProcessTree(pid, groupId);
+      // Kept apart from the capture, so a retry after a failed capture still covers the group.
+      this.processGroupId = process.platform === "win32" ? undefined : pid;
+      this.spawnTreeCapture = captureProcessTree(pid, this.processGroupId);
       // A capture failure must reach terminate(), never an unhandled rejection.
       void this.spawnTreeCapture.catch(() => undefined);
     }
@@ -238,11 +240,15 @@ export class JsonlRpcProcess {
   }
 
   /**
-   * Kill the process and every descendant it started, and confirm they are gone. Unlike close(),
-   * root exit is not taken as proof: a tool or MCP server that ignores SIGTERM outlives the root
-   * and is reparented, so the tree is captured first and each captured process is tracked to its
-   * death. Rejects when that cannot be confirmed; the captured tree is kept, so a retry resumes
-   * the same kill.
+   * Kill the process and its descendants, and confirm they are gone. Unlike close(), root exit is
+   * not taken as proof: a tool or MCP server that ignores SIGTERM outlives the root and is
+   * reparented, so the tree is captured first and each captured process is tracked to its death.
+   * Rejects when that cannot be confirmed; the captured tree is kept, so a retry resumes the kill.
+   *
+   * Covered: every process still in the parent chain, and with ownProcessGroup every process in
+   * the group, including ones orphaned by a double fork. Not covered: a process that left the
+   * group with setsid() (a deliberately daemonized server) after reparenting, and, on Windows,
+   * anything outside the live parent chain. A shell killing the job would miss those too.
    */
   async terminate(
     error = new Error(`${this.diagnosticName} process was terminated`),
@@ -285,7 +291,7 @@ export class JsonlRpcProcess {
       );
     }
     try {
-      return await captureProcessTree(pid);
+      return await captureProcessTree(pid, this.processGroupId);
     } catch (error) {
       throw new Error(`Cannot capture the ${this.diagnosticName} process tree`, { cause: error });
     }

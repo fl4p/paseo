@@ -726,8 +726,9 @@ export interface AgentSession {
   /**
    * Kill the live runtime without its cooperation, for a turn the provider will not cancel.
    *
-   * Optional: implement it only when every process the session started can be killed
-   * unilaterally and its death confirmed. Resolves only once that is confirmed; rejects otherwise,
+   * Optional: implement it only when the processes the session started can be killed
+   * unilaterally and their death confirmed (processes that deliberately daemonize out of the
+   * session's process group are beyond any provider's reach and are not covered). Resolves only once that is confirmed; rejects otherwise,
    * leaving the session as it was so the caller can retry. A provider that cannot promise this (a
    * server shared with other sessions, a close that first awaits the provider) leaves it out, and
    * Stop keeps refusing rather than resume a thread something may still be writing.

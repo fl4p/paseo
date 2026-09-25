@@ -6977,6 +6977,8 @@ test("a kill that ended the turn but was not confirmed blocks resume until a Sto
     await expect(manager.forceStopAgentRun(agentId)).rejects.toThrow("did not exit after SIGKILL");
     expect(manager.hasInFlightRun(agentId)).toBe(false);
 
+    // The session takes no new work while its kill is unconfirmed.
+    expect(() => manager.streamAgent(agentId, "next")).toThrow("being force-stopped");
     await expect(manager.reloadAgentSession(agentId)).rejects.toThrow("did not exit after SIGKILL");
     expect(session.terminateCalls).toBe(2);
     expect(session.closed).toBe(false);
@@ -7040,6 +7042,63 @@ test("a resume that fails to register after a force stop keeps the agent's durab
     expect(client.resumeOverrides).toHaveLength(1);
     await expect(storage.get(agent.id)).resolves.toMatchObject({ id: agent.id });
   } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("closing an agent whose force-stop kill is unconfirmed finishes the kill or refuses", async () => {
+  class UnkillableSession extends UnacknowledgingSession {
+    terminateCalls = 0;
+    async terminate(): Promise<void> {
+      this.terminateCalls += 1;
+      if (this.terminateCalls === 1) throw new Error("process tree did not exit after SIGKILL");
+    }
+  }
+  const session = new UnkillableSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, agentId, workdir } = await startStuckRun(session);
+  try {
+    await expect(manager.forceStopAgentRun(agentId)).rejects.toThrow("did not exit");
+    session.terminateCalls = 0;
+    await expect(manager.closeAgent(agentId)).rejects.toThrow("did not exit");
+    expect(session.closed).toBe(false);
+    expect(manager.getAgent(agentId)).not.toBeNull();
+
+    await expect(manager.closeAgent(agentId)).resolves.toBeUndefined();
+    expect(session.terminateCalls).toBe(2);
+    expect(session.closed).toBe(true);
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("Stop on an idle agent does not wait behind a reload in progress", async () => {
+  const resumeHeld = deferred<void>();
+  const resumeEntered = deferred<void>();
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-force-stop-idle-"));
+  const client = new (class extends TestAgentClient {
+    override async resumeSession(
+      ...args: Parameters<TestAgentClient["resumeSession"]>
+    ): Promise<AgentSession> {
+      resumeEntered.resolve();
+      await resumeHeld.promise;
+      return super.resumeSession(...args);
+    }
+  })();
+  const manager = new AgentManager({ clients: { codex: client }, logger });
+  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const reload = manager.reloadAgentSession(agent.id);
+    await resumeEntered.promise;
+
+    await expect(manager.forceStopAgentRun(agent.id)).resolves.toEqual({ status: "not_running" });
+
+    resumeHeld.resolve();
+    await reload;
+  } finally {
+    resumeHeld.resolve();
+    await manager.closeAgent(agent.id).catch(() => undefined);
     rmSync(workdir, { recursive: true, force: true });
   }
 });

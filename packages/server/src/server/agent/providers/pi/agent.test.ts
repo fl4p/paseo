@@ -1178,6 +1178,21 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("terminate leaves the active turn alone when the kill never started", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    fakeSession.terminate = async () => {
+      throw new Error("Cannot capture the Pi RPC process tree");
+    };
+    const { turnId } = await session.startTurn("still running");
+    fakeSession.emit({ type: "agent_start" });
+    fakeSession.emit({ type: "turn_start" });
+
+    await expect(session.terminate()).rejects.toThrow("Cannot capture");
+
+    expect(events.turnLifecycleEvents()).toEqual([{ type: "turn_started", turnId }]);
+  });
+
   test("preserves the autonomous terminal error when abort rejects", async () => {
     const { pi, session, events } = await createSession();
     const fakeSession = pi.latestSession();

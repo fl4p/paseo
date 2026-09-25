@@ -1271,6 +1271,8 @@ export class PiRpcAgentSession implements AgentSession {
   // Pi publishes the terminal before acknowledging abort. Autonomous runs have no
   // turn ID; retain their errors too until the cancellation request settles.
   private interruptingTurn: { turnId: string | undefined; error: string | null } | null = null;
+  /** Set while terminate() kills the runtime: the failures that kill causes are a cancel. */
+  private terminating = false;
 
   constructor(options: PiRpcAgentSessionOptions) {
     this.runtimeSession = options.runtimeSession;
@@ -1373,6 +1375,9 @@ export class PiRpcAgentSession implements AgentSession {
         }
       } catch (error) {
         if (this.activeTurnId !== turnId) {
+          return;
+        }
+        if (this.terminating && this.cancelActiveTurnForTermination()) {
           return;
         }
         this.usagePoller.stopTurn();
@@ -1709,26 +1714,38 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   /**
-   * A pi turn blocked in a tool that ignores pi's abort ends only by killing the tree. The turn is
-   * ended as canceled first, so the prompt rejection and process exit the kill causes find no
-   * active turn and do not report it as failed.
+   * A pi turn blocked in a tool that ignores pi's abort ends only by killing the tree. While the
+   * kill runs, the prompt rejection and process exit it causes end the active turn as canceled,
+   * not failed. If the kill never started (its process tree could not be captured), the turn is
+   * left exactly as it was.
    */
   async terminate(): Promise<void> {
-    if (this.activeTurnId || this.activeTurnStarted) {
-      const turnId = this.activeTurnId ?? undefined;
-      this.usagePoller.stopTurn();
-      this.activeTurnId = null;
-      this.activeClientMessageId = null;
-      this.activeTurnStarted = false;
-      this.activeTurnStartedEmitted = false;
-      this.pendingSettledMessages = null;
-      this.activeAssistantMessageId = null;
-      this.pendingSteerSubmissions.length = 0;
-      this.clearNoTurnBuffers();
-      this.interruptingTurn = null;
-      this.emit({ type: "turn_canceled", provider: this.provider, reason: "interrupted", turnId });
+    this.terminating = true;
+    try {
+      await this.runtimeSession.terminate();
+    } finally {
+      this.terminating = false;
     }
-    await this.runtimeSession.terminate();
+    this.cancelActiveTurnForTermination();
+  }
+
+  private cancelActiveTurnForTermination(): boolean {
+    if (!this.activeTurnId && !this.activeTurnStarted) {
+      return false;
+    }
+    const turnId = this.activeTurnId ?? undefined;
+    this.usagePoller.stopTurn();
+    this.activeTurnId = null;
+    this.activeClientMessageId = null;
+    this.activeTurnStarted = false;
+    this.activeTurnStartedEmitted = false;
+    this.pendingSettledMessages = null;
+    this.activeAssistantMessageId = null;
+    this.pendingSteerSubmissions.length = 0;
+    this.clearNoTurnBuffers();
+    this.interruptingTurn = null;
+    this.emit({ type: "turn_canceled", provider: this.provider, reason: "interrupted", turnId });
+    return true;
   }
 
   async listCommands(): Promise<AgentSlashCommand[]> {
@@ -2262,6 +2279,9 @@ export class PiRpcAgentSession implements AgentSession {
 
   private handleProcessExit(error: string): void {
     this.rejectAllExtensionResults(new Error(error));
+    if (this.terminating && this.cancelActiveTurnForTermination()) {
+      return;
+    }
     this.interruptingTurn = null;
     if (!this.activeTurnId && !this.activeTurnStarted) {
       return;
