@@ -13,7 +13,6 @@ import {
   type AgentManagerEvent,
   type ManagedAgent,
 } from "./agent-manager.js";
-import { cancelAgentRunCommand } from "./lifecycle-command.js";
 import { AgentStorage } from "./agent-storage.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { toAgentPayload } from "./agent-projections.js";
@@ -6941,59 +6940,10 @@ test("a rejected terminate leaves the stuck run in place so Stop can be retried"
     expect(session.closed).toBe(false);
     expect(client.resumeOverrides).toHaveLength(0);
     expect(manager.hasInFlightRun(agentId)).toBe(true);
+    expect(manager.getAgent(agentId)?.lastError).toContain("could not confirm");
 
     await expect(manager.forceStopAgentRun(agentId)).resolves.toEqual({ status: "settled" });
     expect(session.terminateCalls).toBe(2);
-    expect(session.closed).toBe(true);
-    expect(client.resumeOverrides).toHaveLength(1);
-    expect(manager.getAgent(agentId)?.lifecycle).toBe("idle");
-  } finally {
-    await manager.closeAgent(agentId);
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
-
-test("a kill that ended the turn but was not confirmed blocks resume until a Stop retries it", async () => {
-  // Terminating settles the turn (the dying provider rejects the prompt) and only then fails to
-  // confirm the tree dead, twice: the agent is no longer running, yet nothing may resume over it.
-  class HalfKilledSession extends UnacknowledgingSession {
-    terminateCalls = 0;
-    async terminate(): Promise<void> {
-      this.terminateCalls += 1;
-      this.pushEvent({
-        type: "turn_failed",
-        provider: this.provider,
-        turnId: `active-turn-${this.startCount}`,
-        error: "Pi RPC session was terminated",
-      });
-      if (this.terminateCalls <= 2) {
-        throw new Error("process tree did not exit after SIGKILL");
-      }
-    }
-  }
-  const session = new HalfKilledSession({ provider: "codex", cwd: process.cwd() });
-  const { manager, client, agentId, workdir } = await startStuckRun(session);
-  try {
-    await expect(manager.forceStopAgentRun(agentId)).rejects.toThrow("did not exit after SIGKILL");
-    expect(manager.hasInFlightRun(agentId)).toBe(false);
-
-    // The session takes no new work while its kill is unconfirmed.
-    expect(() => manager.streamAgent(agentId, "next")).toThrow("being force-stopped");
-    expect(() => manager.tryRunOutOfBand(agentId, "/autocompact off")).toThrow(
-      "being force-stopped",
-    );
-    await expect(manager.steerOrReplaceActiveTurn(agentId, "steer")).rejects.toThrow(
-      "being force-stopped",
-    );
-    await expect(manager.reloadAgentSession(agentId)).rejects.toThrow("did not exit after SIGKILL");
-    expect(session.terminateCalls).toBe(2);
-    expect(session.closed).toBe(false);
-    expect(client.resumeOverrides).toHaveLength(0);
-
-    await expect(
-      cancelAgentRunCommand({ agentManager: manager, logger }, agentId),
-    ).resolves.toMatchObject({ cancelled: true });
-    expect(session.terminateCalls).toBe(3);
     expect(session.closed).toBe(true);
     expect(client.resumeOverrides).toHaveLength(1);
     expect(manager.getAgent(agentId)?.lifecycle).toBe("idle");
@@ -7047,31 +6997,6 @@ test("a resume that fails to register after a force stop keeps the agent's durab
 
     expect(client.resumeOverrides).toHaveLength(1);
     await expect(storage.get(agent.id)).resolves.toMatchObject({ id: agent.id });
-  } finally {
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
-
-test("closing an agent whose force-stop kill is unconfirmed finishes the kill or refuses", async () => {
-  class UnkillableSession extends UnacknowledgingSession {
-    terminateCalls = 0;
-    async terminate(): Promise<void> {
-      this.terminateCalls += 1;
-      if (this.terminateCalls === 1) throw new Error("process tree did not exit after SIGKILL");
-    }
-  }
-  const session = new UnkillableSession({ provider: "codex", cwd: process.cwd() });
-  const { manager, agentId, workdir } = await startStuckRun(session);
-  try {
-    await expect(manager.forceStopAgentRun(agentId)).rejects.toThrow("did not exit");
-    session.terminateCalls = 0;
-    await expect(manager.closeAgent(agentId)).rejects.toThrow("did not exit");
-    expect(session.closed).toBe(false);
-    expect(manager.getAgent(agentId)).not.toBeNull();
-
-    await expect(manager.closeAgent(agentId)).resolves.toBeUndefined();
-    expect(session.terminateCalls).toBe(2);
-    expect(session.closed).toBe(true);
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }
@@ -7154,47 +7079,6 @@ test("an escalation queued behind the lifecycle lane does not kill a run started
   }
 });
 
-test("archiving an agent whose force-stop kill is unconfirmed commits nothing", async () => {
-  class UnkillableSession extends UnacknowledgingSession {
-    async terminate(): Promise<void> {
-      throw new Error("process tree did not exit after SIGKILL");
-    }
-  }
-  const session = new UnkillableSession({ provider: "codex", cwd: process.cwd() });
-  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-force-stop-archive-"));
-  const storage = new AgentStorage(join(workdir, "agents"), logger);
-  const manager = new AgentManager({
-    clients: {
-      codex: new (class extends TestAgentClient {
-        override async createSession(): Promise<AgentSession> {
-          return session;
-        }
-      })(),
-    },
-    registry: storage,
-    logger,
-    rescueTimeouts: { interruptSessionMs: 10 },
-  });
-  const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
-    workspaceId: undefined,
-  });
-  try {
-    const run = manager.streamAgent(agent.id, "stuck");
-    void (async () => {
-      for await (const _event of run) {
-      }
-    })().catch(() => undefined);
-    await manager.waitForAgentRunStart(agent.id);
-    await expect(manager.forceStopAgentRun(agent.id)).rejects.toThrow("did not exit");
-
-    await expect(manager.archiveAgent(agent.id)).rejects.toThrow("did not exit");
-    expect((await storage.get(agent.id))?.archivedAt ?? null).toBeNull();
-    expect(manager.getAgent(agent.id)).not.toBeNull();
-  } finally {
-    rmSync(workdir, { recursive: true, force: true });
-  }
-});
-
 test("a first-time resume whose registration fails leaves no record behind", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-resume-fresh-"));
   class SecondSnapshotFailingStorage extends AgentStorage {
@@ -7222,6 +7106,37 @@ test("a first-time resume whose registration fails leaves no record behind", asy
       ),
     ).rejects.toThrow("disk full");
     await expect(storage.get("00000000-0000-4000-8000-000000000321")).resolves.toBeNull();
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("a kill that ended the turn but was not confirmed marks the agent errored and resumes nothing", async () => {
+  // Terminating settles the turn (the dying provider rejects the prompt) and only then fails to
+  // confirm the tree dead: Stop fails, the agent is errored, and no fresh session is started.
+  class HalfKilledSession extends UnacknowledgingSession {
+    async terminate(): Promise<void> {
+      this.pushEvent({
+        type: "turn_failed",
+        provider: this.provider,
+        turnId: `active-turn-${this.startCount}`,
+        error: "Pi RPC session was terminated",
+      });
+      throw new Error("process tree did not exit after SIGKILL");
+    }
+  }
+  const session = new HalfKilledSession({ provider: "codex", cwd: process.cwd() });
+  const { manager, client, agentId, workdir } = await startStuckRun(session);
+  try {
+    await expect(manager.forceStopAgentRun(agentId)).rejects.toThrow("did not exit after SIGKILL");
+
+    expect(manager.hasInFlightRun(agentId)).toBe(false);
+    expect(manager.getAgent(agentId)).toMatchObject({
+      lifecycle: "error",
+      lastError: expect.stringContaining("Reload the agent to retry"),
+    });
+    expect(session.closed).toBe(false);
+    expect(client.resumeOverrides).toHaveLength(0);
   } finally {
     rmSync(workdir, { recursive: true, force: true });
   }

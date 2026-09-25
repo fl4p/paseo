@@ -94,6 +94,7 @@ export class JsonlRpcProcess {
   private nextRequestId = 1;
   private disposed = false;
   private terminationTree: Promise<ProcessTreeSnapshot> | null = null;
+  private terminationConfirmed = false;
   private spawnTreeCapture: Promise<ProcessTreeSnapshot> | null = null;
   private processGroupId: number | undefined;
   private readonly frameDecoder: JsonlFrameDecoder;
@@ -214,6 +215,12 @@ export class JsonlRpcProcess {
   }
 
   async close(error = new Error(`${this.diagnosticName} process is closed`)): Promise<void> {
+    if (this.terminationTree && !this.terminationConfirmed) {
+      // A terminate() that could not confirm the kill already disposed the transport; closing must
+      // not report success over it. Retry the same kill, and fail the close if it still cannot.
+      await this.terminate(error);
+      return;
+    }
     if (this.disposed) return;
     this.failAll(error);
     try {
@@ -281,6 +288,7 @@ export class JsonlRpcProcess {
     if (result === "kill-timeout") {
       throw new Error(`${this.diagnosticName} process tree did not exit after SIGKILL`);
     }
+    this.terminationConfirmed = true;
   }
 
   private async captureTerminationTree(): Promise<ProcessTreeSnapshot> {

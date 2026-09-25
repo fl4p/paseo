@@ -72,9 +72,7 @@ async function requestAgentRunCancellation(
   }
 
   const hasInFlightRun = agentManager.hasInFlightRun(agentId);
-  // Force mode always asks the manager: a force stop whose kill or resume failed leaves no run in
-  // flight, and only the manager knows the agent still needs that finished.
-  if (!hasInFlightRun && mode === "graceful") {
+  if (!hasInFlightRun) {
     logger.trace(
       { agentId, lifecycle: agent.lifecycle, hasInFlightRun },
       "cancelAgentRunCommand: skipping because agent is not running",
