@@ -298,26 +298,29 @@ export class JsonlRpcProcess {
 
   /**
    * The tree could not be read, but the process group is still ours to judge. While the root is
-   * alive its pid is the group id and cannot be reused, so the group is SIGKILLed until it is
-   * empty. Once the root has exited the id may be reused by an unrelated group, so it is only
-   * probed: an empty group confirms the kill, anything else stays unconfirmed.
+   * alive (or an unreaped zombie) its pid is the group id and cannot be reused, so the group gets
+   * one SIGKILL, sent only then. SIGKILL cannot be caught, so after it the group is only probed
+   * with signal 0 until it is empty: a probe cannot harm a group that reused the id after ours
+   * emptied, and an occupied group stays unconfirmed.
    */
   private async terminateProcessGroupWithoutCapture(
     groupId: number,
     error: Error,
     captureError: unknown,
   ): Promise<void> {
-    const rootAlive = this.child.exitCode === null && this.child.signalCode === null;
+    const rootUnreaped = this.child.exitCode === null && this.child.signalCode === null;
     this.failAll(error);
     const deadline = Date.now() + GRACEFUL_SHUTDOWN_TIMEOUT_MS + FORCE_SHUTDOWN_TIMEOUT_MS;
+    let signal: NodeJS.Signals | 0 = rootUnreaped ? "SIGKILL" : 0;
     for (;;) {
       try {
-        process.kill(-groupId, rootAlive ? "SIGKILL" : 0);
+        process.kill(-groupId, signal);
       } catch (killError) {
         if ((killError as NodeJS.ErrnoException).code === "ESRCH") return;
         throw killError;
       }
-      if (!rootAlive || Date.now() >= deadline) {
+      signal = 0;
+      if (Date.now() >= deadline) {
         throw new Error(
           `${this.diagnosticName} process group ${groupId} could not be confirmed empty`,
           { cause: captureError },

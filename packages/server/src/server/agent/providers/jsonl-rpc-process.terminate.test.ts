@@ -97,12 +97,18 @@ describe("JsonlRpcProcess close after an unconfirmed terminate", () => {
           }
         });
       });
+      const kill = vi.spyOn(process, "kill");
       try {
         await expect(transport.terminate()).resolves.toBeUndefined();
         expect(isAlive(grandchild)).toBe(false);
+        // One SIGKILL while the group id is certainly pi's; only harmless probes after it.
+        const groupSignals = kill.mock.calls.filter(([pid]) => pid < 0).map(([, signal]) => signal);
+        expect(groupSignals[0]).toBe("SIGKILL");
+        expect(groupSignals.slice(1).every((signal) => signal === 0)).toBe(true);
         await expect(transport.close()).resolves.toBeUndefined();
         expect(processTree.terminateCapturedProcessTree).not.toHaveBeenCalled();
       } finally {
+        kill.mockRestore();
         if (isAlive(grandchild)) process.kill(grandchild, "SIGKILL");
       }
     },
