@@ -782,6 +782,21 @@ describe("normalizeClaudeRuntimeModelId", () => {
     expect(normalizeClaudeRuntimeModelId("us.anthropic.claude-opus-4-8-20260101")).toBe(
       "claude-opus-4-8",
     );
+    expect(normalizeClaudeRuntimeModelId("us.anthropic.claude-opus-5-20260724-v1:0")).toBe(
+      "claude-opus-5",
+    );
+  });
+
+  // A served-catalog model the manifest does not know (Opus 5.5) must not collapse onto the
+  // major-only manifest entry it shares a prefix with, or the selector snaps back to Opus 5.
+  it("does not truncate an unknown minor version onto the major-only entry", () => {
+    expect(normalizeClaudeRuntimeModelId("claude-opus-5-5")).toBeNull();
+    expect(normalizeClaudeRuntimeModelId("claude-opus-5-5[1m]")).toBeNull();
+    expect(normalizeClaudeRuntimeModelId("claude-opus-5-5-20260901")).toBeNull();
+    expect(normalizeClaudeRuntimeModelId("us.anthropic.claude-opus-5-5")).toBeNull();
+    expect(normalizeClaudeRuntimeModelId("us.anthropic.claude-opus-5-5-v1:0")).toBeNull();
+    expect(normalizeClaudeRuntimeModelId("claude-fable-5-1")).toBe("claude-fable-5-1");
+    expect(findClaudeModel("claude-opus-5-5")).toBeUndefined();
   });
 });
 

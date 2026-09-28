@@ -395,8 +395,10 @@ export function normalizeClaudeRuntimeModelId(value: string | null | undefined):
     return null;
   }
 
+  // Unanchored, so the lookahead is what stops `claude-opus-5-5` matching as `claude-opus-5`: a
+  // short minor version after the major means a different model, an 8-digit date does not.
   const singleSegmentMatch = trimmed.match(
-    /claude[-_ ](fable|opus|sonnet|haiku)[-_ ]+(\d+)(\[1m\])?/i,
+    /claude[-_ ](fable|opus|sonnet|haiku)[-_ ]+(\d+)(?!\d|[-.]\d{1,2}(?!\d))(\[1m\])?/i,
   );
   if (singleSegmentMatch) {
     const normalizedModelId = normalizeSingleSegmentClaudeModelId(
