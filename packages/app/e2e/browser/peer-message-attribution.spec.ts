@@ -23,6 +23,19 @@ test.describe("Peer message attribution", () => {
         .filter({ hasText: "I changed things under you on farmgw." });
       await expect(peerMessage.getByTestId("user-message-origin")).toHaveText("From dragino");
       await expect(peerMessage.getByTestId("user-message-timestamp")).toBeAttached();
+
+      // Collapsed by default: one line of preview, the rest hidden until asked for.
+      await expect(peerMessage.getByTestId("user-message-origin-preview")).toHaveText(
+        "I changed things under you on farmgw.",
+      );
+      await expect(peerMessage.getByText("/etc/farmgw", { exact: false })).toHaveCount(0);
+      await page.screenshot({ path: testInfo.outputPath("peer-message-collapsed.png") });
+      testInfo.attach("collapsed peer message", {
+        path: testInfo.outputPath("peer-message-collapsed.png"),
+      });
+      await peerMessage.getByTestId("user-message-origin-toggle").click();
+      await expect(peerMessage.getByText("/etc/farmgw", { exact: false })).toBeVisible();
+      await expect(peerMessage.getByTestId("user-message-origin-preview")).toHaveCount(0);
       await peerMessage.hover();
       await expect(peerMessage.getByRole("button", { name: /rewind/i })).toHaveCount(0);
 

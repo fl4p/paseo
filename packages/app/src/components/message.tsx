@@ -95,6 +95,7 @@ import {
 } from "@/assistant-file-links";
 import { getCompactionMarkerLabel } from "./message-compaction-label";
 import { getPeerMessageOriginLabel } from "./message-peer-origin-label";
+import { getPeerMessageDisplayText, getPeerMessagePreview } from "./message-peer-display";
 import { useAssistantImage } from "@/assistant-image/use-assistant-image";
 import {
   AttachmentFrame,
@@ -414,11 +415,23 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     flexDirection: "row",
     alignItems: "center",
     gap: theme.spacing[2],
+  },
+  originRowExpanded: {
     marginBottom: theme.spacing[2],
+  },
+  originChevronExpanded: {
+    transform: [{ rotate: "90deg" }],
   },
   originText: {
     color: theme.colors.foregroundMuted,
     fontSize: STREAM_METADATA_FONT_SIZE,
+    flexShrink: 0,
+  },
+  originPreview: {
+    color: theme.colors.foregroundMuted,
+    fontSize: STREAM_METADATA_FONT_SIZE,
+    flex: 1,
+    minWidth: 0,
   },
 }));
 
@@ -440,6 +453,85 @@ function UserMessageImagePill({ image, onOpen, accessibilityLabel }: UserMessage
 }
 
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
+
+/**
+ * A message from another session or a subagent is context, not the conversation: it starts as
+ * one line so it does not bury the reply it caused, and expands on demand.
+ */
+function usePeerMessageBody<TImage, TAttachment>(input: {
+  message: string;
+  origin: PeerMessageOrigin | undefined;
+  images: TImage[];
+  attachments: TAttachment[];
+}) {
+  const { message, origin, images, attachments } = input;
+  const [isExpanded, setIsExpanded] = useState(false);
+  const toggle = useCallback(() => setIsExpanded((expanded) => !expanded), []);
+  const displayMessage = useMemo(
+    () => (origin ? getPeerMessageDisplayText(message) : message),
+    [message, origin],
+  );
+  const preview = useMemo(() => getPeerMessagePreview(displayMessage), [displayMessage]);
+  const showBody = !origin || isExpanded;
+  return {
+    displayMessage,
+    preview,
+    isExpanded,
+    toggle,
+    bodyText: showBody ? displayMessage.trim() : "",
+    bodyImages: showBody ? images : [],
+    bodyAttachments: showBody ? attachments : [],
+  };
+}
+
+const PeerMessageHeader = memo(function PeerMessageHeader({
+  origin,
+  preview,
+  isExpanded,
+  onToggle,
+}: {
+  origin: PeerMessageOrigin;
+  preview: string;
+  isExpanded: boolean;
+  onToggle: () => void;
+}) {
+  const rowStyle = useMemo(
+    () => [
+      userMessageStylesheet.originRow,
+      isExpanded ? userMessageStylesheet.originRowExpanded : null,
+    ],
+    [isExpanded],
+  );
+  const accessibilityState = useMemo(() => ({ expanded: isExpanded }), [isExpanded]);
+  return (
+    <Pressable
+      style={rowStyle}
+      onPress={onToggle}
+      accessibilityRole="button"
+      accessibilityState={accessibilityState}
+      testID="user-message-origin-toggle"
+    >
+      <ThemedChevronRightIcon
+        size={12}
+        uniProps={foregroundMutedColorMapping}
+        style={isExpanded ? userMessageStylesheet.originChevronExpanded : undefined}
+      />
+      <ThemedBot size={12} />
+      <Text style={userMessageStylesheet.originText} testID="user-message-origin">
+        {getPeerMessageOriginLabel(origin)}
+      </Text>
+      {!isExpanded && preview ? (
+        <Text
+          style={userMessageStylesheet.originPreview}
+          numberOfLines={1}
+          testID="user-message-origin-preview"
+        >
+          {preview}
+        </Text>
+      ) : null}
+    </Pressable>
+  );
+});
 
 export const UserMessage = memo(function UserMessage({
   serverId,
@@ -467,9 +559,11 @@ export const UserMessage = memo(function UserMessage({
     [lightboxMetadata],
   );
   const resolvedDisableOuterSpacing = useDisableOuterSpacing(disableOuterSpacing);
-  const hasText = message.trim().length > 0;
-  const hasImages = images.length > 0;
-  const hasAttachments = attachments.length > 0;
+  const peer = usePeerMessageBody({ message, origin, images, attachments });
+  const displayMessage = peer.displayMessage;
+  const hasText = displayMessage.trim().length > 0;
+  const hasImages = peer.bodyImages.length > 0;
+  const hasAttachments = peer.bodyAttachments.length > 0;
   const showTrailingRow = !isPending && hasText && (isCompact || isNative || isHovered);
   const formattedTimestamp = useMemo(
     () => formatMessageTimestamp(new Date(timestamp)),
@@ -479,7 +573,7 @@ export const UserMessage = memo(function UserMessage({
 
   const handlePointerEnter = useCallback(() => setIsHovered(true), []);
   const handlePointerLeave = useCallback(() => setIsHovered(false), []);
-  const getMessageContent = useCallback(() => message, [message]);
+  const getMessageContent = useCallback(() => displayMessage, [displayMessage]);
   const handleRewind = useCallback(
     (input: { mode: RewindMode; rewoundText: string }) => {
       return rewindMutation.rewindAgent(input);
@@ -531,16 +625,16 @@ export const UserMessage = memo(function UserMessage({
       >
         <View style={userMessageStylesheet.bubble}>
           {origin ? (
-            <View style={userMessageStylesheet.originRow}>
-              <ThemedBot size={12} />
-              <Text style={userMessageStylesheet.originText} testID="user-message-origin">
-                {getPeerMessageOriginLabel(origin)}
-              </Text>
-            </View>
+            <PeerMessageHeader
+              origin={origin}
+              preview={peer.preview}
+              isExpanded={peer.isExpanded}
+              onToggle={peer.toggle}
+            />
           ) : null}
           {hasImages ? (
             <View style={imagePreviewContainerStyle}>
-              {images.map((image) => (
+              {peer.bodyImages.map((image) => (
                 <UserMessageImagePill
                   key={image.id}
                   image={image}
@@ -552,7 +646,7 @@ export const UserMessage = memo(function UserMessage({
           ) : null}
           {hasAttachments ? (
             <View style={attachmentPreviewContainerStyle}>
-              {attachments.map((attachment, index) => {
+              {peer.bodyAttachments.map((attachment, index) => {
                 const content = getAgentAttachmentPillContent(attachment, t);
                 return (
                   <AttachmentFrame
@@ -568,9 +662,9 @@ export const UserMessage = memo(function UserMessage({
               })}
             </View>
           ) : null}
-          {hasText ? (
+          {peer.bodyText ? (
             <Text selectable style={userMessageStylesheet.text} dataSet={MESSAGE_TEXT_DATASET}>
-              {message}
+              {displayMessage}
             </Text>
           ) : null}
         </View>

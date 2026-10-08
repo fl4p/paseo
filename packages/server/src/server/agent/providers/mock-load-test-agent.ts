@@ -1227,7 +1227,7 @@ export class MockLoadTestAgentSession implements AgentSession {
       if (this.activeTurn !== turn) return;
       this.emitTimeline(turn.turnId, {
         type: "user_message",
-        text: "I changed things under you on farmgw.",
+        text: "I changed things under you on farmgw.\n\nThe gateway now reads its config from /etc/farmgw.",
         messageId: randomUUID(),
         origin: { kind: "peer", name: sender, address: "uds:/tmp/cc-socks/65428.sock" },
       });
