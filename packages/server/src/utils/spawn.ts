@@ -1,16 +1,8 @@
-import { execFile, spawn, type ChildProcess, type SpawnOptions } from "node:child_process";
-import { extname, resolve } from "node:path";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
-
+import { spawnProcess as spawnCli, execCommand as execCli } from "@getpaseo/plugin/server";
 import { createExternalCommandProcessEnv, type ProcessEnvRecord } from "../server/paseo-env.js";
-import {
-  isWindowsCommandScript,
-  quoteWindowsArgument,
-  quoteWindowsCommand,
-} from "./windows-command.js";
-
-const execFileAsync = promisify(execFile);
 
 interface ExternalEnvOptions {
   baseEnv?: ProcessEnvRecord;
@@ -36,23 +28,6 @@ interface ExecCommandResult {
   stderr: string;
 }
 
-function hasPathSeparator(value: string): boolean {
-  return value.includes("/") || value.includes("\\");
-}
-
-function shouldUseWindowsShell(
-  command: string,
-  requestedShell?: boolean | string,
-): boolean | string {
-  if (isWindowsCommandScript(command)) {
-    return true;
-  }
-  if (requestedShell !== undefined) {
-    return requestedShell;
-  }
-  return process.platform === "win32" && !hasPathSeparator(command) && !extname(command);
-}
-
 /**
  * Point PWD at the child's real cwd, as a shell does on `cd`. Otherwise the child inherits the
  * daemon's PWD (often `/` under launchd), and tools that prefer $PWD over getcwd() — context-mode
@@ -72,12 +47,6 @@ export function spawnProcess(
 ): ChildProcess {
   const { baseEnv, env, envOverlay, ...spawnOptions } = options ?? {};
   const resolvedBaseEnv = env ?? baseEnv ?? process.env;
-  const isWindows = process.platform === "win32";
-  const shell = shouldUseWindowsShell(command, spawnOptions.shell);
-
-  const shouldQuoteForShell = isWindows && shell !== false;
-  const resolvedCommand = shouldQuoteForShell ? quoteWindowsCommand(command) : command;
-  const resolvedArgs = shouldQuoteForShell ? args.map(quoteWindowsArgument) : args;
   const childEnv =
     options?.envMode === "internal"
       ? ({ ...resolvedBaseEnv, ...envOverlay } as NodeJS.ProcessEnv)
@@ -87,12 +56,10 @@ export function spawnProcess(
           ...(envOverlay ? [envOverlay] : []),
         );
 
-  return spawn(resolvedCommand, resolvedArgs, {
+  return spawnCli(command, args, {
     ...spawnOptions,
     env: withChildPwd(childEnv, spawnOptions.cwd),
-    shell,
     signal: options?.signal,
-    windowsHide: true,
   });
 }
 
@@ -103,11 +70,6 @@ export async function execCommand(
 ): Promise<ExecCommandResult> {
   const { baseEnv, env, envOverlay } = options ?? {};
   const resolvedBaseEnv = env ?? baseEnv ?? process.env;
-  const isWindows = process.platform === "win32";
-  const shell = shouldUseWindowsShell(command, options?.shell);
-  const shouldQuoteForShell = isWindows && shell !== false;
-  const resolvedCommand = shouldQuoteForShell ? quoteWindowsCommand(command) : command;
-  const resolvedArgs = shouldQuoteForShell ? args.map(quoteWindowsArgument) : args;
   const childEnv =
     options?.envMode === "internal"
       ? ({ ...resolvedBaseEnv, ...envOverlay } as NodeJS.ProcessEnv)
@@ -117,14 +79,14 @@ export async function execCommand(
           ...(envOverlay ? [envOverlay] : []),
         );
 
-  return execFileAsync(resolvedCommand, resolvedArgs, {
+  return execCli(command, args, {
     cwd: options?.cwd,
     env: withChildPwd(childEnv, options?.cwd),
+    shell: options?.shell,
     encoding: options?.encoding ?? "utf8",
+    signal: options?.signal,
     killSignal: options?.killSignal,
     timeout: options?.timeout,
     maxBuffer: options?.maxBuffer,
-    shell,
-    windowsHide: true,
   }) as Promise<ExecCommandResult>;
 }

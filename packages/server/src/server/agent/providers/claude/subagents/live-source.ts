@@ -16,7 +16,8 @@ import {
  *
  * Verified on the wire (Claude Code 2.1.220, Paseo's own query options):
  *
- *   task_started       task_id, tool_use_id, description, subagent_type, task_type
+ *   task_started       task_id, tool_use_id, description, subagent_type, task_type,
+ *                      is_backgrounded
  *   task_updated       task_id, patch.status, patch.is_backgrounded
  *   task_notification  task_id, tool_use_id, status
  *
@@ -79,9 +80,9 @@ function isProviderSubagentTask(message: TaskStartedMessage): boolean {
 interface TaskUpdatedMessage {
   task_id: string;
   /**
-   * `is_backgrounded` on the patch reports a LATER move to the background, for a task that
-   * started in the foreground. It is not the only source of that fact — a task can be
-   * backgrounded from birth, which arrives on `task_started` instead.
+   * `is_backgrounded` is declared on `SDKTaskUpdatedMessage["patch"]`: it flips when a foreground
+   * task is moved to the background after `task_started`. Together with `task_started`'s own
+   * flag it separates a child that dies with its turn from one told to outlive it.
    */
   patch?: { status?: string; is_backgrounded?: boolean };
 }
@@ -185,8 +186,8 @@ export class ClaudeTaskProtocolSource {
   /** Workflow invocations already own a real Workflow card in the parent timeline. */
   private readonly idsWithExistingParentToolCard = new Set<string>();
   /**
-   * Declared subagents that were moved to the background. They outlive the turn that spawned
-   * them, so a turn ending is not evidence that they stopped.
+   * Declared subagents running in the background, whether spawned there or moved there later.
+   * They outlive the turn that spawned them, so a turn ending is not evidence that they stopped.
    */
   private readonly backgroundedIds = new Set<string>();
   /** Last status emitted per subagent, so a redundant announcement is not re-broadcast. */
@@ -275,19 +276,6 @@ export class ClaudeTaskProtocolSource {
       this.ownerSubagentIdByTaskId.get(taskId) ??
       (toolUseId ? this.ownerSubagentIdByToolUseId.get(toolUseId) : undefined)
     );
-  }
-
-  /**
-   * Remember whether a subagent outlives the turn that spawned it.
-   *
-   * Absent means "not stated", which must not overwrite a known value: `task_started` omits the
-   * field for task types that do not carry it, and a later `task_updated` patch is the only thing
-   * allowed to change a decision already made.
-   */
-  private recordBackgrounded(id: string, isBackgrounded: boolean | undefined): void {
-    if (isBackgrounded === undefined) return;
-    if (isBackgrounded) this.backgroundedIds.add(id);
-    else this.backgroundedIds.delete(id);
   }
 
   /**
@@ -406,12 +394,11 @@ export class ClaudeTaskProtocolSource {
     }
     this.sawTaskStarted = true;
     const existingId = this.subagentIdByTaskId.get(message.task_id);
+    this.recordBackgrounded(existingId ?? id, message.is_backgrounded);
     if (existingId) {
-      this.recordBackgrounded(existingId, message.is_backgrounded);
       return this.observeExistingTaskStart(message, id, existingId);
     }
 
-    this.recordBackgrounded(id, message.is_backgrounded);
     return this.observeNewTaskStart(message, id, parentSubagentId);
   }
 
@@ -500,12 +487,18 @@ export class ClaudeTaskProtocolSource {
   private observeTaskUpdated(message: TaskUpdatedMessage): SubagentObservation[] {
     this.recordTaskSettled(message.task_id, message.patch?.status);
     const id = this.subagentIdByTaskId.get(message.task_id);
-    const backgrounded = message.patch?.is_backgrounded;
-    if (id && typeof backgrounded === "boolean") {
-      if (backgrounded) this.backgroundedIds.add(id);
-      else this.backgroundedIds.delete(id);
-    }
+    if (id) this.recordBackgrounded(id, message.patch?.is_backgrounded);
     return this.observeStatus(message.task_id, message.patch?.status);
+  }
+
+  /**
+   * Remember whether a subagent outlives the turn that spawned it. Absent means "not stated",
+   * which must not overwrite a known value: `task_started` omits the field for task types that do
+   * not carry it.
+   */
+  private recordBackgrounded(id: string, backgrounded: boolean | undefined): void {
+    if (backgrounded === true) this.backgroundedIds.add(id);
+    else if (backgrounded === false) this.backgroundedIds.delete(id);
   }
 
   private observeTaskNotification(message: TaskNotificationMessage): SubagentObservation[] {

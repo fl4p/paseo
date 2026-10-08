@@ -1,5 +1,10 @@
 "use dom";
 
+import type {
+  TerminalFindHandle,
+  TerminalFindResult,
+} from "../terminal/runtime/terminal-emulator-runtime";
+
 import {
   useCallback,
   useEffect,
@@ -45,6 +50,7 @@ import {
 import { getDesktopHost } from "@/desktop/host";
 
 export interface TerminalEmulatorHandle {
+  find?: TerminalFindHandle;
   writeOutput: (data: TerminalOutputData) => void;
   restoreOutput: (data: TerminalOutputData) => void;
   renderSnapshot: (state: TerminalState | null) => void;
@@ -117,6 +123,8 @@ interface TerminalEmulatorProps {
   onSwipeLeft?: () => void;
   onSwipeRight?: () => void;
   initialSnapshot?: TerminalState | null;
+  onFindRequest?: () => void;
+  onFindResult?: (result: TerminalFindResult) => void;
   onInput?: (data: string) => Promise<void> | void;
   onFocus?: () => Promise<void> | void;
   onResize?: (input: {
@@ -179,6 +187,8 @@ export default function TerminalEmulator({
   onSwipeLeft,
   onSwipeRight,
   initialSnapshot = null,
+  onFindRequest,
+  onFindResult,
   onInput,
   onFocus,
   onResize,
@@ -209,6 +219,8 @@ export default function TerminalEmulator({
   const onRendererReadyChangeRef = useRef(onRendererReadyChange);
   onRendererReadyChangeRef.current = onRendererReadyChange;
   const mountCallbacksRef = useRef({
+    onFindRequest,
+    onFindResult,
     onInput,
     onResize,
     onTerminalKey,
@@ -219,6 +231,8 @@ export default function TerminalEmulator({
     onOpenLocalFileLink,
   });
   mountCallbacksRef.current = {
+    onFindRequest,
+    onFindResult,
     onInput,
     onResize,
     onTerminalKey,
@@ -302,6 +316,11 @@ export default function TerminalEmulator({
   useImperativeHandle(
     ref,
     (): TerminalEmulatorHandle => ({
+      find: {
+        setWidgetSize: (size) => runtimeRef.current?.find.setWidgetSize(size),
+        search: (query, direction) => runtimeRef.current?.find.search(query, direction),
+        clear: () => runtimeRef.current?.find.clear(),
+      },
       writeOutput: (data: TerminalOutputData) => {
         runtimeRef.current?.write({ data });
       },
@@ -503,6 +522,8 @@ export default function TerminalEmulator({
   useEffect(() => {
     runtimeRef.current?.setCallbacks({
       callbacks: {
+        onFindRequest,
+        onFindResult,
         onInput,
         onResize,
         onTerminalKey,
@@ -515,6 +536,8 @@ export default function TerminalEmulator({
       },
     });
   }, [
+    onFindRequest,
+    onFindResult,
     onInput,
     onInputModeChange,
     onOpenLocalFileLink,

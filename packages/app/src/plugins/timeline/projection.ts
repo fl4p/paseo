@@ -2,7 +2,12 @@ import type { AgentTimelineItem, ToolCallTimelineItem } from "@getpaseo/protocol
 import type { AgentToolCallData, PluginTimelineStreamItem, StreamItem } from "@/types/stream";
 import type { TimelineItemTransform } from "./model";
 
-const projectionCache = new WeakMap<TimelineItemTransform, WeakMap<StreamItem, StreamItem[]>>();
+type AssistantPhase = "streaming" | "complete";
+
+const projectionCache = new WeakMap<
+  TimelineItemTransform,
+  WeakMap<StreamItem, Partial<Record<AssistantPhase, StreamItem[]>>>
+>();
 
 function cloneAndFreeze<T>(value: T): T {
   if (Array.isArray(value)) {
@@ -79,6 +84,7 @@ function sourceTimelineItem(item: StreamItem): AgentTimelineItem | null {
 function transformSourceItem(
   item: StreamItem,
   transformTimelineItem: TimelineItemTransform,
+  assistantPhase: AssistantPhase,
 ): StreamItem[] {
   const source = sourceTimelineItem(item);
   if (!source) return [item];
@@ -87,7 +93,9 @@ function transformSourceItem(
     item.kind === "tool_call" &&
     item.payload.source === "agent" &&
     item.payload.data.status === "running";
-  const phase = isStreamingThought || isStreamingToolCall ? "streaming" : "complete";
+  const isStreamingAssistant = item.kind === "assistant_message" && assistantPhase === "streaming";
+  const phase =
+    isStreamingAssistant || isStreamingThought || isStreamingToolCall ? "streaming" : "complete";
   const transformed = transformTimelineItem({
     item: cloneAndFreeze(source),
     phase,
@@ -114,6 +122,7 @@ function transformSourceItem(
 export function projectPluginTimelineItems(
   items: StreamItem[],
   transformTimelineItem: TimelineItemTransform | undefined,
+  assistantPhase: AssistantPhase = "complete",
 ): StreamItem[] {
   if (!transformTimelineItem) return items;
   let bySource = projectionCache.get(transformTimelineItem);
@@ -123,13 +132,13 @@ export function projectPluginTimelineItems(
   }
   let changed = false;
   const projected = items.flatMap((item) => {
-    const cached = bySource.get(item);
+    const cached = bySource.get(item)?.[assistantPhase];
     if (cached) {
       changed = changed || cached.length !== 1 || cached[0] !== item;
       return cached;
     }
-    const output = transformSourceItem(item, transformTimelineItem);
-    bySource.set(item, output);
+    const output = transformSourceItem(item, transformTimelineItem, assistantPhase);
+    bySource.set(item, { ...bySource.get(item), [assistantPhase]: output });
     changed = changed || output.length !== 1 || output[0] !== item;
     return output;
   });

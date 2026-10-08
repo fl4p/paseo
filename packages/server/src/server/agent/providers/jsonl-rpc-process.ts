@@ -98,6 +98,8 @@ export class JsonlRpcProcess {
   private terminationConfirmed = false;
   private spawnTreeCapture: Promise<ProcessTreeSnapshot> | null = null;
   private processGroupId: number | undefined;
+  private exited = false;
+  private closing: Promise<void> | null = null;
   private readonly frameDecoder: JsonlFrameDecoder;
 
   constructor(private readonly options: JsonlRpcProcessOptions) {
@@ -136,6 +138,7 @@ export class JsonlRpcProcess {
       this.failAll(error instanceof Error ? error : new Error(String(error)));
     });
     this.child.on("exit", (code, signal) => {
+      this.exited = true;
       const error = new Error(
         `${this.diagnosticName} process exited with code ${code ?? "null"} and signal ${signal ?? "null"}\n${this.stderrBuffer}`.trim(),
       );
@@ -200,6 +203,36 @@ export class JsonlRpcProcess {
     return this.startRequest(command, timeoutMs).promise;
   }
 
+  /**
+   * Send a command whose goal an exited process has already met — stopping a turn,
+   * clearing a queue. Resolves once the child has exited instead of rejecting,
+   * because nothing is queued and nothing is running, which is what the caller
+   * asked for. Use `request` when the caller needs an answer from a live process.
+   *
+   * Keyed on an observed exit rather than on `disposed`: `close()` disposes the
+   * transport before termination completes, and a child that outlives SIGKILL can
+   * still be working, so a disposed transport is not proof the work stopped.
+   */
+  async requestStopWork(
+    command: { type: string; [key: string]: unknown },
+    timeoutMs?: number | null,
+  ): Promise<void> {
+    if (this.exited) {
+      return;
+    }
+    try {
+      await this.request(command, timeoutMs);
+    } catch (error) {
+      // A dying child breaks its stdin pipe a fraction before it emits `exit`, which
+      // fails this request and starts a termination. Wait for that termination to reach
+      // an answer rather than refusing a stop the runtime went on to honor.
+      await this.closing?.catch(() => undefined);
+      if (!this.exited) {
+        throw error;
+      }
+    }
+  }
+
   send(message: Record<string, unknown>): void {
     if (this.disposed) {
       return;
@@ -224,6 +257,12 @@ export class JsonlRpcProcess {
     }
     if (this.disposed) return;
     this.failAll(error);
+    this.closing = this.shutdownProcess();
+    await this.closing;
+  }
+
+  /** close()'s root-exit shutdown; terminate() below is the tree-confirming kill. */
+  private async shutdownProcess(): Promise<void> {
     try {
       this.child.stdin.end();
     } catch {
@@ -348,25 +387,27 @@ export class JsonlRpcProcess {
     this.frameDecoder.write(chunk);
   }
 
-  /** Route a complete logical frame to its consumer (response or subscriber). */
+  /** Route a complete logical frame to its consumer (pending request or subscriber). */
   private dispatchFrame(message: Record<string, unknown>): void {
-    if (message.type === "response") {
-      this.handleResponse(message as unknown as JsonlRpcResponse);
+    const pending =
+      message.type === "response" && typeof message.id === "string"
+        ? this.pending.get(message.id)
+        : undefined;
+    if (pending) {
+      this.settleRequest(pending, message as unknown as JsonlRpcResponse & { id: string });
       return;
     }
+    // A response nothing is waiting for is published like any other frame, so a provider
+    // can read it as an event, such as OMP 18.3 rejecting a prompt after acknowledging it.
     for (const subscriber of this.messageSubscribers) {
       subscriber(message);
     }
   }
 
-  private handleResponse(response: JsonlRpcResponse): void {
-    if (!response.id) {
-      return;
-    }
-    const pending = this.pending.get(response.id);
-    if (!pending) {
-      return;
-    }
+  private settleRequest(
+    pending: PendingRequest,
+    response: JsonlRpcResponse & { id: string },
+  ): void {
     if (pending.timer) {
       clearTimeout(pending.timer);
     }

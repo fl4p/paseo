@@ -4,7 +4,7 @@ import type { AgentAttachment } from "@getpaseo/protocol/messages";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
 import { isLikelyExternalToolName } from "@getpaseo/protocol/tool-name-normalization";
 import { buildToolCallDisplayModel } from "@getpaseo/protocol/tool-call-display";
-import { projectTimelineRows } from "./timeline-projection.js";
+import { projectTimelineRows, type TimelineProjectionEntry } from "./timeline-projection.js";
 
 const DEFAULT_MAX_ITEMS = 0;
 const MAX_TOOL_INPUT_CHARS = 400;
@@ -270,15 +270,24 @@ const FORK_CONTEXT_SUMMARY_HEADING = "[Compaction summary of the earlier convers
 /** Label opening the replayed turns when a compaction summary precedes them. */
 const FORK_CONTEXT_SINCE_COMPACTION_HEADING = "[Conversation since the compaction]";
 
-function findForkBoundaryIndex(input: {
+/**
+ * Project the timeline and select the rows at or before the fork boundary.
+ *
+ * Works in projected space: stored rows may themselves be projected items that
+ * cover a range of source seqs, so a cursor names a projected row's `seqEnd`.
+ * `boundarySelected` is false when no boundary was requested (fork the whole
+ * session), in which case `rows` is the full projection.
+ */
+function selectRowsUpToForkBoundary(input: {
   rows: readonly AgentTimelineRow[];
   cursorBoundary?: ForkCursorBoundary | null;
   boundaryMessageId?: string | null;
-}): number | null {
+}): { rows: TimelineProjectionEntry[]; boundarySelected: boolean } {
+  const projectedRows = projectTimelineRows({ rows: input.rows, mode: "projected" });
   const boundaryCursor = input.cursorBoundary?.cursor ?? null;
   const boundaryMessageId = input.boundaryMessageId?.trim() || null;
   if (!boundaryCursor && !boundaryMessageId) {
-    return null;
+    return { rows: projectedRows, boundarySelected: false };
   }
   if (
     input.cursorBoundary &&
@@ -287,8 +296,8 @@ function findForkBoundaryIndex(input: {
     throw new Error("Selected timeline position is no longer available.");
   }
   const boundaryIndex = boundaryCursor
-    ? input.rows.findIndex((row) => row.seq === boundaryCursor.seq)
-    : input.rows.findLastIndex(
+    ? projectedRows.findIndex((row) => row.seqEnd === boundaryCursor.seq)
+    : projectedRows.findLastIndex(
         (row) => row.item.type === "assistant_message" && row.item.messageId === boundaryMessageId,
       );
   if (boundaryIndex < 0) {
@@ -298,7 +307,16 @@ function findForkBoundaryIndex(input: {
         : "Selected assistant message is no longer available.",
     );
   }
-  return boundaryIndex;
+  const boundarySeq = projectedRows[boundaryIndex].seqEnd;
+  if (projectedRows.some((row) => row.seqStart <= boundarySeq && row.seqEnd > boundarySeq)) {
+    throw new Error(
+      "This checkpoint changed after it was created. Fork from a later completed response instead.",
+    );
+  }
+  return {
+    rows: projectedRows.filter((row) => row.seqEnd <= boundarySeq),
+    boundarySelected: true,
+  };
 }
 
 /**
@@ -315,23 +333,20 @@ export function resolveForkBoundaryMessageId(input: {
   cursorBoundary?: ForkCursorBoundary | null;
   boundaryMessageId?: string | null;
 }): string | null {
-  const boundaryIndex = findForkBoundaryIndex(input);
-  if (boundaryIndex === null) {
+  const selected = selectRowsUpToForkBoundary(input);
+  if (!selected.boundarySelected) {
     return null;
   }
-  const messageId = findMessageIdAtOrBefore(input.rows, boundaryIndex);
+  const messageId = findLastMessageId(selected.rows);
   if (!messageId) {
     throw new Error("Selected timeline position has no provider message to fork from.");
   }
   return messageId;
 }
 
-/** The provider message id of the last message row at or before `endIndex`. */
-function findMessageIdAtOrBefore(
-  rows: readonly AgentTimelineRow[],
-  endIndex: number,
-): string | null {
-  for (let index = Math.min(endIndex, rows.length - 1); index >= 0; index -= 1) {
+/** The provider message id of the last message row in `rows`. */
+function findLastMessageId(rows: readonly TimelineProjectionEntry[]): string | null {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
     const item = rows[index]?.item;
     if (
       item &&
@@ -346,17 +361,14 @@ function findMessageIdAtOrBefore(
 }
 
 /**
- * Index of the last completed compaction at or before `endIndex`, or -1.
+ * Index of the last completed compaction in `rows`, or -1.
  *
  * Everything before it is history the provider has already summarized away;
  * replaying it into a fork is exactly the re-inflation this attachment path
  * used to cause.
  */
-function findLastCompletedCompactionIndex(
-  rows: readonly AgentTimelineRow[],
-  endIndex: number,
-): number {
-  for (let index = Math.min(endIndex, rows.length - 1); index >= 0; index -= 1) {
+function findLastCompletedCompactionIndex(rows: readonly TimelineProjectionEntry[]): number {
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
     const item = rows[index]?.item;
     // A canceled or failed compaction summarized nothing away; it is not a boundary.
     if (item?.type === "compaction" && item.status === "completed" && !item.outcome) {
@@ -376,12 +388,9 @@ function selectForkContextRows(input: {
   boundaryMessageId: string | null;
   startedAtCompaction: boolean;
 } {
-  const boundaryIndex = findForkBoundaryIndex(input);
-  const endIndex = boundaryIndex ?? input.rows.length - 1;
-  const compactionIndex = findLastCompletedCompactionIndex(input.rows, endIndex);
-  const startIndex = compactionIndex >= 0 ? compactionIndex + 1 : 0;
-  const selectedRows = input.rows.slice(startIndex, endIndex + 1);
-  const projected = projectTimelineRows({ rows: selectedRows, mode: "projected" });
+  const selected = selectRowsUpToForkBoundary(input);
+  const compactionIndex = findLastCompletedCompactionIndex(selected.rows);
+  const projected = selected.rows.slice(compactionIndex + 1);
 
   return {
     items: projected.map((entry) => entry.item),
@@ -641,16 +650,14 @@ export async function loadForkCompactionSummary(input: {
   read: (agentId: string, options: { untilMessageId: string | null }) => Promise<string | null>;
   logger?: Logger | null;
 }): Promise<string | null> {
-  const boundaryIndex = findForkBoundaryIndex(input);
-  const endIndex = boundaryIndex ?? input.rows.length - 1;
+  const selected = selectRowsUpToForkBoundary(input);
   // The same question `selectForkContextRows` asks, so the two cannot disagree
   // about which compaction the selection started after.
-  if (findLastCompletedCompactionIndex(input.rows, endIndex) < 0) {
+  if (findLastCompletedCompactionIndex(selected.rows) < 0) {
     return null;
   }
-  const untilMessageId =
-    boundaryIndex === null ? null : findMessageIdAtOrBefore(input.rows, boundaryIndex);
-  if (boundaryIndex !== null && !untilMessageId) {
+  const untilMessageId = selected.boundarySelected ? findLastMessageId(selected.rows) : null;
+  if (selected.boundarySelected && !untilMessageId) {
     // A boundary was requested but nothing at or before it names a provider
     // message, so the read cannot be bounded. Reading unbounded is exactly the
     // leak this bound exists to prevent, so answer "no summary" instead.

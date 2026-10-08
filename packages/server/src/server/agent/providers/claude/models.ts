@@ -9,11 +9,12 @@ import {
   normalizeClaudeManifestModelId,
   normalizeClaudeRuntimeModelId as normalizeClaudeManifestRuntimeModelId,
 } from "./model-manifest.js";
-import { readClaudeServedCatalogModels, resolveClaudeConfigDir } from "./served-catalog.js";
+import { readClaudeServedCatalogModels } from "./served-catalog.js";
 
 const CLAUDE_SETTINGS_MODEL_ENV_KEYS = [
   "ANTHROPIC_MODEL",
   "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_DEFAULT_FABLE_MODEL",
   "ANTHROPIC_DEFAULT_OPUS_MODEL",
   "ANTHROPIC_DEFAULT_SONNET_MODEL",
   "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -50,7 +51,7 @@ export function findClaudeModel(
 
 export async function getClaudeModelsWithSettings(
   logger: Logger,
-  configDir?: string,
+  configDir: string,
   claudeCodeVersion?: string,
 ): Promise<AgentModelDefinition[]> {
   const manifestModels = getClaudeModels(claudeCodeVersion);
@@ -123,9 +124,9 @@ function hasOneMillionContextSuffix(modelId: string): boolean {
 
 async function readClaudeSettingsModels(
   logger: Logger,
-  configDir?: string,
+  configDir: string,
 ): Promise<AgentModelDefinition[]> {
-  const settingsPath = path.join(resolveClaudeConfigDir(configDir), "settings.json");
+  const settingsPath = path.join(configDir, "settings.json");
 
   let parsed: unknown;
   try {

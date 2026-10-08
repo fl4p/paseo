@@ -109,6 +109,10 @@ const unsubscribeBackupThread = {
   params: { threadId: "backup-thread" },
 };
 
+function failOnThreadSwitch(threadId: string): never {
+  throw new Error(`An in-place rewind must not move the agent onto thread ${threadId}`);
+}
+
 describe("Codex Rewind", () => {
   test("rolls back a legacy thread in place after forking an untouched backup", async () => {
     const codex = new FakeCodex("legacy");
@@ -127,6 +131,8 @@ describe("Codex Rewind", () => {
       model: "gpt-5.4-mini",
       serviceTier: null,
       userMessageTurns,
+      threadRollbackAvailable: true,
+      setThreadId: failOnThreadSwitch,
     });
 
     expect(codex.calls).toEqual([
@@ -153,6 +159,8 @@ describe("Codex Rewind", () => {
       threadId: "source-thread",
       messageId: "codex-second",
       userMessageTurns,
+      threadRollbackAvailable: true,
+      setThreadId: failOnThreadSwitch,
     });
 
     expect(codex.calls.filter((call) => call.method === "thread/rollback")).toEqual([
@@ -181,6 +189,8 @@ describe("Codex Rewind", () => {
       model: "gpt-5.4-mini",
       serviceTier: null,
       userMessageTurns,
+      threadRollbackAvailable: true,
+      setThreadId: failOnThreadSwitch,
     });
 
     expect(codex.calls).toEqual([
@@ -208,6 +218,8 @@ describe("Codex Rewind", () => {
         model: "gpt-5.4-mini",
         serviceTier: null,
         userMessageTurns,
+        threadRollbackAvailable: true,
+        setThreadId: failOnThreadSwitch,
       }),
     ).rejects.toThrow("Codex could not find the turn containing user message codex-first");
 
@@ -224,8 +236,59 @@ describe("Codex Rewind", () => {
         threadId: "source-thread",
         messageId: "missing-message",
         userMessageTurns,
+        threadRollbackAvailable: true,
+        setThreadId: failOnThreadSwitch,
       }),
     ).rejects.toThrow("Codex could not find user message missing-message");
     expect(codex.calls).toEqual([]);
+  });
+
+  test("forks before the target turn when a legacy thread cannot be rolled back", async () => {
+    const codex = new FakeCodex("legacy");
+    const userMessageTurns = new CodexMessageTurns(
+      new Map([
+        ["codex-first", 0],
+        ["codex-second", 1],
+      ]),
+      new Map([
+        ["codex-first", "turn-first"],
+        ["codex-second", "turn-second"],
+      ]),
+    );
+    let reboundThreadId: string | null = null;
+
+    const result = await revertCodexConversation({
+      client: codex,
+      threadId: "source-thread",
+      messageId: "codex-second",
+      cwd: "/workspace/project",
+      model: "gpt-5.4-mini",
+      serviceTier: null,
+      config: { model_provider: "custom" },
+      userMessageTurns,
+      threadRollbackAvailable: false,
+      setThreadId: (threadId) => {
+        reboundThreadId = threadId;
+      },
+    });
+
+    expect(codex.calls).toEqual([
+      readSourceThread,
+      {
+        method: "thread/fork",
+        params: {
+          threadId: "source-thread",
+          cwd: "/workspace/project",
+          model: "gpt-5.4-mini",
+          serviceTier: null,
+          config: { model_provider: "custom" },
+          excludeTurns: false,
+          persistExtendedHistory: true,
+          beforeTurnId: "turn-second",
+        },
+      },
+    ]);
+    expect(reboundThreadId).toBe("backup-thread");
+    expect(result).toEqual({ backupThreadId: "source-thread" });
   });
 });

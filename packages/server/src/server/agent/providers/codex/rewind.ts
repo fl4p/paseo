@@ -113,7 +113,15 @@ export async function revertCodexConversation(input: {
   cwd?: string | null;
   model?: string | null;
   serviceTier?: string | null;
+  config?: Record<string, unknown> | null;
   userMessageTurns: CodexUserMessageTurnIndex;
+  /** False on Codex 0.156+, which removed thread/rollback. */
+  threadRollbackAvailable: boolean;
+  /**
+   * Only called when the rewind cannot happen in place (a legacy thread on a Codex without
+   * thread/rollback) and the agent has to move onto a fork instead.
+   */
+  setThreadId: (threadId: string) => void | Promise<void>;
 }): Promise<CodexRewindResult> {
   const threadId = input.threadId;
   if (!threadId) {
@@ -131,8 +139,37 @@ export async function revertCodexConversation(input: {
     throw new Error(`Codex user message ${input.messageId} is outside the current thread`);
   }
 
+  // Codex does not carry the parent thread's config into a fork; without it the
+  // forked thread falls back to the default model provider.
+  const forkParams: CodexThreadForkParams = {
+    threadId,
+    cwd: input.cwd ?? null,
+    model: input.model ?? null,
+    serviceTier: input.serviceTier ?? null,
+    ...(input.config ? { config: input.config } : {}),
+    excludeTurns: false,
+    persistExtendedHistory: true,
+  };
+
+  const historyMode = await readCodexThreadHistoryMode(input.client, threadId);
+  if (historyMode === "legacy" && !input.threadRollbackAvailable) {
+    // A legacy thread on Codex 0.156+ can be rewound neither with thread/rollback (removed) nor
+    // with thread/revert (paginated only), so fork before the target turn and move onto the
+    // fork. This loses the prompt cache for the kept prefix; the untouched original thread is
+    // the recovery copy.
+    if (!targetTurn.turnId) {
+      throw new Error(`Codex could not find the turn containing user message ${input.messageId}`);
+    }
+    const forked = await forkCodexThread(input.client, {
+      ...forkParams,
+      beforeTurnId: targetTurn.turnId,
+    });
+    await input.setThreadId(forked.thread.id);
+    return { backupThreadId: threadId };
+  }
+
   const rewind = planInPlaceRewind({
-    historyMode: await readCodexThreadHistoryMode(input.client, threadId),
+    historyMode,
     threadId,
     messageId: input.messageId,
     turnId: targetTurn.turnId,
@@ -143,14 +180,7 @@ export async function revertCodexConversation(input: {
   // session id. Rewinding the thread itself keeps the key, so the next turn reuses the cached
   // prefix instead of starting cold. The untouched fork is the recovery copy of the pre-rewind
   // conversation: `codex resume <backupThreadId>`.
-  const backup = await forkCodexThread(input.client, {
-    threadId,
-    cwd: input.cwd ?? null,
-    model: input.model ?? null,
-    serviceTier: input.serviceTier ?? null,
-    excludeTurns: true,
-    persistExtendedHistory: true,
-  });
+  const backup = await forkCodexThread(input.client, { ...forkParams, excludeTurns: true });
   const backupThreadId = backup.thread.id;
   // thread/fork subscribes this connection to the new thread; Paseo never drives the backup.
   await input.client.request("thread/unsubscribe", { threadId: backupThreadId });

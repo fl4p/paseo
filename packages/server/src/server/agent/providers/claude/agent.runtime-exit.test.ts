@@ -235,10 +235,17 @@ describe("Claude runtime exit", () => {
     const queryFactory = vi.fn(({ options }: ClaudeQueryInput) => {
       capturedOptions = options;
       // A real query stays open between turns, so hold it open; the process
-      // dies when the session retires it, as ending its stdin does in practice.
+      // dies when the session retires it, as ending its stdin does in practice,
+      // and its stream ends with it.
+      let endStream: (() => void) | undefined;
       return createQueryMock(RUNNING_WORKFLOW_TURN_EVENTS, {
-        tail: new Promise<never>(() => undefined),
-        onReturn: () => child.emit("exit", 0, null),
+        tail: new Promise<undefined>((resolve) => {
+          endStream = () => resolve(undefined);
+        }),
+        onReturn: () => {
+          child.emit("exit", 0, null);
+          endStream?.();
+        },
       });
     });
     vi.spyOn(spawnUtils, "spawnProcess").mockReturnValue(child);
