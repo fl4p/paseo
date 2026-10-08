@@ -43,9 +43,14 @@ describe("shared messages stream parsing", () => {
       agentId: "agent_live",
       requestId: "req-search-1",
       query: "pagination",
-      limit: 50,
+      cursor: 200,
+      scope: "transcript",
     });
-    expect(request).toMatchObject({ type: "agent.timeline.search.request", limit: 50 });
+    expect(request).toMatchObject({
+      type: "agent.timeline.search.request",
+      cursor: 200,
+      scope: "transcript",
+    });
 
     const response = SessionOutboundMessageSchema.parse({
       type: "agent.timeline.search.response",
@@ -53,14 +58,13 @@ describe("shared messages stream parsing", () => {
         requestId: "req-search-1",
         agentId: "agent_live",
         epoch: "epoch-1",
-        query: "pagination",
-        matches: [{ seqStart: 40, seqEnd: 42, occurrence: 0 }],
-        truncated: true,
+        locations: [{ seq: 40, role: "assistant", count: 3 }],
+        nextCursor: 400,
         error: null,
       },
     });
     expect(response).toMatchObject({
-      payload: { matches: [{ seqStart: 40, seqEnd: 42, occurrence: 0 }], truncated: true },
+      payload: { locations: [{ seq: 40, role: "assistant", count: 3 }], nextCursor: 400 },
     });
   });
 

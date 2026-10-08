@@ -69,7 +69,7 @@ import {
   type TerminalResizeRequest,
 } from "./terminal-resize-debouncer";
 import { useIsCompactFormFactor } from "@/constants/layout";
-import { isNative } from "@/constants/platform";
+import { getIsElectron, isNative } from "@/constants/platform";
 import {
   applyTerminalRendererReadyChange,
   resolveTerminalStreamTarget,
@@ -299,6 +299,11 @@ export function TerminalPane({
   useBlockMobilePanelOpenGestures(isMobile && isWorkspaceFocused && isPaneFocused && hasSelection);
   const emulatorRef = useRef<TerminalEmulatorHandle>(null);
   const findRef = useRef<TerminalPaneFindHandle>(null);
+  // In Electron the window's Find bar (find-in-page-bar.electron.tsx) owns
+  // Cmd/Ctrl+F through its menu accelerator and searches this terminal via
+  // the find store below. The in-pane widget would answer the same keystroke
+  // with a second Find UI, so it only serves surfaces without that bar.
+  const usesPaneFindWidget = !getIsElectron();
   const handleFindRequest = useCallback(() => findRef.current?.open(), []);
   const handleFindResult = useCallback(
     (result: TerminalFindResult) => findRef.current?.update(result),
@@ -1113,8 +1118,8 @@ export function TerminalPane({
             onRendererReadyChange={handleRendererReadyChange}
             onSwipeRight={handleSwipeRight}
             onSwipeLeft={handleSwipeLeft}
-            onFindRequest={handleFindRequest}
-            onFindResult={handleFindResult}
+            onFindRequest={usesPaneFindWidget ? handleFindRequest : undefined}
+            onFindResult={usesPaneFindWidget ? handleFindResult : undefined}
             onInput={handleTerminalData}
             onFocus={handleTerminalFocus}
             onResize={handleTerminalResize}
@@ -1136,7 +1141,10 @@ export function TerminalPane({
           ref={findRef}
           terminal={emulatorRef}
           active={
-            isTerminalPresented && isPaneFocused && rendererReadyStreamKey === terminalStreamKey
+            usesPaneFindWidget &&
+            isTerminalPresented &&
+            isPaneFocused &&
+            rendererReadyStreamKey === terminalStreamKey
           }
           focusTerminal={requestTerminalFocus}
         />

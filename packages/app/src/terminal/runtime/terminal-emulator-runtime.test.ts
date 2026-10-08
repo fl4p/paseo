@@ -37,7 +37,12 @@ vi.mock("@xterm/addon-search", () => ({
     nextCalls: Array<{ query: string; options?: unknown }> = [];
     previousCalls: Array<{ query: string; options?: unknown }> = [];
     clearCalls = 0;
-    onDidChangeResults(): () => void {
+    disposeCalls = 0;
+    resultListeners: Array<(result: { resultIndex: number; resultCount: number }) => void> = [];
+    onDidChangeResults(
+      listener: (result: { resultIndex: number; resultCount: number }) => void,
+    ): () => void {
+      this.resultListeners.push(listener);
       return () => undefined;
     }
     findNext(query: string, options?: unknown): boolean {
@@ -51,7 +56,9 @@ vi.mock("@xterm/addon-search", () => ({
     clearDecorations(): void {
       this.clearCalls += 1;
     }
-    dispose(): void {}
+    dispose(): void {
+      this.disposeCalls += 1;
+    }
     constructor() {
       searchAddonInstances.instances.push(this);
     }
@@ -118,6 +125,8 @@ interface SearchAddonProbe {
   nextCalls: Array<{ query: string; options?: unknown }>;
   previousCalls: Array<{ query: string; options?: unknown }>;
   clearCalls: number;
+  disposeCalls: number;
+  resultListeners: Array<(result: { resultIndex: number; resultCount: number }) => void>;
 }
 
 function createSearchAddonProbe(): SearchAddonProbe {
@@ -215,6 +224,65 @@ function decodeTerminalOutput(data: string | Uint8Array): string {
     return data;
   }
   return new TextDecoder().decode(data);
+}
+
+interface FindState {
+  findQuery: string;
+  findResult: { resultIndex: number; resultCount: number };
+  findOutputAnchor: unknown;
+  searchAddon: unknown;
+}
+
+function mountSearchable(): {
+  runtime: TerminalEmulatorRuntime;
+  state: () => FindState;
+  markers: number[];
+  searchResults: Array<{ resultIndex: number; resultCount: number }>;
+  findResults: Array<{ resultIndex: number; resultCount: number }>;
+  addon: () => SearchAddonProbe;
+  writeOutput: (text: string) => void;
+} {
+  const { runtime, terminal } = createRuntimeWithTerminal();
+  const markers: number[] = [];
+  Object.assign(terminal, {
+    buffer: { active: { viewportY: 10, baseY: 40, cursorY: 5 } },
+    registerMarker: (offset: number) => {
+      markers.push(offset);
+      return { line: 10, isDisposed: false, dispose: () => undefined };
+    },
+    loadAddon: () => undefined,
+    getSelectionPosition: () => undefined,
+  });
+  const searchResults: Array<{ resultIndex: number; resultCount: number }> = [];
+  const findResults: Array<{ resultIndex: number; resultCount: number }> = [];
+  runtime.setCallbacks({
+    callbacks: {
+      onSearchResults: (result) => {
+        searchResults.push(result);
+      },
+      onFindResult: (result) => {
+        findResults.push({ resultIndex: result.resultIndex, resultCount: result.resultCount });
+      },
+    },
+  });
+  const state = () => runtime as unknown as FindState;
+  return {
+    runtime,
+    state,
+    markers,
+    searchResults,
+    findResults,
+    addon: () => state().searchAddon as SearchAddonProbe,
+    writeOutput: (text) => runtime.write({ data: terminalOutput(text) }),
+  };
+}
+
+/** Plays a search result into every listener the runtime registered on the addon. */
+function emitSearchResult(
+  addon: SearchAddonProbe,
+  result: { resultIndex: number; resultCount: number },
+): void {
+  for (const listener of addon.resultListeners) listener(result);
 }
 
 describe("terminal-emulator-runtime", () => {
@@ -773,7 +841,7 @@ describe("terminal-emulator-runtime", () => {
     ]);
   });
 
-  it("refuses to search an empty query and drops the highlights on clear", () => {
+  it("refuses to search an empty query and ends the search on clear", () => {
     const runtime = new TerminalEmulatorRuntime();
     const addon = createSearchAddonProbe();
     (runtime as unknown as { searchAddon: unknown }).searchAddon = addon;
@@ -781,12 +849,83 @@ describe("terminal-emulator-runtime", () => {
     expect(runtime.search({ query: "", forward: true, incremental: true })).toBe(false);
     expect(addon.nextCalls).toEqual([]);
 
+    // Clearing ends the search the way the pane widget's clear() does: the
+    // addon (and its pending highlight refresh) is disposed, not just cleared.
     runtime.clearSearch();
-    expect(addon.clearCalls).toBe(1);
+    expect(addon.disposeCalls).toBe(1);
+    expect((runtime as unknown as { searchAddon: unknown }).searchAddon).toBeNull();
 
-    // Without a mounted addon there is nothing to search or clear; both no-op.
+    // Without a mounted terminal there is nothing to search or clear; both no-op.
     const bare = new TerminalEmulatorRuntime();
     expect(bare.search({ query: "needle", forward: true, incremental: false })).toBe(false);
     bare.clearSearch();
+  });
+
+  describe("one search lifecycle for the pane widget and the desktop Find bar", () => {
+    it("anchors the inspected match against arriving output for a desktop Find bar search", () => {
+      const desktop = mountSearchable();
+      desktop.runtime.search({ query: "needle", forward: true, incremental: true });
+      emitSearchResult(desktop.addon(), { resultIndex: 2, resultCount: 3 });
+      desktop.writeOutput("more output");
+
+      const pane = mountSearchable();
+      pane.runtime.find.search("needle", "next");
+      emitSearchResult(pane.addon(), { resultIndex: 2, resultCount: 3 });
+      pane.writeOutput("more output");
+
+      // The desktop path records the query, so output arriving while a match
+      // is inspected registers the same viewport anchor as the pane widget.
+      expect(desktop.state().findQuery).toBe("needle");
+      expect(desktop.state().findQuery).toBe(pane.state().findQuery);
+      expect(desktop.markers).toEqual([10 - 40 - 5]);
+      expect(desktop.markers).toEqual(pane.markers);
+      expect(desktop.state().findOutputAnchor).toBeDefined();
+
+      // Both surfaces hear the result, whichever one searched.
+      expect(desktop.searchResults).toEqual([{ resultIndex: 2, resultCount: 3 }]);
+      expect(pane.searchResults).toEqual([{ resultIndex: 2, resultCount: 3 }]);
+      expect(desktop.findResults).toEqual(pane.findResults);
+    });
+
+    it("resets query, anchor, addon and counts on a desktop clearSearch like find.clear", () => {
+      const desktop = mountSearchable();
+      desktop.runtime.search({ query: "needle", forward: true, incremental: true });
+      const desktopAddon = desktop.addon();
+      emitSearchResult(desktopAddon, { resultIndex: 0, resultCount: 1 });
+      desktop.writeOutput("more output");
+      desktop.runtime.clearSearch();
+
+      const pane = mountSearchable();
+      pane.runtime.find.search("needle", "next");
+      const paneAddon = pane.addon();
+      emitSearchResult(paneAddon, { resultIndex: 0, resultCount: 1 });
+      pane.writeOutput("more output");
+      pane.runtime.find.clear();
+
+      for (const [surface, addon] of [
+        [desktop, desktopAddon],
+        [pane, paneAddon],
+      ] as const) {
+        expect(surface.state().findQuery).toBe("");
+        expect(surface.state().findOutputAnchor).toBeUndefined();
+        expect(surface.state().searchAddon).toBeNull();
+        expect(surface.state().findResult).toEqual({ resultIndex: -1, resultCount: 0 });
+        expect(addon.disposeCalls).toBe(1);
+        expect(surface.searchResults.at(-1)).toEqual({ resultIndex: -1, resultCount: 0 });
+        expect(surface.findResults.at(-1)).toEqual({ resultIndex: -1, resultCount: 0 });
+      }
+
+      // With the search over, arriving output is no longer anchored.
+      desktop.writeOutput("later output");
+      expect(desktop.markers).toHaveLength(1);
+    });
+
+    it("lets the desktop Find bar search again after the pane widget disposed the addon", () => {
+      const { runtime, addon } = mountSearchable();
+      runtime.find.search("needle", "next");
+      runtime.find.clear();
+      expect(runtime.search({ query: "needle", forward: false, incremental: false })).toBe(true);
+      expect(addon().previousCalls).toEqual([{ query: "needle", options: expect.anything() }]);
+    });
   });
 });

@@ -1887,6 +1887,10 @@ export const AgentTimelineSearchRequestMessageSchema = z.object({
   requestId: z.string(),
   query: z.string(),
   cursor: z.number().int().nonnegative().optional(),
+  // `transcript` also searches reasoning, tasks, notices and errors with the
+  // transcript Find's text rules (`./timeline-search`). Hosts that predate it drop
+  // the field and answer for messages only, which is the default.
+  scope: z.enum(["messages", "transcript"]).optional(),
 });
 
 export const AgentTimelineListPromptsRequestMessageSchema = z.object({
@@ -3187,6 +3191,7 @@ export const SessionEventSubscriptionSchema = z.enum([
   "project.update",
   "providers_snapshot_update",
   "agent_attention_required",
+  "agent_prompt_discarded",
   "agent_permission_request",
   "agent_permission_resolved",
   "checkout_status_update",
@@ -3767,6 +3772,9 @@ export const ServerInfoStatusPayloadSchema = z
         // COMPAT(selectiveAgentTimeline): added in v0.1.106, remove after 2027-01-12.
         selectiveAgentTimeline: z.boolean().optional(),
         explicitEventSubscriptions: z.boolean().optional(),
+        // Daemon accepts the `agent_prompt_discarded` session event subscription. Older daemons
+        // reject the whole event subscription request on an unknown event name.
+        promptDiscardedEvents: z.boolean().optional(),
         ownedSubscriptions: z.boolean().optional(),
         // COMPAT(canonicalSubmittedPrompts): added in v0.2.6, remove gate after 2027-01-30.
         canonicalSubmittedPrompts: z.boolean().optional(),
@@ -4881,6 +4889,20 @@ export const AgentAttentionRequiredMessageSchema = z.object({
         }),
       })
       .optional(),
+  }),
+});
+
+// A submitted prompt that will never reach the provider, addressed to the composer rather than to
+// a timeline: the client retires the pending submission for `clientMessageId` whether or not it
+// observes this agent's timeline. Delivered through a session event subscription; a source that
+// subscribes to it no longer receives the `prompt_discarded` agent_stream form.
+export const AgentPromptDiscardedMessageSchema = z.object({
+  type: z.literal("agent_prompt_discarded"),
+  payload: z.object({
+    subscriptionId: z.string().optional(),
+    agentId: z.string(),
+    clientMessageId: z.string(),
+    reason: z.string(),
   }),
 });
 
@@ -7000,6 +7022,7 @@ export const SessionOutboundMessageSchema = z.discriminatedUnion("type", [
   ProviderSubagentUpdateMessageSchema,
   SetAgentTimelineSubscriptionResponseMessageSchema,
   AgentAttentionRequiredMessageSchema,
+  AgentPromptDiscardedMessageSchema,
   AgentForkContextResponseMessageSchema,
   AgentForkSessionResponseMessageSchema,
   CancelAgentResponseMessageSchema,

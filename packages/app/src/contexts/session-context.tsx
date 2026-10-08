@@ -51,6 +51,7 @@ import { toErrorMessage } from "@/utils/error-messages";
 import { showProviderNoticeToast } from "@/utils/provider-notice-toast";
 import { applyCheckoutStatusUpdateFromEvent } from "@/git/checkout-status-cache";
 import { resyncProviderSubagents, useProviderSubagentStore } from "@/subagents/provider-store";
+import { observePromptDiscards } from "@/composer/submission/prompt-discards";
 
 // Re-export types from session-store and draft-store for backward compatibility
 export type { DraftInput } from "@/stores/draft-store";
@@ -226,6 +227,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   const updateSessionServerInfo = useSessionStore((state) => state.updateSessionServerInfo);
   const setViewedTimelineSync = useSessionStore((state) => state.setViewedTimelineSync);
   const upsertWorkspaceSetupProgress = useWorkspaceSetupStore((state) => state.upsertProgress);
+  const supportsPromptDiscardEvents = useSessionStore(
+    (state) => state.sessions[serverId]?.serverInfo?.features?.promptDiscardedEvents === true,
+  );
 
   // Track focused agent for heartbeat
   const focusedAgentId = useSessionStore(
@@ -380,9 +384,9 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       const parsedTimestamp = new Date(timestamp);
       const streamEvent = event;
       if (event.type === "prompt_discarded") {
-        // The prompt never reached the provider, so no canonical row will ever arrive for it.
-        // Rejecting the submission is the only signal that retires the pending composer row
-        // (see composer/submission/model.ts); the daemon also writes a timeline row saying why.
+        // COMPAT(promptDiscardedEvents): daemons that predate the `agent_prompt_discarded`
+        // session event send the discard only in this form, and only for an observed timeline.
+        // A daemon with the event never sends this form to a session subscribed to it.
         useSessionStore
           .getState()
           .rejectAgentMessageSubmission(serverId, agentId, event.clientMessageId);
@@ -506,6 +510,17 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   useEffect(() => {
     viewedTimelineSyncRef.current?.setConnected(isConnected);
   }, [isConnected]);
+
+  // The prompt never reached the provider, so no canonical row will ever arrive for it.
+  // Rejecting the submission is the only signal that retires the pending composer row
+  // (see composer/submission/model.ts), whether or not this agent's chat is open; the daemon
+  // also writes a timeline row saying why.
+  useEffect(() => {
+    if (!supportsPromptDiscardEvents) return;
+    return observePromptDiscards(client, ({ agentId, clientMessageId }) => {
+      useSessionStore.getState().rejectAgentMessageSubmission(serverId, agentId, clientMessageId);
+    });
+  }, [client, serverId, supportsPromptDiscardEvents]);
 
   // Daemon message handlers - directly update Zustand store
   useEffect(() => {

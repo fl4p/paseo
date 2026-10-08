@@ -225,41 +225,73 @@ export class TerminalEmulatorRuntime {
   private findOutputAnchor: IMarker | undefined;
   private findWidgetSize = { width: 0, height: 0 };
 
+  /**
+   * The in-pane Find widget's handle. It and the desktop Find bar's
+   * `search()`/`clearSearch()` are two front ends over one search lifecycle
+   * (`runSearch`/`resetSearch`): the same query, output anchor, result
+   * reporting and addon disposal, whichever surface drives it.
+   */
   readonly find: TerminalFindHandle = {
     setWidgetSize: (size) => {
       this.findWidgetSize = size;
       this.emitFindResult();
     },
     search: (query, direction) => {
-      this.releaseFindOutputAnchor();
-      this.findQuery = query;
-      if (this.terminal && !this.searchAddon) this.loadSearchAddon(this.terminal);
       const theme = this.terminal?.options.theme;
-      const options = {
-        regex: false,
-        caseSensitive: false,
-        incremental: direction === undefined,
-        decorations: {
-          matchBorder: theme?.yellow ?? "#b58900",
-          matchOverviewRuler: theme?.yellow ?? "#b58900",
-          activeMatchBorder: theme?.blue ?? "#268bd2",
-          activeMatchColorOverviewRuler: theme?.blue ?? "#268bd2",
+      this.runSearch({
+        query,
+        forward: direction === "next",
+        options: {
+          regex: false,
+          caseSensitive: false,
+          incremental: direction === undefined,
+          decorations: {
+            matchBorder: theme?.yellow ?? "#b58900",
+            matchOverviewRuler: theme?.yellow ?? "#b58900",
+            activeMatchBorder: theme?.blue ?? "#268bd2",
+            activeMatchColorOverviewRuler: theme?.blue ?? "#268bd2",
+          },
         },
-      };
-      if (direction === "next") this.searchAddon?.findNext(query, options);
-      else this.searchAddon?.findPrevious(query, options);
+      });
     },
     clear: () => {
-      this.releaseFindOutputAnchor();
-      this.findQuery = "";
-      // clearDecorations leaves the addon's pending refresh alive. Disposal
-      // cancels its timers and listeners without touching terminal selection.
-      this.searchAddon?.dispose();
-      this.searchAddon = null;
-      this.findResult = { resultIndex: -1, resultCount: 0 };
-      this.emitFindResult();
+      this.resetSearch();
     },
   };
+
+  /**
+   * The one search step. Recording the query is what arms
+   * `preserveFindViewport`: while it is set and has hits, arriving output
+   * keeps the inspected match in view instead of scrolling it away.
+   */
+  private runSearch(input: { query: string; forward: boolean; options: ISearchOptions }): boolean {
+    this.releaseFindOutputAnchor();
+    this.findQuery = input.query;
+    // resetSearch() disposes the addon; load a fresh one on demand.
+    if (this.terminal && !this.searchAddon) this.loadSearchAddon(this.terminal);
+    const searchAddon = this.searchAddon;
+    if (!searchAddon) return false;
+    return input.forward
+      ? searchAddon.findNext(input.query, input.options)
+      : searchAddon.findPrevious(input.query, input.options);
+  }
+
+  /** Ends the search for every surface: query, anchor, highlights, counts. */
+  private resetSearch(): void {
+    this.releaseFindOutputAnchor();
+    this.findQuery = "";
+    // clearDecorations leaves the addon's pending refresh alive. Disposal
+    // cancels its timers and listeners without touching terminal selection.
+    this.searchAddon?.dispose();
+    this.searchAddon = null;
+    this.reportFindResult({ resultIndex: -1, resultCount: 0 });
+  }
+
+  private reportFindResult(result: { resultIndex: number; resultCount: number }): void {
+    this.findResult = { resultIndex: result.resultIndex, resultCount: result.resultCount };
+    this.emitFindResult();
+    void this.callbacks.onSearchResults?.({ ...this.findResult });
+  }
 
   private fitAndEmitResize: ((input?: TerminalResizeRequest) => void) | null = null;
   private lastSize: { rows: number; cols: number } | null = null;
@@ -308,13 +340,9 @@ export class TerminalEmulatorRuntime {
     terminal.loadAddon(searchAddon);
     this.searchAddon = searchAddon;
     searchAddon.onDidChangeResults((result) => {
-      this.findResult = result;
-      this.emitFindResult();
-      // The desktop Find bar's terminal backend (search/clearSearch) shares this addon.
-      void this.callbacks.onSearchResults?.({
-        resultIndex: result.resultIndex,
-        resultCount: result.resultCount,
-      });
+      // Both Find surfaces hear every result: the pane widget through
+      // onFindResult, the desktop Find bar through onSearchResults.
+      this.reportFindResult(result);
     });
   }
 
@@ -964,25 +992,24 @@ export class TerminalEmulatorRuntime {
    * arrive through `onSearchResults`.
    */
   search(input: TerminalSearchInput): boolean {
-    // The pane Find's clear() disposes the addon; load a fresh one on demand.
-    if (this.terminal && !this.searchAddon) this.loadSearchAddon(this.terminal);
-    const searchAddon = this.searchAddon;
-    if (!searchAddon || input.query.length === 0) {
+    if (input.query.length === 0) {
+      this.resetSearch();
       return false;
     }
-    const options: ISearchOptions = {
-      // The addon applies incremental only to findNext; ask for it on every
-      // typing step and let the addon ignore it where it does not apply.
-      incremental: input.incremental,
-      decorations: TERMINAL_SEARCH_DECORATIONS,
-    };
-    return input.forward
-      ? searchAddon.findNext(input.query, options)
-      : searchAddon.findPrevious(input.query, options);
+    return this.runSearch({
+      query: input.query,
+      forward: input.forward,
+      options: {
+        // The addon applies incremental only to findNext; ask for it on every
+        // typing step and let the addon ignore it where it does not apply.
+        incremental: input.incremental,
+        decorations: TERMINAL_SEARCH_DECORATIONS,
+      },
+    });
   }
 
   clearSearch(): void {
-    this.searchAddon?.clearDecorations();
+    this.resetSearch();
   }
 
   private refreshVisibleRows(): void {

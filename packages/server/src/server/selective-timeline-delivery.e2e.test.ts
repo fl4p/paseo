@@ -334,20 +334,19 @@ test("timeline search covers history no client has loaded, and only rows the cli
     limit: 10,
   });
   const [capableSearch, legacySearch] = await Promise.all([
-    capable.client.searchAgentTimeline(agent.id, "NEEDLE"),
-    legacy.client.searchAgentTimeline(agent.id, "NEEDLE"),
+    capable.client.searchAgentTimeline({ agentId: agent.id, query: "NEEDLE", scope: "transcript" }),
+    legacy.client.searchAgentTimeline({ agentId: agent.id, query: "NEEDLE", scope: "transcript" }),
   ]);
 
   expect(capableSearch.epoch).toBe(tail.epoch);
-  expect(capableSearch.truncated).toBe(false);
-  expect(capableSearch.matches).toHaveLength(3);
-  const [early, notification, joined] = capableSearch.matches;
+  expect(capableSearch.nextCursor).toBeNull();
+  expect(capableSearch.locations).toHaveLength(3);
+  const [early, notification, joined] = capableSearch.locations;
   // The first hit lies far behind the window a client loads first.
-  expect(early?.seqEnd).toBeLessThan(tail.startCursor?.seq ?? 0);
-  expect(notification?.seqEnd).toBeLessThan(joined?.seqStart ?? 0);
-  expect(joined?.seqEnd).toBe((joined?.seqStart ?? 0) + 1);
+  expect(early?.seq).toBeLessThan(tail.startCursor?.seq ?? 0);
+  expect(notification?.seq).toBeLessThan(joined?.seq ?? 0);
   // A client that cannot render notifications is not told about a hit in one.
-  expect(legacySearch.matches).toEqual([early, joined]);
+  expect(legacySearch.locations).toEqual([early, joined]);
 });
 
 test("plugin timeline items are sent only to clients that advertise support", async () => {

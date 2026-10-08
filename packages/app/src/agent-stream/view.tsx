@@ -745,7 +745,12 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
         let epoch: string | null = null;
         let cursor: number | undefined;
         for (;;) {
-          const page = await hostClient.searchAgentTimeline({ agentId, query, cursor });
+          const page = await hostClient.searchAgentTimeline({
+            agentId,
+            query,
+            cursor,
+            scope: "transcript",
+          });
           if (epoch !== null && page.epoch !== epoch) {
             throw new Error("The timeline changed while searching");
           }
@@ -753,14 +758,14 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
           for (const location of page.locations) {
             const count = location.count ?? 1;
             for (let occurrence = 0; occurrence < count; occurrence += 1) {
+              if (matches.length >= FIND_HISTORY_MATCH_LIMIT) {
+                return { epoch, matches, truncated: true };
+              }
               matches.push({ seqStart: location.seq, seqEnd: location.seq, occurrence });
             }
           }
           if (page.nextCursor === null) {
             return { epoch, matches, truncated: false };
-          }
-          if (matches.length >= FIND_HISTORY_MATCH_LIMIT) {
-            return { epoch, matches: matches.slice(0, FIND_HISTORY_MATCH_LIMIT), truncated: true };
           }
           cursor = page.nextCursor;
         }

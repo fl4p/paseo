@@ -1,5 +1,10 @@
 import MarkdownIt from "markdown-it";
 import { setImmediate } from "node:timers/promises";
+import {
+  findTextOccurrences,
+  TIMELINE_SEARCH_MATCH_LIMIT,
+  timelineItemSearchText,
+} from "@getpaseo/protocol/timeline-search";
 import type { AgentTimelineRow } from "../agent-timeline-store-types.js";
 import { projectTimelineRows } from "../timeline-projection.js";
 
@@ -10,10 +15,21 @@ interface SearchLocation {
   role: "user" | "assistant";
   count: number;
 }
+/**
+ * `messages` (the default) is what chat find can step to: user and assistant
+ * messages only. `transcript` is what the transcript Find bar matches in its
+ * loaded rows — reasoning, tasks, notices and errors too — using the shared
+ * `@getpaseo/protocol/timeline-search` text rules, so a hit found in loaded rows
+ * is still found once those rows are unloaded, and with the same count.
+ */
+export type TimelineSearchScope = "messages" | "transcript";
 interface SearchInput {
   rows: readonly AgentTimelineRow[];
   query: string;
   cursor?: number;
+  scope?: TimelineSearchScope;
+  /** Rows the requesting client can render; a hit in any other row could never be shown. */
+  include?: (item: AgentTimelineRow["item"]) => boolean;
 }
 
 // Discovery is deliberately approximate. Only the client can verify displayed text, so
@@ -56,24 +72,48 @@ function countMatches(text: string, pattern: RegExp): number {
   return count;
 }
 
-export async function searchTimeline({ rows, query, cursor = 0 }: SearchInput) {
+function countMessageMatches(item: AgentTimelineRow["item"], pattern: RegExp): number {
+  if (item.type !== "user_message" && item.type !== "assistant_message") return 0;
+  const raw = item.text.replace(/\r/g, "");
+  const blocks = item.type === "assistant_message" ? searchableBlocks(raw) : [raw];
+  return blocks.reduce((sum, block) => sum + countMatches(block, pattern), 0);
+}
+
+// Literal and case-insensitive over the item's visible text, exactly as the app's
+// `findTranscriptMatches` scans a loaded row.
+function countTranscriptMatches(item: AgentTimelineRow["item"], query: string): number {
+  return findTextOccurrences(timelineItemSearchText(item), query, TIMELINE_SEARCH_MATCH_LIMIT)
+    .length;
+}
+
+export async function searchTimeline({
+  rows,
+  query,
+  cursor = 0,
+  scope = "messages",
+  include,
+}: SearchInput) {
   const locations: SearchLocation[] = [];
-  if (!query.trim()) return { locations, nextCursor: null };
-  const pattern = searchPattern(query);
+  const transcript = scope === "transcript";
+  if (transcript ? !query : !query.trim()) return { locations, nextCursor: null };
+  const pattern = transcript ? null : searchPattern(query);
   let lastYield = performance.now();
   for (const entry of projectTimelineRows({ rows, mode: "projected" })) {
     if (entry.seqEnd <= cursor) continue;
     const item = entry.item;
-    if (item.type !== "user_message" && item.type !== "assistant_message") continue;
-    const raw = item.text.replace(/\r/g, "");
-    const blocks = item.type === "assistant_message" ? searchableBlocks(raw) : [raw];
-    const count = blocks.reduce((sum, block) => sum + countMatches(block, pattern), 0);
+    let count = 0;
+    if (!include || include(item)) {
+      count = pattern ? countMessageMatches(item, pattern) : countTranscriptMatches(item, query);
+    }
     if (count) {
       if (locations.length === PAGE_SIZE) {
         return { locations, nextCursor: locations[PAGE_SIZE - 1]!.seq };
       }
       locations.push({
         seq: entry.seqEnd,
+        // The wire role is user|assistant; reasoning, tasks and notices are the agent's
+        // side of the turn. Only the transcript scope returns them, and its caller
+        // steps by seq, not by role.
         role: item.type === "user_message" ? "user" : "assistant",
         count,
       });

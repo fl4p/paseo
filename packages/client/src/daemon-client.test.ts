@@ -1673,7 +1673,7 @@ test("lists the full agent prompt index", async () => {
   });
 });
 
-test("searches an agent's whole timeline and returns the daemon's hits", async () => {
+async function connectSearchClient() {
   const logger = createMockLogger();
   const mock = createMockTransport();
   const client = new DaemonClient({
@@ -1684,32 +1684,41 @@ test("searches an agent's whole timeline and returns the daemon's hits", async (
     transportFactory: () => mock.transport,
   });
   clients.push(client);
-
   const connectPromise = client.connect();
   mock.triggerOpen();
   await connectPromise;
+  return { client, mock };
+}
 
-  const responsePromise = client.searchAgentTimeline("agent-1", "widget", {
-    requestId: "req-search-1",
-  });
+test("searches an agent's whole timeline with the requested scope and returns the daemon's hits", async () => {
+  const { client, mock } = await connectSearchClient();
 
-  expect(parseSentFrame(mock.sent[0])).toEqual({
-    type: "agent.timeline.search.request",
-    requestId: "req-search-1",
+  const responsePromise = client.searchAgentTimeline({
     agentId: "agent-1",
     query: "widget",
+    cursor: 200,
+    scope: "transcript",
+  });
+
+  const sent = parseSentFrame(mock.sent[0]) as { requestId: string };
+  expect(sent).toEqual({
+    type: "agent.timeline.search.request",
+    requestId: expect.any(String),
+    agentId: "agent-1",
+    query: "widget",
+    cursor: 200,
+    scope: "transcript",
   });
 
   mock.triggerMessage(
     wrapSessionMessage({
       type: "agent.timeline.search.response",
       payload: {
-        requestId: "req-search-1",
+        requestId: sent.requestId,
         agentId: "agent-1",
         epoch: "epoch-1",
-        query: "widget",
-        matches: [{ seqStart: 3, seqEnd: 4, occurrence: 1 }],
-        truncated: false,
+        locations: [{ seq: 3, role: "assistant", count: 2 }],
+        nextCursor: null,
         error: null,
       },
     }),
@@ -1717,41 +1726,26 @@ test("searches an agent's whole timeline and returns the daemon's hits", async (
 
   await expect(responsePromise).resolves.toMatchObject({
     epoch: "epoch-1",
-    matches: [{ seqStart: 3, seqEnd: 4, occurrence: 1 }],
-    truncated: false,
+    locations: [{ seq: 3, role: "assistant", count: 2 }],
+    nextCursor: null,
   });
 });
 
 test("rejects a timeline search the daemon could not run", async () => {
-  const logger = createMockLogger();
-  const mock = createMockTransport();
-  const client = new DaemonClient({
-    url: "ws://test",
-    clientId: "clsk_unit_test",
-    logger,
-    reconnect: { enabled: false },
-    transportFactory: () => mock.transport,
-  });
-  clients.push(client);
+  const { client, mock } = await connectSearchClient();
 
-  const connectPromise = client.connect();
-  mock.triggerOpen();
-  await connectPromise;
-
-  const responsePromise = client.searchAgentTimeline("agent-1", "widget", {
-    requestId: "req-search-2",
-  });
+  const responsePromise = client.searchAgentTimeline({ agentId: "agent-1", query: "widget" });
+  const sent = parseSentFrame(mock.sent[0]) as { requestId: string };
 
   mock.triggerMessage(
     wrapSessionMessage({
       type: "agent.timeline.search.response",
       payload: {
-        requestId: "req-search-2",
+        requestId: sent.requestId,
         agentId: "agent-1",
         epoch: "",
-        query: "widget",
-        matches: [],
-        truncated: false,
+        locations: [],
+        nextCursor: null,
         error: "Agent not found",
       },
     }),

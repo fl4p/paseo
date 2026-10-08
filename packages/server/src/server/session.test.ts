@@ -5524,6 +5524,176 @@ test("delivers a discarded prompt to every socket source, viewing that agent or 
   expect(discards.map((entry) => entry.source)).toEqual([viewingSocket, elsewhereSocket]);
 });
 
+/**
+ * The app routes agent_stream only through owned timeline observations, which drop untagged
+ * messages, so a source that asked for `agent_prompt_discarded` gets the discard as that session
+ * event — exactly once, viewing the agent or not — and never also as the agent_stream form.
+ */
+test("delivers a discarded prompt once as a session event to every source that subscribed to it", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    messages,
+    targetedMessages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  const viewingSocket = {};
+  const elsewhereSocket = {};
+  const olderSocket = {};
+  for (const socket of [viewingSocket, elsewhereSocket, olderSocket]) {
+    session.updateClientCapabilities({ selective_agent_timeline: true }, socket);
+  }
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agent-discarded"],
+      requestId: "timeline-viewing",
+    },
+    viewingSocket,
+  );
+  // A second, overlapping observation of the same agent from the same source.
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agent-discarded", "agent-other"],
+      requestId: "timeline-viewing-again",
+    },
+    viewingSocket,
+  );
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agent-other"],
+      requestId: "timeline-elsewhere",
+    },
+    elsewhereSocket,
+  );
+  for (const socket of [viewingSocket, elsewhereSocket]) {
+    await session.handleMessage(
+      {
+        type: "session.events.set_subscription.request",
+        events: ["agent_prompt_discarded"],
+        requestId: "events-discarded",
+      },
+      socket,
+    );
+  }
+  targetedMessages.length = 0;
+  messages.length = 0;
+
+  if (agentEventListeners.length === 0) throw new Error("Agent event listener was not installed");
+  for (const listener of agentEventListeners) {
+    listener({
+      type: "agent_stream",
+      agentId: "agent-discarded",
+      event: {
+        type: "prompt_discarded",
+        provider: "mock",
+        clientMessageId: "client-message-3",
+        reason: "Message not sent: you stopped the agent",
+      },
+    });
+  }
+
+  const discardsFor = (source: object) =>
+    targetedMessages
+      .filter((entry) => entry.source === source)
+      .map((entry) => entry.message)
+      .filter(
+        (message) =>
+          message.type === "agent_prompt_discarded" ||
+          (message.type === "agent_stream" && message.payload.event.type === "prompt_discarded"),
+      );
+  for (const source of [viewingSocket, elsewhereSocket]) {
+    expect(discardsFor(source)).toEqual([
+      {
+        type: "agent_prompt_discarded",
+        payload: {
+          agentId: "agent-discarded",
+          clientMessageId: "client-message-3",
+          reason: "Message not sent: you stopped the agent",
+        },
+      },
+    ]);
+  }
+  // A client that never asked for the event keeps the agent_stream form it understands.
+  expect(discardsFor(olderSocket)).toMatchObject([
+    {
+      type: "agent_stream",
+      payload: {
+        agentId: "agent-discarded",
+        event: { type: "prompt_discarded", clientMessageId: "client-message-3" },
+      },
+    },
+  ]);
+  expect(messages).toEqual([]);
+});
+
+test("delivers a discarded prompt once as a session event on the single-source path", async () => {
+  const messages: SessionOutboundMessage[] = [];
+  const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];
+  const session = createSessionForTest({
+    messages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        agentEventListeners.push(listener);
+        return () => {};
+      }),
+    },
+  });
+  session.updateClientCapabilities({ selective_agent_timeline: true });
+  await session.handleMessage({
+    type: "agent.timeline.set_subscription.request",
+    agentIds: ["agent-viewed"],
+    requestId: "timeline-single",
+  });
+  await session.handleMessage({
+    type: "session.events.set_subscription.request",
+    events: ["agent_prompt_discarded"],
+    requestId: "events-single",
+  });
+  messages.length = 0;
+
+  if (agentEventListeners.length === 0) throw new Error("Agent event listener was not installed");
+  for (const agentId of ["agent-viewed", "agent-elsewhere"]) {
+    for (const listener of agentEventListeners) {
+      listener({
+        type: "agent_stream",
+        agentId,
+        event: {
+          type: "prompt_discarded",
+          provider: "mock",
+          clientMessageId: `client-${agentId}`,
+          reason: "Message not sent: the agent was closed",
+        },
+      });
+    }
+  }
+
+  expect(
+    messages.filter(
+      (message) =>
+        message.type === "agent_prompt_discarded" ||
+        (message.type === "agent_stream" && message.payload.event.type === "prompt_discarded"),
+    ),
+  ).toEqual(
+    ["agent-viewed", "agent-elsewhere"].map((agentId) => ({
+      type: "agent_prompt_discarded",
+      payload: {
+        agentId,
+        clientMessageId: `client-${agentId}`,
+        reason: "Message not sent: the agent was closed",
+      },
+    })),
+  );
+});
+
 test("unions viewed timelines across socket sources and removes detached sources", async () => {
   const messages: SessionOutboundMessage[] = [];
   const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];

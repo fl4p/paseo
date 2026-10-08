@@ -1303,6 +1303,21 @@ export class Session {
     return serializedEvent.type === "prompt_discarded";
   }
 
+  /**
+   * A source that subscribed to the `agent_prompt_discarded` session event receives the discard
+   * there, independent of which timelines it observes, so it must not also receive the
+   * `prompt_discarded` agent_stream form. `source` is omitted on the single-source path.
+   */
+  private receivesDiscardAsEvent(
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+    source?: object,
+  ): boolean {
+    return (
+      serializedEvent.type === "prompt_discarded" &&
+      this.wantsEvent("agent_prompt_discarded", source)
+    );
+  }
+
   private buildAttentionRequiredMessage(
     agentId: string,
     serializedEvent: Extract<
@@ -1322,6 +1337,33 @@ export class Session {
     };
   }
 
+  /** Per-source exclusions from the agent_stream form of an event. */
+  private withholdsStreamFrom(
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+    source: object,
+  ): boolean {
+    if (serializedEvent.type === "timeline")
+      return !this.supportsTimelineItem(serializedEvent.item, source);
+    return this.receivesDiscardAsEvent(serializedEvent, source);
+  }
+
+  private emitPromptDiscarded(
+    agentId: string,
+    serializedEvent: Extract<
+      Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
+      { type: "prompt_discarded" }
+    >,
+  ): void {
+    this.emit({
+      type: "agent_prompt_discarded",
+      payload: {
+        agentId,
+        clientMessageId: serializedEvent.clientMessageId,
+        reason: serializedEvent.reason,
+      },
+    });
+  }
+
   private forwardAgentStream(
     event: Extract<AgentManagerEvent, { type: "agent_stream" }>,
     serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
@@ -1329,6 +1371,9 @@ export class Session {
     const attention = serializedEvent.type === "attention_required";
     if (attention) {
       this.emit(this.buildAttentionRequiredMessage(event.agentId, serializedEvent));
+    }
+    if (serializedEvent.type === "prompt_discarded") {
+      this.emitPromptDiscarded(event.agentId, serializedEvent);
     }
     const message: SessionOutboundMessage = {
       type: "agent_stream",
@@ -1343,22 +1388,14 @@ export class Session {
           this.supportsForSource(CLIENT_CAPS.selectiveAgentTimeline, source))
       )
         continue;
-      if (
-        serializedEvent.type === "timeline" &&
-        !this.supportsTimelineItem(serializedEvent.item, source)
-      )
-        continue;
+      if (this.withholdsStreamFrom(serializedEvent, source)) continue;
       subscription.owner.emit(message);
     }
     // COMPAT(ownedSubscriptions): added in v0.8.0, remove implicit timeline delivery after 2027-03-09.
     for (const [source, { capabilities }] of this.clientSources) {
       if (this.delivery.isModern(source) || capabilities.has(CLIENT_CAPS.selectiveAgentTimeline))
         continue;
-      if (
-        serializedEvent.type === "timeline" &&
-        !this.supportsTimelineItem(serializedEvent.item, source)
-      )
-        continue;
+      if (this.withholdsStreamFrom(serializedEvent, source)) continue;
       const alreadyDelivered = [...this.timelineSubscriptions.values()].some(
         (subscription) =>
           subscription.owner.source === source && subscription.agentIds.has(event.agentId),
@@ -1368,11 +1405,12 @@ export class Session {
     if (
       this.clientSources.size === 0 &&
       !this.supports(CLIENT_CAPS.selectiveAgentTimeline) &&
-      this.timelineSubscriptions.size === 0
+      this.timelineSubscriptions.size === 0 &&
+      !this.receivesDiscardAsEvent(serializedEvent)
     )
       this.emit(message);
     if (this.ignoresViewedTimeline(serializedEvent)) {
-      this.forwardComposerEventBeyondTimelines(event.agentId, message);
+      this.forwardComposerEventBeyondTimelines(event.agentId, serializedEvent, message);
     }
   }
 
@@ -1381,9 +1419,14 @@ export class Session {
    * that the timeline routing above skipped because it is not subscribed to this agent's timeline.
    * Legacy clients already received it through the implicit delivery, and subscribed clients
    * through their subscription.
+   *
+   * COMPAT(promptDiscardedEvents): this untagged form only serves clients that predate the
+   * `agent_prompt_discarded` session event; a source subscribed to that event got it there.
+   * Owned-subscription clients do not route untagged agent_stream messages to timelines at all.
    */
   private forwardComposerEventBeyondTimelines(
     agentId: string,
+    serializedEvent: Extract<SessionOutboundMessage, { type: "agent_stream" }>["payload"]["event"],
     message: SessionOutboundMessage,
   ): void {
     const subscribedSources = new Set<object>();
@@ -1392,6 +1435,7 @@ export class Session {
     }
     for (const [source, { capabilities }] of this.clientSources) {
       if (subscribedSources.has(source)) continue;
+      if (this.receivesDiscardAsEvent(serializedEvent, source)) continue;
       const selective =
         this.delivery.isModern(source) || capabilities.has(CLIENT_CAPS.selectiveAgentTimeline);
       if (!selective) continue;
@@ -1400,6 +1444,7 @@ export class Session {
     if (
       this.clientSources.size === 0 &&
       subscribedSources.size === 0 &&
+      !this.receivesDiscardAsEvent(serializedEvent) &&
       (this.supports(CLIENT_CAPS.selectiveAgentTimeline) || this.timelineSubscriptions.size > 0)
     )
       this.emit(message);
@@ -7847,7 +7892,13 @@ export class Session {
         direction: "tail",
         limit: 1,
       });
-      const result = await searchTimeline({ rows, query: msg.query, cursor: msg.cursor });
+      const result = await searchTimeline({
+        rows,
+        query: msg.query,
+        cursor: msg.cursor,
+        scope: msg.scope,
+        include: (item) => this.supportsTimelineItem(item, source),
+      });
       if (
         this.agentManager.fetchTimeline(msg.agentId, { direction: "tail", limit: 1 }).epoch !==
         epoch
@@ -8764,6 +8815,7 @@ function sessionEventCategory(message: SessionOutboundMessage): SessionEventSubs
     case "project.update":
     case "providers_snapshot_update":
     case "agent_attention_required":
+    case "agent_prompt_discarded":
     case "agent_permission_request":
     case "agent_permission_resolved":
     case "checkout_status_update":
@@ -8806,6 +8858,10 @@ function legacyWantsEvent(
     case "agent_permission_request":
     case "agent_permission_resolved":
       return !capabilities.has(CLIENT_CAPS.explicitEventSubscriptions);
+    // Only clients that ask for it by name know this message; everyone else keeps the
+    // `prompt_discarded` agent_stream form.
+    case "agent_prompt_discarded":
+      return false;
     case "agent.provider_subagents.update":
       return capabilities.has(CLIENT_CAPS.providerSubagents);
     default:

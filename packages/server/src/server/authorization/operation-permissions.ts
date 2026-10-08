@@ -254,6 +254,7 @@ const OUTBOUND_PERMISSION = {
   "agent.timeline.set_subscription.response": ["workspace.read", "hub.execute"],
   agent_archived: ["workspace.read", "hub.execute"],
   agent_attention_required: ["workspace.read", "hub.execute"],
+  agent_prompt_discarded: ["workspace.read", "hub.execute"],
   agent_deleted: ["workspace.read", "hub.execute"],
   agent_permission_request: ["workspace.read", "hub.execute"],
   agent_permission_resolved: ["workspace.write", "hub.execute"],

@@ -675,6 +675,8 @@ export interface AgentTimelineSearchOptions {
   agentId: string;
   query: string;
   cursor?: number;
+  /** `transcript` adds reasoning, tasks, notices and errors to the messages searched. */
+  scope?: "messages" | "transcript";
 }
 
 export type AgentTimelineSearchPayload = Extract<
@@ -3290,11 +3292,12 @@ export class DaemonClient {
     agentId,
     query,
     cursor,
+    scope,
   }: AgentTimelineSearchOptions): Promise<AgentTimelineSearchPayload> {
     const requestId = this.createRequestId();
     const payload = await this.sendCorrelatedSessionRequest({
       requestId,
-      message: { type: "agent.timeline.search.request", requestId, agentId, query, cursor },
+      message: { type: "agent.timeline.search.request", requestId, agentId, query, cursor, scope },
       responseType: "agent.timeline.search.response",
     });
     if (payload.error) throw new Error(payload.error);

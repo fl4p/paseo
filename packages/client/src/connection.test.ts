@@ -1027,3 +1027,79 @@ test("subscribeFile returns its initial version without calling the change callb
     await h.client.close();
   }
 });
+
+/**
+ * A discarded prompt retires a pending composer submission, so it must reach the app whether or
+ * not that agent's timeline is observed. Timeline observations only route messages tagged with
+ * their subscription ID, so an untagged discard never reaches them; the discard therefore travels
+ * as its own session event, delivered through an event subscription.
+ */
+test("an untagged discarded prompt never reaches a timeline observation", async () => {
+  const h = connection();
+  try {
+    const connected = h.client.connect();
+    h.open();
+    await connected;
+    const timeline = h.client.observeTimeline(["agent-viewed"]);
+    await timeline.ready;
+    const received: unknown[] = [];
+    timeline.subscribe({ snapshot: () => {}, update: (message) => received.push(message) });
+    h.receive({
+      type: "agent_stream",
+      payload: {
+        agentId: "agent-elsewhere",
+        timestamp: "2026-10-08T00:00:00Z",
+        event: {
+          type: "prompt_discarded",
+          provider: "mock",
+          clientMessageId: "client-message-1",
+          reason: "Message not sent: the agent was closed",
+        },
+      },
+    });
+    expect(received).toEqual([]);
+    await timeline.release();
+  } finally {
+    await h.client.close();
+  }
+});
+
+test("a discarded prompt reaches its event observer once, without a timeline observation", async () => {
+  const h = connection();
+  try {
+    const connected = h.client.connect();
+    h.open();
+    await connected;
+    const observation = h.client.observeEvents(["agent_prompt_discarded"]);
+    await observation.ready;
+    expect(h.sent.at(-1)?.message).toMatchObject({
+      type: "session.events.set_subscription.request",
+      events: ["agent_prompt_discarded"],
+    });
+    const received: unknown[] = [];
+    observation.subscribe({ snapshot: () => {}, update: (message) => received.push(message) });
+    h.receive({
+      type: "agent_prompt_discarded",
+      payload: {
+        subscriptionId: observation.subscriptionId,
+        agentId: "agent-elsewhere",
+        clientMessageId: "client-message-1",
+        reason: "Message not sent: the agent was closed",
+      },
+    });
+    expect(received).toEqual([
+      {
+        type: "agent_prompt_discarded",
+        payload: {
+          subscriptionId: observation.subscriptionId,
+          agentId: "agent-elsewhere",
+          clientMessageId: "client-message-1",
+          reason: "Message not sent: the agent was closed",
+        },
+      },
+    ]);
+    await observation.release();
+  } finally {
+    await h.client.close();
+  }
+});
