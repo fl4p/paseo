@@ -5,6 +5,7 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readFileSync,
   readSync,
   rmSync,
   writeFileSync,
@@ -2898,6 +2899,84 @@ describe("PiRpcAgentClient", () => {
     await session.deleteForkedProviderSession?.(forkResult!);
     expect(existsSync(forkResult!.providerHandleId)).toBe(false);
     expect(existsSync(sessionFile)).toBe(true);
+  });
+
+  test("forks at a live assistant message whose id was minted before Pi sent its response id", async () => {
+    const testDir = mkdtempSync(path.join(tmpdir(), "paseo-pi-session-test-"));
+    onTestFinished(() => rmSync(testDir, { recursive: true, force: true }));
+    const sessionFile = path.join(testDir, "test-session.jsonl");
+    const transcript = [
+      JSON.stringify({ type: "session", version: 3, id: "session-1", cwd: testDir }),
+      JSON.stringify({
+        type: "message",
+        id: "u1",
+        parentId: null,
+        message: { role: "user", content: "hello" },
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "a1",
+        parentId: "u1",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "world" }],
+          responseId: "chatcmpl-1",
+          stopReason: "stop",
+        },
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "u2",
+        parentId: "a1",
+        message: { role: "user", content: "again" },
+      }),
+      JSON.stringify({
+        type: "message",
+        id: "a2",
+        parentId: "u2",
+        message: {
+          role: "assistant",
+          content: [{ type: "text", text: "later" }],
+          responseId: "chatcmpl-2",
+          stopReason: "stop",
+        },
+      }),
+    ].join("\n");
+    writeFileSync(sessionFile, transcript, "utf8");
+
+    const { pi, session, events } = await createSession();
+    (session as unknown as { state: { sessionFile: string } }).state.sessionFile = sessionFile;
+    const fakeSession = pi.latestSession();
+
+    // Pi >=0.84: message_start precedes the first chunk, so it has no responseId,
+    // and text deltas carry no message.
+    await session.startTurn("hello");
+    fakeSession.emit({ type: "message_start", message: { role: "assistant", content: [] } });
+    fakeSession.emit({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "world" },
+    });
+    fakeSession.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "world" }],
+        responseId: "chatcmpl-1",
+        stopReason: "stop",
+      },
+    });
+
+    const [liveItem] = events.timelineItems();
+    const liveMessageId = (liveItem as { messageId: string }).messageId;
+    expect(liveMessageId).not.toBe("chatcmpl-1");
+
+    const forkResult = await session.forkProviderSession?.({ boundaryMessageId: liveMessageId });
+    const forkedIds = readFileSync(forkResult!.providerHandleId, "utf8")
+      .trim()
+      .split("\n")
+      .slice(1)
+      .map((line) => (JSON.parse(line) as { id: string }).id);
+    expect(forkedIds).toEqual(["u1", "a1"]);
   });
 });
 

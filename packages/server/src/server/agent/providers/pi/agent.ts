@@ -1246,6 +1246,10 @@ export class PiRpcAgentSession implements AgentSession {
   private activeTurnId: string | null = null;
   private activeClientMessageId: string | null = null;
   private activeAssistantMessageId: string | null = null;
+  // Pi >=0.84 streams text deltas without the message, so a live assistant
+  // message may get a minted id before its responseId is known. Map the minted
+  // id to the responseId at message_end so a fork can still find the entry.
+  private readonly assistantMessageIdAliases = new Map<string, string>();
   private activeTurnStarted = false;
   private activeTurnStartedEmitted = false;
   private pendingSettledMessages: PiAgentMessage[] | null = null;
@@ -1566,7 +1570,7 @@ export class PiRpcAgentSession implements AgentSession {
     }
     const fork = await forkPiSession({
       sourceSessionPath,
-      boundaryMessageId: input.boundaryMessageId,
+      boundaryMessageId: this.resolveTranscriptMessageId(input.boundaryMessageId),
       atCompletedTurn: input.atCompletedTurn,
       logger: this.logger,
     });
@@ -1590,7 +1594,16 @@ export class PiRpcAgentSession implements AgentSession {
       return null;
     }
     const content = await fsPromises.readFile(sessionPath, "utf8");
-    return readPiCompactionSummary(content, { untilMessageId: input?.untilMessageId ?? null });
+    return readPiCompactionSummary(content, {
+      untilMessageId: this.resolveTranscriptMessageId(input?.untilMessageId),
+    });
+  }
+
+  private resolveTranscriptMessageId(messageId: string | null | undefined): string | null {
+    if (!messageId) {
+      return null;
+    }
+    return this.assistantMessageIdAliases.get(messageId) ?? messageId;
   }
 
   async interrupt(): Promise<void> {
@@ -2522,6 +2535,14 @@ export class PiRpcAgentSession implements AgentSession {
     turnId: string | undefined,
   ): void {
     if (event.message.role === "assistant") {
+      const responseId = event.message.responseId;
+      if (
+        this.activeAssistantMessageId &&
+        responseId &&
+        this.activeAssistantMessageId !== responseId
+      ) {
+        this.assistantMessageIdAliases.set(this.activeAssistantMessageId, responseId);
+      }
       this.activeAssistantMessageId = null;
       return;
     }
