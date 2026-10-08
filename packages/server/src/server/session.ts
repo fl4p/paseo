@@ -1740,6 +1740,7 @@ export class Session {
       this.delivery.hasDemand("timelines") ||
       this.voiceSessions.hasDemand ||
       this.wantsEvent("agent_attention_required") ||
+      this.wantsEvent("agent_prompt_discarded") ||
       this.wantsEvent("agent_permission_request") ||
       this.wantsEvent("agent_permission_resolved") ||
       this.wantsEvent("agent.provider_subagents.update");

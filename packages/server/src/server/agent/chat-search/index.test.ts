@@ -169,3 +169,10 @@ it("pages transcript hits with the same cursor contract", async () => {
     nextCursor: null,
   });
 });
+
+it("reports one hit past the cap for a saturated transcript row", async () => {
+  const source = rows([{ type: "reasoning", text: "needle ".repeat(5001) }]);
+  const result = await searchTimeline({ rows: source, query: "needle", scope: "transcript" });
+  // 5000 is the app's ceiling; the extra hit lets it mark the result truncated.
+  expect(result.locations).toEqual([{ seq: 1, role: "assistant", count: 5001 }]);
+});

@@ -13,8 +13,9 @@ export interface PromptDiscard {
  * session event rather than through `observeTimeline`. A daemon delivers it to an event
  * subscriber in this form only, never also as the `prompt_discarded` agent_stream event.
  *
- * Only call this against a daemon that advertises `features.promptDiscardedEvents`: older
- * daemons reject an event subscription that names an event they do not know.
+ * Safe against any daemon: the connection only requests the event from a daemon that advertises
+ * `features.promptDiscardedEvents`, re-deciding on every reconnect (`@getpaseo/client`
+ * connection/index.ts). Older daemons keep the agent_stream form, handled by the timeline path.
  */
 export function observePromptDiscards(
   client: Pick<DaemonClient, "observeEvents">,

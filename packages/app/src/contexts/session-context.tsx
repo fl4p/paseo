@@ -227,9 +227,6 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   const updateSessionServerInfo = useSessionStore((state) => state.updateSessionServerInfo);
   const setViewedTimelineSync = useSessionStore((state) => state.setViewedTimelineSync);
   const upsertWorkspaceSetupProgress = useWorkspaceSetupStore((state) => state.upsertProgress);
-  const supportsPromptDiscardEvents = useSessionStore(
-    (state) => state.sessions[serverId]?.serverInfo?.features?.promptDiscardedEvents === true,
-  );
 
   // Track focused agent for heartbeat
   const focusedAgentId = useSessionStore(
@@ -515,12 +512,13 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
   // Rejecting the submission is the only signal that retires the pending composer row
   // (see composer/submission/model.ts), whether or not this agent's chat is open; the daemon
   // also writes a timeline row saying why.
-  useEffect(() => {
-    if (!supportsPromptDiscardEvents) return;
-    return observePromptDiscards(client, ({ agentId, clientMessageId }) => {
-      useSessionStore.getState().rejectAgentMessageSubmission(serverId, agentId, clientMessageId);
-    });
-  }, [client, serverId, supportsPromptDiscardEvents]);
+  useEffect(
+    () =>
+      observePromptDiscards(client, ({ agentId, clientMessageId }) => {
+        useSessionStore.getState().rejectAgentMessageSubmission(serverId, agentId, clientMessageId);
+      }),
+    [client, serverId],
+  );
 
   // Daemon message handlers - directly update Zustand store
   useEffect(() => {

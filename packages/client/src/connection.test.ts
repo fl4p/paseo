@@ -11,6 +11,8 @@ function connection(
     broadcasts?: boolean;
     browserHost?: { hostKind: string; supportedCommands: string[] };
     acknowledgeTimelineReads?: boolean;
+    /** Read at every hello, so a test can reconnect to a different daemon. */
+    features?: Record<string, unknown>;
   } = {},
 ) {
   const sent: Array<{
@@ -47,6 +49,7 @@ function connection(
                   workspaceMultiplicity: options.workspaceMultiplicity ?? true,
                   selectiveAgentTimeline: !options.broadcasts,
                   explicitEventSubscriptions: !options.broadcasts,
+                  ...options.features,
                 },
               },
             },
@@ -1065,7 +1068,7 @@ test("an untagged discarded prompt never reaches a timeline observation", async 
 });
 
 test("a discarded prompt reaches its event observer once, without a timeline observation", async () => {
-  const h = connection();
+  const h = connection({ features: { promptDiscardedEvents: true } });
   try {
     const connected = h.client.connect();
     h.open();
@@ -1097,6 +1100,58 @@ test("a discarded prompt reaches its event observer once, without a timeline obs
           reason: "Message not sent: the agent was closed",
         },
       },
+    ]);
+    await observation.release();
+  } finally {
+    await h.client.close();
+  }
+});
+
+/**
+ * Owned-subscriptions daemons reject a whole event subscription that names an event they do not
+ * know, and observations are replayed on every reconnect, before any app code sees the new
+ * server info. The connection itself must therefore drop events the daemon does not advertise.
+ */
+test("event observations omit events the daemon does not advertise, on every replay", async () => {
+  const features: Record<string, unknown> = { promptDiscardedEvents: true };
+  const h = connection({ features });
+  const eventRequests = () =>
+    h.sent
+      .map((frame) => frame.message)
+      .filter((message) => message?.type === "session.events.set_subscription.request");
+  try {
+    const connected = h.client.connect();
+    h.open();
+    await connected;
+    const observation = h.client.observeEvents([
+      "agent_attention_required",
+      "agent_prompt_discarded",
+    ]);
+    await observation.ready;
+    expect(eventRequests().at(-1)?.events).toEqual([
+      "agent_attention_required",
+      "agent_prompt_discarded",
+    ]);
+
+    // Reconnect to a daemon that supports owned subscriptions but predates the event.
+    delete features.promptDiscardedEvents;
+    h.disconnect();
+    const reconnecting = h.client.connect();
+    h.open();
+    await reconnecting;
+    await expect.poll(() => eventRequests().length).toBe(2);
+    expect(eventRequests().at(-1)?.events).toEqual(["agent_attention_required"]);
+
+    // And back to one that has it.
+    features.promptDiscardedEvents = true;
+    h.disconnect();
+    const restoring = h.client.connect();
+    h.open();
+    await restoring;
+    await expect.poll(() => eventRequests().length).toBe(3);
+    expect(eventRequests().at(-1)?.events).toEqual([
+      "agent_attention_required",
+      "agent_prompt_discarded",
     ]);
     await observation.release();
   } finally {

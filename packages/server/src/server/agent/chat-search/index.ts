@@ -80,9 +80,10 @@ function countMessageMatches(item: AgentTimelineRow["item"], pattern: RegExp): n
 }
 
 // Literal and case-insensitive over the item's visible text, exactly as the app's
-// `findTranscriptMatches` scans a loaded row.
+// `findTranscriptMatches` scans a loaded row. Counts one occurrence past the cap so a
+// saturated row still tells the caller its hit list was truncated.
 function countTranscriptMatches(item: AgentTimelineRow["item"], query: string): number {
-  return findTextOccurrences(timelineItemSearchText(item), query, TIMELINE_SEARCH_MATCH_LIMIT)
+  return findTextOccurrences(timelineItemSearchText(item), query, TIMELINE_SEARCH_MATCH_LIMIT + 1)
     .length;
 }
 

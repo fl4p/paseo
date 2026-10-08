@@ -5694,6 +5694,120 @@ test("delivers a discarded prompt once as a session event on the single-source p
   );
 });
 
+function createDiscardProducerFixture() {
+  const targetedMessages: Array<{ source: object; message: SessionOutboundMessage }> = [];
+  // Only listeners that are currently subscribed: a producer the session released stops hearing.
+  const activeListeners = new Set<(event: AgentManagerEvent) => void>();
+  const session = createSessionForTest({
+    messages: [],
+    targetedMessages,
+    agentManager: {
+      subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
+        activeListeners.add(listener);
+        return () => {
+          activeListeners.delete(listener);
+        };
+      }),
+    },
+  });
+  const discard = (clientMessageId: string) => {
+    for (const listener of activeListeners) {
+      listener({
+        type: "agent_stream",
+        agentId: "agent-discarded",
+        event: {
+          type: "prompt_discarded",
+          provider: "mock",
+          clientMessageId,
+          reason: "Message not sent: the agent was closed",
+        },
+      });
+    }
+  };
+  const discardsFor = (source: object) =>
+    targetedMessages
+      .filter((entry) => entry.source === source && entry.message.type === "agent_prompt_discarded")
+      .map((entry) =>
+        entry.message.type === "agent_prompt_discarded"
+          ? entry.message.payload.clientMessageId
+          : "",
+      );
+  const subscriptionIdOf = (requestId: string) => {
+    for (const { message } of targetedMessages) {
+      if (
+        "payload" in message &&
+        message.payload &&
+        typeof message.payload === "object" &&
+        "requestId" in message.payload &&
+        message.payload.requestId === requestId &&
+        "subscriptionId" in message.payload &&
+        typeof message.payload.subscriptionId === "string"
+      )
+        return message.payload.subscriptionId;
+    }
+    throw new Error(`No subscription acknowledged for ${requestId}`);
+  };
+  return { session, discard, discardsFor, subscriptionIdOf };
+}
+
+const OWNED_CLIENT = {
+  [CLIENT_CAPS.ownedSubscriptions]: true,
+  [CLIENT_CAPS.selectiveAgentTimeline]: true,
+  [CLIENT_CAPS.explicitEventSubscriptions]: true,
+};
+
+test("an owned-subscriptions client observing only discards starts the agent event producer", async () => {
+  const { session, discard, discardsFor } = createDiscardProducerFixture();
+  const socket = {};
+  session.updateClientCapabilities(OWNED_CLIENT, socket);
+  await session.handleMessage(
+    {
+      type: "session.events.set_subscription.request",
+      events: ["agent_prompt_discarded"],
+      requestId: "events-only-discards",
+    },
+    socket,
+  );
+
+  discard("client-message-only");
+
+  expect(discardsFor(socket)).toEqual(["client-message-only"]);
+});
+
+test("releasing the last timeline keeps the agent event producer for an active discard subscription", async () => {
+  const { session, discard, discardsFor, subscriptionIdOf } = createDiscardProducerFixture();
+  const socket = {};
+  session.updateClientCapabilities(OWNED_CLIENT, socket);
+  await session.handleMessage(
+    {
+      type: "agent.timeline.set_subscription.request",
+      agentIds: ["agent-discarded"],
+      requestId: "timeline-then-released",
+    },
+    socket,
+  );
+  await session.handleMessage(
+    {
+      type: "session.events.set_subscription.request",
+      events: ["agent_prompt_discarded"],
+      requestId: "events-outlives-timeline",
+    },
+    socket,
+  );
+  await session.handleMessage(
+    {
+      type: "subscription.release.request",
+      requestId: "release-timeline",
+      subscriptionId: subscriptionIdOf("timeline-then-released"),
+    },
+    socket,
+  );
+
+  discard("client-message-after-release");
+
+  expect(discardsFor(socket)).toEqual(["client-message-after-release"]);
+});
+
 test("unions viewed timelines across socket sources and removes detached sources", async () => {
   const messages: SessionOutboundMessage[] = [];
   const agentEventListeners: Array<(event: AgentManagerEvent) => void> = [];

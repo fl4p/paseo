@@ -7,13 +7,26 @@ import {
 import { LegacySubscriptions, type ObservationRequest } from "./legacy.js";
 import {
   type SessionInboundMessage,
+  type SessionEventSubscription,
   type SessionOutboundMessage,
   type ServerInfoStatusPayload,
 } from "@getpaseo/protocol/messages";
 import { CLIENT_CAPS, type ClientCapability } from "@getpaseo/protocol/client-capabilities";
 
+/**
+ * Session events newer than owned subscriptions, keyed to the server feature that advertises
+ * them. An owned-subscriptions daemon rejects a whole event subscription that names an event it
+ * does not know, so an event is only requested from a daemon that advertises it.
+ */
+const EVENT_FEATURES: Partial<
+  Record<SessionEventSubscription, keyof NonNullable<ServerInfoStatusPayload["features"]>>
+> = {
+  agent_prompt_discarded: "promptDiscardedEvents",
+};
+
 export class ConnectionSubscriptions extends OwnedSubscriptions {
   private legacy: LegacySubscriptions | null = null;
+  private features: ServerInfoStatusPayload["features"];
 
   constructor(
     private readonly connection: OwnedSubscriptionsHost & {
@@ -35,6 +48,7 @@ export class ConnectionSubscriptions extends OwnedSubscriptions {
     capabilities?: Partial<Record<ClientCapability, unknown>>,
   ): void {
     if (info) {
+      this.features = info.features;
       const clientCapabilities = capabilities ?? DEFAULT_CLIENT_CAPABILITIES;
       const owned =
         info.features?.ownedSubscriptions === true &&
@@ -65,7 +79,8 @@ export class ConnectionSubscriptions extends OwnedSubscriptions {
     return super.observe(
       async (accept) => {
         const legacy = this.legacy;
-        if (!legacy) return request(query, accept);
+        // Filtered at every start: observations replay on reconnect, possibly to another daemon.
+        if (!legacy) return request(this.advertised(query), accept);
         const interest = legacy.start(query);
         const snapshot = (payload: T): T & { subscriptionId: string } => ({
           ...payload,
@@ -96,6 +111,18 @@ export class ConnectionSubscriptions extends OwnedSubscriptions {
       signal,
       failed,
     );
+  }
+
+  private advertised(query: ObservationRequest): ObservationRequest {
+    if (query.type !== "session.events.set_subscription.request") return query;
+    const events = query.events as SessionEventSubscription[];
+    return {
+      ...query,
+      events: events.filter((event) => {
+        const feature = EVENT_FEATURES[event];
+        return !feature || this.features?.[feature] === true;
+      }),
+    };
   }
 
   override owns(message: SessionOutboundMessage): boolean {
