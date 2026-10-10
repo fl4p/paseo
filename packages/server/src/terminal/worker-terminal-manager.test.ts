@@ -968,3 +968,172 @@ it("removes a killed worker terminal from terminalExit without duplicate snapsho
     },
   ]);
 });
+
+function createRespawnHarness(): {
+  workers: FakeTerminalWorker[];
+  forkWorker: () => FakeTerminalWorker;
+} {
+  const workers: FakeTerminalWorker[] = [];
+  return {
+    workers,
+    forkWorker: () => {
+      const worker = new FakeTerminalWorker();
+      workers.push(worker);
+      return worker;
+    },
+  };
+}
+
+function respondToRequest(
+  worker: FakeTerminalWorker,
+  type: TerminalWorkerRequest["type"],
+  result: unknown,
+): void {
+  const request = worker.sentMessages.find((message) => message.type === type);
+  if (!request) {
+    throw new Error(`Worker never received a ${type} request`);
+  }
+  worker.emitWorkerMessage({
+    type: "response",
+    requestId: request.requestId,
+    ok: true,
+    result,
+  });
+}
+
+function createTerminalResult(id: string): {
+  terminal: {
+    id: string;
+    name: string;
+    cwd: string;
+    workspaceId: string;
+    activity: TerminalActivity;
+  };
+  state: TerminalState;
+} {
+  return {
+    terminal: {
+      id,
+      name: "Terminal",
+      cwd: "/tmp",
+      workspaceId: "ws-test",
+      activity: { state: "idle", changedAt: 0 },
+    },
+    state: createTerminalState(),
+  };
+}
+
+it("forks a replacement worker after the worker exits on its own", async () => {
+  const { workers, forkWorker } = createRespawnHarness();
+  manager = createWorkerTerminalManager({ forkWorker });
+  expect(workers).toHaveLength(1);
+
+  workers[0]!.connected = false;
+  workers[0]!.emit("exit", 1, null);
+
+  const created = manager.createTerminal({
+    workspaceId: "ws-test",
+    cwd: "/tmp",
+    ...nodeTerminalCommand("setInterval(() => {}, 1000);"),
+  });
+  expect(workers).toHaveLength(2);
+  respondToRequest(workers[1]!, "createTerminal", createTerminalResult("terminal-respawned"));
+
+  const session = await created;
+  expect(session.id).toBe("terminal-respawned");
+  expect(manager.getTerminal("terminal-respawned")).toBeDefined();
+});
+
+it("stays down after killAll instead of respawning the worker", async () => {
+  const { workers, forkWorker } = createRespawnHarness();
+  manager = createWorkerTerminalManager({ forkWorker });
+
+  manager.killAll();
+
+  await expect(
+    manager.createTerminal({
+      workspaceId: "ws-test",
+      cwd: "/tmp",
+      ...nodeTerminalCommand("setInterval(() => {}, 1000);"),
+    }),
+  ).rejects.toThrow("Terminal worker is not running");
+  expect(workers).toHaveLength(1);
+  manager = null;
+});
+
+it("reports the terminals of an exited worker as gone", async () => {
+  const { workers, forkWorker } = createRespawnHarness();
+  manager = createWorkerTerminalManager({ forkWorker });
+
+  workers[0]!.emitWorkerMessage({
+    type: "terminalCreated",
+    terminal: {
+      id: "terminal-1",
+      name: "Terminal",
+      cwd: "/tmp",
+      workspaceId: "ws-test",
+      activity: { state: "idle", changedAt: 0 },
+    },
+    state: createTerminalState(),
+  });
+  const session = manager.getTerminal("terminal-1");
+  expect(session).toBeDefined();
+
+  const exits: Array<number | null> = [];
+  session!.onExit((info) => exits.push(info.exitCode));
+  const changedEvents: string[] = [];
+  manager.subscribeTerminalsChanged((event) => changedEvents.push(event.cwd));
+
+  workers[0]!.connected = false;
+  workers[0]!.emit("exit", 1, null);
+
+  expect(exits).toEqual([null]);
+  expect(manager.getTerminal("terminal-1")).toBeUndefined();
+  expect(changedEvents).toContain("/tmp");
+  expect(await manager.getTerminals("/tmp")).toEqual([]);
+});
+
+it("replays registered cwd env to the replacement worker", async () => {
+  const { workers, forkWorker } = createRespawnHarness();
+  manager = createWorkerTerminalManager({ forkWorker });
+  manager.registerCwdEnv({ cwd: "/tmp", env: { PASEO_TEST_ENV: "1" } });
+
+  workers[0]!.connected = false;
+  workers[0]!.emit("exit", 1, null);
+
+  void manager.createTerminal({
+    workspaceId: "ws-test",
+    cwd: "/tmp",
+    ...nodeTerminalCommand("setInterval(() => {}, 1000);"),
+  });
+  respondToRequest(workers[1]!, "createTerminal", createTerminalResult("terminal-env"));
+
+  const replayed = workers[1]!.sentMessages.filter(
+    (message) => message.type === "registerCwdEnv",
+  );
+  expect(replayed).toHaveLength(1);
+  expect(replayed[0]).toMatchObject({ cwd: "/tmp", env: { PASEO_TEST_ENV: "1" } });
+  // The env has to reach the worker before the request that needed it.
+  expect(workers[1]!.sentMessages[0]!.type).toBe("registerCwdEnv");
+});
+
+it("does not fork a worker just to shut a dead one down", async () => {
+  const { workers, forkWorker } = createRespawnHarness();
+  manager = createWorkerTerminalManager({ forkWorker });
+
+  workers[0]!.connected = false;
+  workers[0]!.emit("exit", 1, null);
+
+  manager.killAll();
+
+  expect(workers).toHaveLength(1);
+  await expect(
+    manager.createTerminal({
+      workspaceId: "ws-test",
+      cwd: "/tmp",
+      ...nodeTerminalCommand("setInterval(() => {}, 1000);"),
+    }),
+  ).rejects.toThrow("Terminal worker is not running");
+  expect(workers).toHaveLength(1);
+  manager = null;
+});

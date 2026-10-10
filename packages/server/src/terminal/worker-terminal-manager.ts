@@ -150,7 +150,7 @@ function forkTerminalWorker(): TerminalWorkerProcess {
 export function createWorkerTerminalManager(
   managerOptions: WorkerTerminalManagerOptions = {},
 ): TerminalManager {
-  const worker = managerOptions.forkWorker ? managerOptions.forkWorker() : forkTerminalWorker();
+  const forkWorker = managerOptions.forkWorker ?? forkTerminalWorker;
   const requestTimeoutMs = managerOptions.requestTimeoutMs ?? REQUEST_TIMEOUT_MS;
   const pendingRequests = new Map<string, PendingRequest>();
   const recordsById = new Map<string, WorkerTerminalRecord>();
@@ -160,7 +160,14 @@ export function createWorkerTerminalManager(
   const terminalActivityListeners = new Set<TerminalActivityListener>();
   const terminalWorkspaceContributionChangedListeners =
     new Set<TerminalWorkspaceContributionChangedListener>();
+  // Env registered per cwd lives in the worker process. Mirror it here so a
+  // replacement worker starts out knowing what the dead one knew.
+  const cwdEnvByCwd = new Map<string, Record<string, string>>();
+  let worker: TerminalWorkerProcess;
   let workerExited = false;
+  // Set by killAll: an intentional shutdown must stay down. Only an
+  // unsolicited worker exit is recoverable.
+  let shuttingDown = false;
   let workerShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
   function emitTerminalsChanged(event: TerminalsChangedEvent): void {
@@ -588,34 +595,79 @@ export function createWorkerTerminalManager(
     }
   }
 
-  worker.on("message", (message: TerminalWorkerToParentMessage) => {
-    if (isResponse(message)) {
-      const pending = pendingRequests.get(message.requestId);
-      if (!pending) {
+  // A worker exit takes every pty in it. The records here are the parent's
+  // mirror of those ptys, so report each one as exited and drop it; otherwise
+  // consumers keep listing terminals that no longer exist anywhere.
+  function failAllRecords(): void {
+    for (const terminalId of Array.from(recordsById.keys())) {
+      handleTerminalExitEvent({
+        type: "terminalExit",
+        terminalId,
+        info: { exitCode: null, signal: null, lastOutputLines: [] },
+      });
+    }
+  }
+
+  function attachWorker(nextWorker: TerminalWorkerProcess): void {
+    worker = nextWorker;
+    workerExited = false;
+
+    nextWorker.on("message", (message: TerminalWorkerToParentMessage) => {
+      // A message from a worker we already replaced must not touch current state.
+      if (nextWorker !== worker) {
         return;
       }
-      clearTimeout(pending.timeout);
-      pendingRequests.delete(message.requestId);
-      if (message.ok) {
-        pending.resolve(message.result);
-      } else {
-        pending.reject(new Error(message.error));
+      if (isResponse(message)) {
+        const pending = pendingRequests.get(message.requestId);
+        if (!pending) {
+          return;
+        }
+        clearTimeout(pending.timeout);
+        pendingRequests.delete(message.requestId);
+        if (message.ok) {
+          pending.resolve(message.result);
+        } else {
+          pending.reject(new Error(message.error));
+        }
+        return;
       }
+      handleWorkerEvent(message);
+    });
+
+    nextWorker.on("exit", (code, signal) => {
+      if (nextWorker !== worker) {
+        return;
+      }
+      workerExited = true;
+      if (workerShutdownTimer) {
+        clearTimeout(workerShutdownTimer);
+        workerShutdownTimer = null;
+      }
+      rejectPendingRequests(new Error(`Terminal worker exited (${signal ?? code ?? "unknown"})`));
+      failAllRecords();
+    });
+  }
+
+  // Replace a worker that exited on its own. Lazy, driven by the next request,
+  // so a worker that dies instantly costs one fork per request instead of
+  // spinning a respawn loop.
+  function ensureWorker(): void {
+    if (!workerExited && worker.connected) {
       return;
     }
-    handleWorkerEvent(message);
-  });
-
-  worker.on("exit", (code, signal) => {
-    workerExited = true;
-    if (workerShutdownTimer) {
-      clearTimeout(workerShutdownTimer);
-      workerShutdownTimer = null;
+    attachWorker(forkWorker());
+    for (const [cwd, env] of cwdEnvByCwd) {
+      sendBestEffortRequest({ type: "registerCwdEnv", cwd, env });
     }
-    rejectPendingRequests(new Error(`Terminal worker exited (${signal ?? code ?? "unknown"})`));
-  });
+  }
+
+  attachWorker(forkWorker());
 
   function sendRequest(input: TerminalWorkerRequestInput): Promise<unknown> {
+    if (shuttingDown) {
+      return Promise.reject(new Error("Terminal worker is not running"));
+    }
+    ensureWorker();
     if (workerExited || !worker.connected) {
       return Promise.reject(new Error("Terminal worker is not running"));
     }
@@ -712,6 +764,7 @@ export function createWorkerTerminalManager(
     },
 
     registerCwdEnv(options: { cwd: string; env: Record<string, string> }): void {
+      cwdEnvByCwd.set(options.cwd, options.env);
       sendBestEffortRequest({
         type: "registerCwdEnv",
         cwd: options.cwd,
@@ -814,7 +867,20 @@ export function createWorkerTerminalManager(
     },
 
     killAll(): void {
-      void sendRequest({ type: "killAll" })
+      // Nothing to kill, and asking would fork a worker just to shut it down.
+      if (shuttingDown || workerExited || !worker.connected) {
+        shuttingDown = true;
+        for (const terminalId of Array.from(recordsById.keys())) {
+          removeRecord(terminalId);
+        }
+        return;
+      }
+      // sendRequest hands the message to the worker synchronously, so flipping
+      // the flag straight after still gets the killAll out while closing the
+      // window where a racing request could respawn the worker we just killed.
+      const killAllRequest = sendRequest({ type: "killAll" });
+      shuttingDown = true;
+      void killAllRequest
         .catch(() => {
           // no-op
         })
