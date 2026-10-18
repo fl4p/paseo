@@ -72,7 +72,7 @@ import {
   streamPiHistory,
   type PiCapturedUserMessageEntry,
 } from "./history-mapper.js";
-import { materializeProviderImage } from "../provider-image-output.js";
+import { materializeProviderImage, renderProviderImageOutputAsAssistantMarkdown } from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
 import { shouldDisplayPiCustomMessage } from "./custom-message.js";
 import {
@@ -99,6 +99,7 @@ import {
   mapToolDetail,
   parseToolArgs,
   parseToolResult,
+  splitPiToolResultImages,
   type PiToolResult,
   type PiTrackedToolCall,
 } from "./tool-call-mapper.js";
@@ -2408,8 +2409,11 @@ export class PiRpcAgentSession implements AgentSession {
       this.activeToolCalls.get(event.toolCallId) ?? parseToolArgs(event.toolName, null);
     this.activeToolCalls.delete(event.toolCallId);
 
-    const result = parseToolResult(event.result);
-    const error = event.isError ? event.result : null;
+    // Pull image blocks out of the result so base64 never reaches the tool output, then render
+    // each one as an assistant_message markdown image after the tool_call (mirroring the Claude
+    // provider, upstream #1717).
+    const { images, result } = splitPiToolResultImages(parseToolResult(event.result));
+    const error = event.isError ? result : null;
     const status = event.isError ? "failed" : "completed";
     this.extensionHost.onToolEnd({
       callId: event.toolCallId,
@@ -2419,6 +2423,19 @@ export class PiRpcAgentSession implements AgentSession {
       result,
     });
     this.emitToolCallEvent(event.toolCallId, toolCall, status, result, error);
+    for (const image of images) {
+      const imageItem = renderProviderImageOutputAsAssistantMarkdown(image, {
+        materialize: materializeProviderImage,
+      });
+      if (imageItem) {
+        this.emit({
+          type: "timeline",
+          provider: this.provider,
+          turnId: this.currentTurnIdForEvent(),
+          item: imageItem,
+        });
+      }
+    }
   }
 
   private emitCompactionTimeline(input: {
