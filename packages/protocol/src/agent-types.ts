@@ -393,8 +393,23 @@ export interface AgentTaskItem {
   activeForm?: string;
 }
 
+export interface PeerMessageOrigin {
+  kind: "peer";
+  name?: string;
+  address?: string;
+}
+
 export type AgentTimelineItem =
-  | { type: "user_message"; text: string; messageId?: string; clientMessageId?: string }
+  | {
+      type: "user_message";
+      text: string;
+      messageId?: string;
+      clientMessageId?: string;
+      origin?: PeerMessageOrigin;
+      prefixTokens?: number;
+      prefixTrunkDelta?: number;
+      isInitialPrefix?: boolean;
+    }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }
   | ToolCallTimelineItem

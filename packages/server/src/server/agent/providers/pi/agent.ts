@@ -68,7 +68,6 @@ import {
 import {
   materializeProviderImage,
   renderProviderImageOutputAsAssistantMarkdown,
-  type ProviderImageOutput,
 } from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
 import {
@@ -1210,6 +1209,13 @@ export class PiRpcAgentSession implements AgentSession {
   private activePromptRequestId: string | null = null;
   private readonly pendingPromptResults = new Map<string, boolean>();
   private readonly pendingSteerSubmissions: PiPendingSteerSubmission[] = [];
+  private activeUserMessage: {
+    text: string;
+    messageId?: string;
+    clientMessageId?: string;
+    turnId: string;
+  } | null = null;
+  private hasRecordedInitialPrefix = false;
   currentLeafOverrideId: string | null | undefined;
   private readonly treeUserEntriesById = new Map<string, PiCapturedEntry>();
   private readonly pendingExtensionResults = new Map<string, PendingExtensionResult>();
@@ -1248,6 +1254,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.runtimeSession = options.runtimeSession;
     this.config = options.config;
     this.state = options.initialState;
+    this.hasRecordedInitialPrefix = (options.initialState.messageCount ?? 0) > 0;
     this.config.thinkingOptionId = this.state.thinkingLevel;
     this.capabilities = options.capabilities;
     this.provider = PI_PROVIDER;
@@ -1821,6 +1828,11 @@ export class PiRpcAgentSession implements AgentSession {
     const outputs = this.pendingNoTurnOutputs.filter((output) => output.turnId === turnId);
     this.clearNoTurnBuffers();
     if (promptText) {
+      this.activeUserMessage = {
+        text: promptText,
+        clientMessageId: this.activeClientMessageId ?? undefined,
+        turnId,
+      };
       this.emit({
         type: "timeline",
         provider: this.provider,
@@ -2040,10 +2052,17 @@ export class PiRpcAgentSession implements AgentSession {
     const clientMessageId = pendingSteer
       ? pendingSteer.clientMessageId
       : this.activeClientMessageId;
+    const turnId = this.currentTurnIdForEvent();
+    this.activeUserMessage = {
+      text: entry.text,
+      messageId: entry.id,
+      clientMessageId: clientMessageId ?? undefined,
+      turnId: turnId ?? randomUUID(),
+    };
     this.emit({
       type: "timeline",
       provider: this.provider,
-      turnId: this.currentTurnIdForEvent(),
+      turnId,
       item: {
         type: "user_message",
         text: entry.text,
@@ -2580,13 +2599,65 @@ export class PiRpcAgentSession implements AgentSession {
       });
       return;
     }
+    const userMessage = this.activeUserMessage;
+    this.activeUserMessage = null;
+
+    const { isFirst, emitted } = this.emitUserMessagePrefixTokens(turnId, userMessage, messages);
+
     const finalUsage = this.usagePoller.completeTurn(turnId);
     this.emit({
       type: "turn_completed",
       provider: this.provider,
       turnId,
     });
-    void this.refreshAfterTurn(finalUsage);
+    void this.refreshAfterTurn(finalUsage, userMessage, isFirst, emitted);
+  }
+
+  private emitUserMessagePrefixTokens(
+    turnId: string | undefined,
+    userMessage: typeof this.activeUserMessage,
+    messages: PiAgentMessage[],
+  ): { isFirst: boolean; emitted: boolean } {
+    let promptTokens: number | undefined;
+    let cachedTokens: number | undefined;
+
+    for (let i = 0; i < messages.length; i++) {
+      const m = messages[i];
+      if (m?.role === "assistant") {
+        const u = (m as { usage?: { input?: number; cacheRead?: number } }).usage;
+        if (typeof u?.input === "number") {
+          promptTokens = u.input;
+          cachedTokens = u.cacheRead;
+          break;
+        }
+      }
+    }
+
+    const isFirst = !this.hasRecordedInitialPrefix;
+    let emitted = false;
+
+    if (userMessage && typeof promptTokens === "number" && promptTokens > 0) {
+      this.hasRecordedInitialPrefix = true;
+      const tokensAdded =
+        isFirst || !cachedTokens ? promptTokens : Math.max(0, promptTokens - cachedTokens);
+      this.emit({
+        type: "timeline",
+        provider: this.provider,
+        turnId,
+        item: {
+          type: "user_message",
+          text: userMessage.text,
+          ...(userMessage.messageId ? { messageId: userMessage.messageId } : {}),
+          ...(userMessage.clientMessageId ? { clientMessageId: userMessage.clientMessageId } : {}),
+          prefixTokens: tokensAdded,
+          prefixTrunkDelta: tokensAdded,
+          isInitialPrefix: isFirst,
+        },
+      });
+      emitted = true;
+    }
+
+    return { isFirst, emitted };
   }
 
   private async refreshState(): Promise<void> {
@@ -2594,8 +2665,44 @@ export class PiRpcAgentSession implements AgentSession {
     this.config.thinkingOptionId = this.state.thinkingLevel;
   }
 
-  private async refreshAfterTurn(finalUsage: Promise<void>): Promise<void> {
-    await Promise.all([this.refreshState().catch(() => undefined), finalUsage]);
+  private async refreshAfterTurn(
+    finalUsage: Promise<void>,
+    userMessage?: typeof this.activeUserMessage,
+    isFirst?: boolean,
+    alreadyEmittedPrefixTokens?: boolean,
+  ): Promise<void> {
+    await Promise.all([
+      this.refreshState().catch(() => undefined),
+      finalUsage,
+      (async () => {
+        if (!alreadyEmittedPrefixTokens && userMessage) {
+          const stats = await this.runtimeSession.getSessionStats().catch(() => null);
+          const inputTokens = stats?.tokens?.input;
+          const cachedTokens = stats?.tokens?.cacheRead;
+          if (typeof inputTokens === "number" && inputTokens > 0) {
+            this.hasRecordedInitialPrefix = true;
+            const tokensAdded =
+              isFirst || !cachedTokens ? inputTokens : Math.max(0, inputTokens - cachedTokens);
+            this.emit({
+              type: "timeline",
+              provider: this.provider,
+              turnId: userMessage.turnId,
+              item: {
+                type: "user_message",
+                text: userMessage.text,
+                ...(userMessage.messageId ? { messageId: userMessage.messageId } : {}),
+                ...(userMessage.clientMessageId
+                  ? { clientMessageId: userMessage.clientMessageId }
+                  : {}),
+                prefixTokens: tokensAdded,
+                prefixTrunkDelta: tokensAdded,
+                isInitialPrefix: isFirst,
+              },
+            });
+          }
+        }
+      })(),
+    ]);
   }
 }
 

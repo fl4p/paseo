@@ -25,4 +25,30 @@ describe("timelineItemIdentity", () => {
     ).toBe("review/row-1");
     expect(timelineItemIdentity({ type: "reasoning", text: "hi" })).toBeNull();
   });
+
+  it("identifies user messages preferring clientMessageId over messageId", () => {
+    expect(
+      timelineItemIdentity({
+        type: "user_message",
+        text: "hello",
+        clientMessageId: "cli-1",
+        messageId: "msg-1",
+      }),
+    ).toBe("user_message:cli-1");
+
+    expect(
+      timelineItemIdentity({
+        type: "user_message",
+        text: "hello",
+        messageId: "msg-1",
+      }),
+    ).toBe("user_message:msg-1");
+
+    expect(
+      timelineItemIdentity({
+        type: "user_message",
+        text: "hello",
+      }),
+    ).toBeNull();
+  });
 });

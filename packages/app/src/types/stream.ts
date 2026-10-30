@@ -105,6 +105,10 @@ export interface UserMessageItem {
   timestamp: Date;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
+  origin?: PeerMessageOrigin;
+  prefixTokens?: number;
+  prefixTrunkDelta?: number;
+  isInitialPrefix?: boolean;
 }
 
 export interface UserMessageInput {
@@ -117,6 +121,10 @@ export interface UserMessageInput {
   timestamp: Date;
   images?: UserMessageImageAttachment[];
   attachments?: AgentAttachment[];
+  origin?: PeerMessageOrigin;
+  prefixTokens?: number;
+  prefixTrunkDelta?: number;
+  isInitialPrefix?: boolean;
 }
 
 export function createUserMessage(input: UserMessageInput): UserMessageItem {
@@ -137,6 +145,10 @@ export function createUserMessage(input: UserMessageInput): UserMessageItem {
     ...(input.attachments && input.attachments.length > 0
       ? { attachments: input.attachments }
       : {}),
+    ...(input.origin ? { origin: input.origin } : {}),
+    ...(input.prefixTokens !== undefined ? { prefixTokens: input.prefixTokens } : {}),
+    ...(input.prefixTrunkDelta !== undefined ? { prefixTrunkDelta: input.prefixTrunkDelta } : {}),
+    ...(input.isInitialPrefix !== undefined ? { isInitialPrefix: input.isInitialPrefix } : {}),
   };
 }
 
@@ -233,6 +245,22 @@ interface UserMessageProductionResult {
   matched: boolean;
 }
 
+function userMessagesEqual(a: UserMessageItem, b: UserMessageItem): boolean {
+  return (
+    a.id === b.id &&
+    a.clientMessageId === b.clientMessageId &&
+    a.messageId === b.messageId &&
+    a.timelineCursor === b.timelineCursor &&
+    a.text === b.text &&
+    a.timestamp === b.timestamp &&
+    a.images === b.images &&
+    a.attachments === b.attachments &&
+    a.prefixTokens === b.prefixTokens &&
+    a.prefixTrunkDelta === b.prefixTrunkDelta &&
+    a.isInitialPrefix === b.isInitialPrefix
+  );
+}
+
 function produceUserMessage(
   items: StreamItem[],
   incoming: UserMessageItem,
@@ -265,17 +293,11 @@ function produceUserMessage(
     clientMessageId: incoming.clientMessageId ?? existing.clientMessageId,
     messageId: incoming.messageId ?? existing.messageId,
     timelineCursor: incoming.timelineCursor ?? existing.timelineCursor,
+    prefixTokens: incoming.prefixTokens ?? existing.prefixTokens,
+    prefixTrunkDelta: incoming.prefixTrunkDelta ?? existing.prefixTrunkDelta,
+    isInitialPrefix: incoming.isInitialPrefix ?? existing.isInitialPrefix,
   });
-  if (
-    existing.id === merged.id &&
-    existing.clientMessageId === merged.clientMessageId &&
-    existing.messageId === merged.messageId &&
-    existing.timelineCursor === merged.timelineCursor &&
-    existing.text === merged.text &&
-    existing.timestamp === merged.timestamp &&
-    existing.images === merged.images &&
-    existing.attachments === merged.attachments
-  ) {
+  if (userMessagesEqual(existing, merged)) {
     return { items, index, message: existing, matched: true };
   }
   const next = [...items];
@@ -1911,6 +1933,10 @@ function applyCanonicalUserMessageEvent(params: {
     timelineCursor,
     text: normalized.chunk,
     timestamp,
+    origin: event.item.origin,
+    prefixTokens: event.item.prefixTokens,
+    prefixTrunkDelta: event.item.prefixTrunkDelta,
+    isInitialPrefix: event.item.isInitialPrefix,
   });
   if (unmatchedInsert === "head") {
     const reconciled = upsertUserMessageAcrossStream({

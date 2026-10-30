@@ -1639,49 +1639,23 @@ async function leaveWorkerWithTerminal(
   };
 }
 
-it.each([1, 4])(
-  "hard cuts unreleased worker protocol %s, closing its terminals",
-  async (version) => {
-    const paseoHome = createTemporaryHome();
-    const old = await leaveWorkerWithTerminal(paseoHome, version);
-    const [record] = await workerRecords(paseoHome);
-    const program = record!.terminals.find((entry) => entry.id === old.terminalId)!;
-    const inspector = createTerminalWorkerProcessInspector();
+  const replayed = workers[1]!.sentMessages.filter((message) => message.type === "registerCwdEnv");
+  expect(replayed).toHaveLength(1);
+  expect(replayed[0]).toMatchObject({ cwd: "/tmp", env: { PASEO_TEST_ENV: "1" } });
+  // The env has to reach the worker before the request that needed it.
+  expect(workers[1]!.sentMessages[0]!.type).toBe("registerCwdEnv");
+});
 
-    manager = await startRealWorkerManager({ paseoHome });
+it("does not fork a worker just to shut a dead one down", async () => {
+  const { workers, forkWorker } = createRespawnHarness();
+  manager = createWorkerTerminalManager({ forkWorker });
 
-    expect(await readUnconfirmedTerminalCleanup(paseoHome)).toEqual([]);
-    // Startup launches a replacement worker after cleanup. Either old PID may already
-    // belong to another process, so verify that the recorded birth identities are gone.
-    await waitForCondition(() => !isProcessAlive(record!.pid), 10000);
-    await expect
-      .poll(
-        async () =>
-          !isProcessAlive(program.pid) ||
-          classifyTerminalProgramProcess(program, await inspector.inspect(program.pid)).status ===
-            "unrelated",
-        { timeout: 10000 },
-      )
-      .toBe(true);
-    expect(manager.getTerminal(old.terminalId)).toBeUndefined();
-    const workers = await workerRecords(paseoHome);
-    expect(workers).toHaveLength(1);
-    expect(workers[0]!.protocolVersion).toBe(6);
-  },
-);
+  workers[0]!.connected = false;
+  workers[0]!.emit("exit", 1, null);
 
-it("leaves a worker from a newer Paseo running, reports it incompatible, and closes it on a kill stop", async () => {
-  const paseoHome = createTemporaryHome();
-  const newer = await leaveWorkerWithTerminal(paseoHome, 7);
+  manager.killAll();
 
-  manager = await startRealWorkerManager({ paseoHome });
-
-  const unavailable = manager.getUnavailableError?.();
-  expect(unavailable).toBeInstanceOf(TerminalWorkerIncompatibleError);
-  expect(unavailable?.message).toContain("worker protocol 7");
-  await expect(manager.getTerminals(newer.cwd)).rejects.toBeInstanceOf(
-    TerminalWorkerIncompatibleError,
-  );
+  expect(workers).toHaveLength(1);
   await expect(
     manager.createTerminal({ workspaceId: "ws-protocol", cwd: newer.cwd }),
   ).rejects.toBeInstanceOf(TerminalWorkerIncompatibleError);

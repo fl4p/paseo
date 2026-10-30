@@ -108,6 +108,9 @@ interface UserMessageProps {
   isLastInGroup?: boolean;
   isPending?: boolean;
   disableOuterSpacing?: boolean;
+  prefixTokens?: number;
+  prefixTrunkDelta?: number;
+  isInitialPrefix?: boolean;
 }
 
 const MessageOuterSpacingContext = createContext(false);
@@ -371,6 +374,33 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     color: theme.colors.foregroundMuted,
     fontSize: STREAM_METADATA_FONT_SIZE,
   },
+  originRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: theme.spacing[2],
+  },
+  originRowExpanded: {
+    marginBottom: theme.spacing[2],
+  },
+  originChevronExpanded: {
+    transform: [{ rotate: "90deg" }],
+  },
+  originText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: STREAM_METADATA_FONT_SIZE,
+    flexShrink: 0,
+  },
+  originPreview: {
+    color: theme.colors.foregroundMuted,
+    fontSize: STREAM_METADATA_FONT_SIZE,
+    flex: 1,
+    minWidth: 0,
+  },
+  prefixBadgeText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: STREAM_METADATA_FONT_SIZE,
+    flexShrink: 1,
+  },
 }));
 
 interface UserMessageImagePillProps {
@@ -392,6 +422,108 @@ function UserMessageImagePill({ image, onOpen, accessibilityLabel }: UserMessage
 
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
 
+// Spacing rule shared by both preview containers; kept out of UserMessage to stay inside the
+// component's complexity budget (lint: 20).
+function previewSpacing(visible: boolean): { marginBottom: number } | undefined {
+  return visible ? userMessageStylesheet.imagePreviewSpacing : undefined;
+}
+
+// Group spacing for the message container, hoisted out of UserMessage for the same reason.
+function groupContainerStyle(
+  isFirstInGroup: boolean,
+  isLastInGroup: boolean,
+  disableOuterSpacing: boolean,
+): Array<{ marginTop?: number; marginBottom?: number } | null> | undefined {
+  if (disableOuterSpacing) return undefined;
+  return [
+    isFirstInGroup ? userMessageStylesheet.containerFirstInGroup : null,
+    isLastInGroup ? userMessageStylesheet.containerLastInGroup : null,
+    !isFirstInGroup || !isLastInGroup ? userMessageStylesheet.containerSpacing : null,
+  ];
+}
+
+/**
+ * A message from another session or a subagent is context, not the conversation: it starts as
+ * one line so it does not bury the reply it caused, and expands on demand.
+ */
+function usePeerMessageBody<TImage, TAttachment>(input: {
+  message: string;
+  origin: PeerMessageOrigin | undefined;
+  images: TImage[];
+  attachments: TAttachment[];
+}) {
+  const { message, origin, images, attachments } = input;
+  const [isExpanded, setIsExpanded] = useState(false);
+  const toggle = useCallback(() => setIsExpanded((expanded) => !expanded), []);
+  const displayMessage = useMemo(
+    () => (origin ? getPeerMessageDisplayText(message) : message),
+    [message, origin],
+  );
+  const preview = useMemo(() => getPeerMessagePreview(displayMessage), [displayMessage]);
+  const showBody = !origin || isExpanded;
+  return {
+    displayMessage,
+    preview,
+    isExpanded,
+    toggle,
+    bodyText: showBody ? displayMessage.trim() : "",
+    bodyImages: showBody ? images : [],
+    bodyAttachments: showBody ? attachments : [],
+  };
+}
+
+const PeerMessageHeader = memo(function PeerMessageHeader({
+  origin,
+  preview,
+  isExpanded,
+  onToggle,
+}: {
+  origin: PeerMessageOrigin;
+  preview: string;
+  isExpanded: boolean;
+  onToggle: () => void;
+}) {
+  const rowStyle = useMemo(
+    () => [
+      userMessageStylesheet.originRow,
+      isExpanded ? userMessageStylesheet.originRowExpanded : null,
+    ],
+    [isExpanded],
+  );
+  const accessibilityState = useMemo(() => ({ expanded: isExpanded }), [isExpanded]);
+  return (
+    <Pressable
+      style={rowStyle}
+      onPress={onToggle}
+      accessibilityRole="button"
+      accessibilityState={accessibilityState}
+      testID="user-message-origin-toggle"
+    >
+      <ThemedChevronRightIcon
+        size={12}
+        uniProps={foregroundMutedColorMapping}
+        style={isExpanded ? userMessageStylesheet.originChevronExpanded : undefined}
+      />
+      <ThemedBot size={12} />
+      <Text style={userMessageStylesheet.originText} testID="user-message-origin">
+        {getPeerMessageOriginLabel(origin)}
+      </Text>
+      {!isExpanded && preview ? (
+        <Text
+          style={userMessageStylesheet.originPreview}
+          numberOfLines={1}
+          testID="user-message-origin-preview"
+        >
+          {preview}
+        </Text>
+      ) : null}
+    </Pressable>
+  );
+});
+
+// The two merged features (peer-message origin collapse + prefix-token badges) each add a render
+// branch here; the helpers above absorb what could be hoisted, the rest is one component's JSX.
+// eslint-disable-next-line complexity
 export const UserMessage = memo(function UserMessage({
   itemId,
   sender,
@@ -408,6 +540,8 @@ export const UserMessage = memo(function UserMessage({
   isLastInGroup = true,
   isPending = false,
   disableOuterSpacing,
+  prefixTokens,
+  isInitialPrefix,
 }: UserMessageProps) {
   const isCompact = useIsCompactFormFactor();
   const { t } = useTranslation();
@@ -423,6 +557,7 @@ export const UserMessage = memo(function UserMessage({
   const hasImages = images.length > 0;
   const hasAttachments = attachments.length > 0;
   const showTrailingRow = !isPending && hasText && (isCompact || isNative || isHovered);
+
   const formattedTimestamp = useMemo(
     () => formatMessageTimestamp(new Date(timestamp)),
     [timestamp],
@@ -442,26 +577,16 @@ export const UserMessage = memo(function UserMessage({
   const containerStyle = useMemo(
     () => [
       userMessageStylesheet.container,
-      !resolvedDisableOuterSpacing && [
-        isFirstInGroup ? userMessageStylesheet.containerFirstInGroup : null,
-        isLastInGroup ? userMessageStylesheet.containerLastInGroup : null,
-        !isFirstInGroup || !isLastInGroup ? userMessageStylesheet.containerSpacing : null,
-      ],
+      groupContainerStyle(isFirstInGroup, isLastInGroup, resolvedDisableOuterSpacing),
     ],
     [resolvedDisableOuterSpacing, isFirstInGroup, isLastInGroup],
   );
   const imagePreviewContainerStyle = useMemo(
-    () => [
-      userMessageStylesheet.imagePreviewContainer,
-      hasText || hasAttachments ? userMessageStylesheet.imagePreviewSpacing : undefined,
-    ],
+    () => [userMessageStylesheet.imagePreviewContainer, previewSpacing(hasText || hasAttachments)],
     [hasAttachments, hasText],
   );
   const attachmentPreviewContainerStyle = useMemo(
-    () => [
-      userMessageStylesheet.attachmentPreviewContainer,
-      hasText ? userMessageStylesheet.imagePreviewSpacing : undefined,
-    ],
+    () => [userMessageStylesheet.attachmentPreviewContainer, previewSpacing(hasText)],
     [hasText],
   );
   const trailingRowStyle = useMemo(
@@ -527,6 +652,18 @@ export const UserMessage = memo(function UserMessage({
             pointerEvents={showTrailingRow ? "auto" : "none"}
             testID="user-message-trailing-row"
           >
+            {prefixTokens !== undefined ? (
+              <Text
+                numberOfLines={1}
+                ellipsizeMode="tail"
+                style={userMessageStylesheet.prefixBadgeText}
+                testID="user-message-prefix-tokens"
+              >
+                {isInitialPrefix
+                  ? `${prefixTokens.toLocaleString()} tokens initial prefill`
+                  : `+${prefixTokens.toLocaleString()} tokens`}
+              </Text>
+            ) : null}
             <Text style={userMessageStylesheet.timestampText} testID="user-message-timestamp">
               {formattedTimestamp}
             </Text>

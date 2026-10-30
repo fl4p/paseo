@@ -62,6 +62,23 @@ export function getUserMessageText(content: string | (PiTextContent | PiImageCon
   return textParts.join("\n\n");
 }
 
+function findRespondingAssistantUsage(
+  messages: readonly PiAgentMessage[],
+  startIndex: number,
+): { input?: number; cacheRead?: number } | undefined {
+  for (let j = startIndex; j < messages.length; j++) {
+    const next = messages[j];
+    if (!next || next.role === "user") break;
+    if (next.role === "assistant") {
+      const u = (next as { usage?: { input?: number; cacheRead?: number } }).usage;
+      if (typeof u?.input === "number") {
+        return u;
+      }
+    }
+  }
+  return undefined;
+}
+
 export class PiHistoryMapper {
   private readonly pendingToolCalls = new Map<string, PiTrackedToolCall>();
   private readonly hydrations: Promise<AgentStreamEvent[]>[] = [];
@@ -78,12 +95,27 @@ export class PiHistoryMapper {
 
   async mapMessages(messages: readonly PiAgentMessage[]): Promise<AgentStreamEvent[]> {
     const events: AgentStreamEvent[] = [];
+    let userTurnCount = 0;
 
-    for (const message of messages) {
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (!message) continue;
       switch (message.role) {
-        case "user":
-          events.push(...this.mapUserMessage(message));
+        case "user": {
+          let prefixTokens: number | undefined;
+          let isInitialPrefix: boolean | undefined;
+
+          const u = findRespondingAssistantUsage(messages, i + 1);
+          if (typeof u?.input === "number") {
+            const isFirst = userTurnCount === 0;
+            prefixTokens = isFirst || !u.cacheRead ? u.input : Math.max(0, u.input - u.cacheRead);
+            isInitialPrefix = isFirst;
+            userTurnCount += 1;
+          }
+
+          events.push(...this.mapUserMessage(message, prefixTokens, isInitialPrefix));
           break;
+        }
         case "custom":
           events.push(...this.mapCustomMessage(message));
           break;
@@ -107,7 +139,11 @@ export class PiHistoryMapper {
     return (await Promise.all(this.hydrations)).flat();
   }
 
-  private mapUserMessage(message: Extract<PiAgentMessage, { role: "user" }>): AgentStreamEvent[] {
+  private mapUserMessage(
+    message: Extract<PiAgentMessage, { role: "user" }>,
+    prefixTokens?: number,
+    isInitialPrefix?: boolean,
+  ): AgentStreamEvent[] {
     const text = getUserMessageText(message.content);
     this.userIndex += 1;
     if (!text) {
@@ -122,6 +158,10 @@ export class PiHistoryMapper {
           type: "user_message",
           text,
           ...(userEntry ? { messageId: userEntry.id } : {}),
+          ...(typeof prefixTokens === "number"
+            ? { prefixTokens, prefixTrunkDelta: prefixTokens }
+            : {}),
+          ...(isInitialPrefix !== undefined ? { isInitialPrefix } : {}),
         },
       },
     ];

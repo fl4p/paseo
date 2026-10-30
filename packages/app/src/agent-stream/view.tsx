@@ -733,6 +733,9 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
               item.clientMessageId !== undefined &&
               pendingClientMessageIds.has(item.clientMessageId)
             }
+            prefixTokens={item.prefixTokens}
+            prefixTrunkDelta={item.prefixTrunkDelta}
+            isInitialPrefix={item.isInitialPrefix}
           />
         );
       },
