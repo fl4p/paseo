@@ -136,6 +136,9 @@ interface UserMessageProps {
   isLastInGroup?: boolean;
   isPending?: boolean;
   disableOuterSpacing?: boolean;
+  prefixTokens?: number;
+  prefixTrunkDelta?: number;
+  isInitialPrefix?: boolean;
 }
 
 const MessageOuterSpacingContext = createContext(false);
@@ -433,6 +436,11 @@ const userMessageStylesheet = StyleSheet.create((theme) => ({
     flex: 1,
     minWidth: 0,
   },
+  prefixBadgeText: {
+    color: theme.colors.foregroundMuted,
+    fontSize: STREAM_METADATA_FONT_SIZE,
+    flexShrink: 1,
+  },
 }));
 
 interface UserMessageImagePillProps {
@@ -453,6 +461,26 @@ function UserMessageImagePill({ image, onOpen, accessibilityLabel }: UserMessage
 }
 
 const MESSAGE_TEXT_DATASET = { messageText: "true" };
+
+// Spacing rule shared by both preview containers; kept out of UserMessage to stay inside the
+// component's complexity budget (lint: 20).
+function previewSpacing(visible: boolean): { marginBottom: number } | undefined {
+  return visible ? userMessageStylesheet.imagePreviewSpacing : undefined;
+}
+
+// Group spacing for the message container, hoisted out of UserMessage for the same reason.
+function groupContainerStyle(
+  isFirstInGroup: boolean,
+  isLastInGroup: boolean,
+  disableOuterSpacing: boolean,
+): Array<{ marginTop?: number; marginBottom?: number } | null> | undefined {
+  if (disableOuterSpacing) return undefined;
+  return [
+    isFirstInGroup ? userMessageStylesheet.containerFirstInGroup : null,
+    isLastInGroup ? userMessageStylesheet.containerLastInGroup : null,
+    !isFirstInGroup || !isLastInGroup ? userMessageStylesheet.containerSpacing : null,
+  ];
+}
 
 /**
  * A message from another session or a subagent is context, not the conversation: it starts as
@@ -533,6 +561,9 @@ const PeerMessageHeader = memo(function PeerMessageHeader({
   );
 });
 
+// The two merged features (peer-message origin collapse + prefix-token badges) each add a render
+// branch here; the helpers above absorb what could be hoisted, the rest is one component's JSX.
+// eslint-disable-next-line complexity
 export const UserMessage = memo(function UserMessage({
   serverId,
   agentId,
@@ -548,6 +579,8 @@ export const UserMessage = memo(function UserMessage({
   isLastInGroup = true,
   isPending = false,
   disableOuterSpacing,
+  prefixTokens,
+  isInitialPrefix,
 }: UserMessageProps) {
   const isCompact = useIsCompactFormFactor();
   const { t } = useTranslation();
@@ -565,6 +598,7 @@ export const UserMessage = memo(function UserMessage({
   const hasImages = peer.bodyImages.length > 0;
   const hasAttachments = peer.bodyAttachments.length > 0;
   const showTrailingRow = !isPending && hasText && (isCompact || isNative || isHovered);
+
   const formattedTimestamp = useMemo(
     () => formatMessageTimestamp(new Date(timestamp)),
     [timestamp],
@@ -584,26 +618,16 @@ export const UserMessage = memo(function UserMessage({
   const containerStyle = useMemo(
     () => [
       userMessageStylesheet.container,
-      !resolvedDisableOuterSpacing && [
-        isFirstInGroup ? userMessageStylesheet.containerFirstInGroup : null,
-        isLastInGroup ? userMessageStylesheet.containerLastInGroup : null,
-        !isFirstInGroup || !isLastInGroup ? userMessageStylesheet.containerSpacing : null,
-      ],
+      groupContainerStyle(isFirstInGroup, isLastInGroup, resolvedDisableOuterSpacing),
     ],
     [resolvedDisableOuterSpacing, isFirstInGroup, isLastInGroup],
   );
   const imagePreviewContainerStyle = useMemo(
-    () => [
-      userMessageStylesheet.imagePreviewContainer,
-      hasText || hasAttachments ? userMessageStylesheet.imagePreviewSpacing : undefined,
-    ],
+    () => [userMessageStylesheet.imagePreviewContainer, previewSpacing(hasText || hasAttachments)],
     [hasAttachments, hasText],
   );
   const attachmentPreviewContainerStyle = useMemo(
-    () => [
-      userMessageStylesheet.attachmentPreviewContainer,
-      hasText ? userMessageStylesheet.imagePreviewSpacing : undefined,
-    ],
+    () => [userMessageStylesheet.attachmentPreviewContainer, previewSpacing(hasText)],
     [hasText],
   );
   const trailingRowStyle = useMemo(
@@ -674,6 +698,18 @@ export const UserMessage = memo(function UserMessage({
             pointerEvents={showTrailingRow ? "auto" : "none"}
             testID="user-message-trailing-row"
           >
+            {prefixTokens !== undefined ? (
+              <Text
+                numberOfLines={1}
+                ellipsizeMode="tail"
+                style={userMessageStylesheet.prefixBadgeText}
+                testID="user-message-prefix-tokens"
+              >
+                {isInitialPrefix
+                  ? `${prefixTokens.toLocaleString()} tokens initial prefill`
+                  : `+${prefixTokens.toLocaleString()} tokens`}
+              </Text>
+            ) : null}
             <Text style={userMessageStylesheet.timestampText} testID="user-message-timestamp">
               {formattedTimestamp}
             </Text>

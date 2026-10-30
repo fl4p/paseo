@@ -1108,9 +1108,7 @@ it("replays registered cwd env to the replacement worker", async () => {
   });
   respondToRequest(workers[1]!, "createTerminal", createTerminalResult("terminal-env"));
 
-  const replayed = workers[1]!.sentMessages.filter(
-    (message) => message.type === "registerCwdEnv",
-  );
+  const replayed = workers[1]!.sentMessages.filter((message) => message.type === "registerCwdEnv");
   expect(replayed).toHaveLength(1);
   expect(replayed[0]).toMatchObject({ cwd: "/tmp", env: { PASEO_TEST_ENV: "1" } });
   // The env has to reach the worker before the request that needed it.

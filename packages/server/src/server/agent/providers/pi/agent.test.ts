@@ -1037,6 +1037,103 @@ describe("PiRpcAgentSession", () => {
     ]);
   });
 
+  test("associates prefixTokens and prefixTrunkDelta with user message on turn completion", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("explain this");
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-1",
+      parentId: null,
+      text: "explain this",
+    });
+    fakeSession.finishTurn({
+      role: "assistant",
+      content: [{ type: "text", text: "Here is the explanation" }],
+      usage: { input: 12000, output: 45, cacheRead: 0 },
+    } as unknown as PiAgentMessage);
+    await events.nextTurnCompletion();
+
+    const userMessages = events.timelineItems().filter((item) => item.type === "user_message");
+    expect(userMessages.at(-1)).toEqual({
+      type: "user_message",
+      text: "explain this",
+      messageId: "entry-1",
+      prefixTokens: 12000,
+      prefixTrunkDelta: 12000,
+      isInitialPrefix: true,
+    });
+  });
+
+  test("uses the first assistant message's usage in turns with tool calls", async () => {
+    const { pi, session, events } = await createSession();
+    const fakeSession = pi.latestSession();
+    await session.startTurn("run tool");
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-tool-turn",
+      parentId: null,
+      text: "run tool",
+    });
+    // Multi-step turn: first assistant calls tool with input: 5000, second assistant responds with input: 8000
+    fakeSession.finishAgentRun({
+      message: {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call-1", name: "bash", arguments: {} }],
+        usage: { input: 5000, output: 20, cacheRead: 4800 },
+      } as unknown as PiAgentMessage,
+      willRetry: false,
+    });
+    fakeSession.messages.push({
+      role: "assistant",
+      content: [{ type: "text", text: "Tool finished" }],
+      usage: { input: 8000, output: 50, cacheRead: 7500 },
+    } as unknown as PiAgentMessage);
+    fakeSession.settleTurn();
+    await events.nextTurnCompletion();
+
+    const userMessages = events.timelineItems().filter((item) => item.type === "user_message");
+    expect(userMessages.at(-1)).toMatchObject({
+      type: "user_message",
+      text: "run tool",
+      messageId: "entry-tool-turn",
+      prefixTokens: 5000, // turn 1 initial prefill
+      isInitialPrefix: true,
+    });
+  });
+
+  test("does not mark initial prefix on resumed sessions with existing messages", async () => {
+    const pi = new FakePi();
+    pi.queueSessionSetup((session) => {
+      session.state = {
+        ...session.state,
+        messageCount: 5,
+      };
+    });
+    const { session, events } = await createSession(pi);
+    const fakeSession = pi.latestSession();
+    await session.startTurn("resumed turn");
+    fakeSession.finishSubmittedUserMessage({
+      id: "entry-resumed",
+      parentId: null,
+      text: "resumed turn",
+    });
+    fakeSession.finishTurn({
+      role: "assistant",
+      content: [{ type: "text", text: "Resumed answer" }],
+      usage: { input: 20000, output: 30, cacheRead: 19800 },
+    } as unknown as PiAgentMessage);
+    await events.nextTurnCompletion();
+
+    const userMessages = events.timelineItems().filter((item) => item.type === "user_message");
+    expect(userMessages.at(-1)).toMatchObject({
+      type: "user_message",
+      text: "resumed turn",
+      messageId: "entry-resumed",
+      prefixTokens: 200, // 20000 - 19800
+      prefixTrunkDelta: 200,
+      isInitialPrefix: false,
+    });
+  });
+
   test("keeps custom context in separate tools while a turn continues", async () => {
     const { pi, session, events } = await createSession();
     const runtime = pi.latestSession();
