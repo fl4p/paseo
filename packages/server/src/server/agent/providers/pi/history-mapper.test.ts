@@ -306,3 +306,75 @@ test("replayed Pi images keep their position before the following reply", async 
     ),
   ).toEqual(["tool_call", expect.stringContaining("![Image]("), "Image read complete."]);
 });
+
+// Restored from the fork (8f95ae791): history replay streams one message at a time since
+// upstream #8280, so the turn-start usage must still be found in the messages that follow.
+describe("Pi history prefix tokens", () => {
+  test("extracts prefixTokens and prefixTrunkDelta from assistant usage across turns", async () => {
+    const events = await collectHistory([
+      {
+        role: "user",
+        content: [{ type: "text", text: "first turn" }],
+      },
+      {
+        role: "assistant",
+        responseId: "resp-1",
+        content: [{ type: "text", text: "first reply" }],
+        usage: { input: 25000, output: 50, cacheRead: 0 },
+      } as unknown as PiAgentMessage,
+      {
+        role: "user",
+        content: [{ type: "text", text: "second turn" }],
+      },
+      {
+        role: "assistant",
+        responseId: "resp-2",
+        content: [{ type: "text", text: "second reply" }],
+        usage: { input: 25200, output: 80, cacheRead: 25000 },
+      } as unknown as PiAgentMessage,
+    ]);
+
+    const userMessages = events.filter((e) => e.item.type === "user_message");
+    expect(userMessages).toHaveLength(2);
+    expect(userMessages[0].item).toMatchObject({
+      type: "user_message",
+      text: "first turn",
+      prefixTokens: 25000,
+      prefixTrunkDelta: 25000,
+      isInitialPrefix: true,
+    });
+    expect(userMessages[1].item).toMatchObject({
+      type: "user_message",
+      text: "second turn",
+      prefixTokens: 200,
+      prefixTrunkDelta: 200,
+      isInitialPrefix: false,
+    });
+  });
+
+  test("selects the first responding assistant message in turns with tool calls", async () => {
+    const events = await collectHistory([
+      { role: "user", content: [{ type: "text", text: "run tool" }] },
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", id: "c1", name: "bash", arguments: {} }],
+        usage: { input: 10000, output: 20, cacheRead: 0 },
+      } as unknown as PiAgentMessage,
+      { role: "toolResult", toolCallId: "c1", content: "output" } as unknown as PiAgentMessage,
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "done" }],
+        usage: { input: 15000, output: 30, cacheRead: 14000 },
+      } as unknown as PiAgentMessage,
+    ]);
+
+    const userMessages = events.filter((e) => e.item.type === "user_message");
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0].item).toMatchObject({
+      type: "user_message",
+      text: "run tool",
+      prefixTokens: 10000,
+      isInitialPrefix: true,
+    });
+  });
+});

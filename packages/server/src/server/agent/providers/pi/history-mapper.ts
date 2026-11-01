@@ -86,6 +86,8 @@ export class PiHistoryMapper {
   private userIndex = 0;
   private assistantIndex = 0;
   private customIndex = 0;
+  /** User turns that carried a prefix size, across calls, so streaming one message per call works. */
+  private prefixedUserTurns = 0;
 
   constructor(
     private readonly provider: string,
@@ -94,9 +96,16 @@ export class PiHistoryMapper {
     private readonly extensionHost: PiExtensionHost = createPiExtensionHost(),
   ) {}
 
-  async mapMessages(messages: readonly PiAgentMessage[]): Promise<AgentStreamEvent[]> {
+  /**
+   * `transcript` is the whole conversation `messages` is a window of, starting at `offset`. A
+   * replay that maps one message per call passes it so a user message can still read the usage
+   * of the assistant reply that follows it.
+   */
+  async mapMessages(
+    messages: readonly PiAgentMessage[],
+    transcript: { messages: readonly PiAgentMessage[]; offset: number } = { messages, offset: 0 },
+  ): Promise<AgentStreamEvent[]> {
     const events: AgentStreamEvent[] = [];
-    let userTurnCount = 0;
 
     for (let i = 0; i < messages.length; i++) {
       const message = messages[i];
@@ -106,12 +115,12 @@ export class PiHistoryMapper {
           let prefixTokens: number | undefined;
           let isInitialPrefix: boolean | undefined;
 
-          const u = findRespondingAssistantUsage(messages, i + 1);
+          const u = findRespondingAssistantUsage(transcript.messages, transcript.offset + i + 1);
           if (typeof u?.input === "number") {
-            const isFirst = userTurnCount === 0;
+            const isFirst = this.prefixedUserTurns === 0;
             prefixTokens = isFirst || !u.cacheRead ? u.input : Math.max(0, u.input - u.cacheRead);
             isInitialPrefix = isFirst;
-            userTurnCount += 1;
+            this.prefixedUserTurns += 1;
           }
 
           events.push(...this.mapUserMessage(message, prefixTokens, isInitialPrefix));
@@ -355,9 +364,9 @@ export async function* streamPiHistory(
   signal?: AbortSignal,
 ): AsyncGenerator<AgentStreamEvent> {
   const mapper = new PiHistoryMapper(provider, userEntries, hooks, extensionHost);
-  for (const message of messages) {
+  for (const [offset, message] of messages.entries()) {
     if (signal?.aborted) return;
-    for (const event of await mapper.mapMessages([message])) {
+    for (const event of await mapper.mapMessages([message], { messages, offset })) {
       if (signal?.aborted) return;
       yield event;
     }
