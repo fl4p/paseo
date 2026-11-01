@@ -361,6 +361,11 @@ interface CompactionGate {
   release: () => void;
   /** The provider has an open `loading` compaction marker it has not terminalized. */
   markerOpen: boolean;
+  /**
+   * The open marker came with no turn: a compaction that runs beside turns (pi, OMP), which no
+   * cancel of a turn can have ended.
+   */
+  markerOutOfBand: boolean;
   /** Manual compactions dispatched whose first marker has not arrived yet. */
   arms: Set<CompactionArm>;
   /**
@@ -3020,6 +3025,7 @@ export class AgentManager {
       released,
       release,
       markerOpen: false,
+      markerOutOfBand: false,
       arms: new Set(),
       requiresRun: scope === "turn",
       timeout: setTimeout(() => undefined, 0),
@@ -3044,6 +3050,7 @@ export class AgentManager {
   private openCompactionMarker(agentId: string, scope: CompactionArm["scope"]): void {
     const gate = this.ensureCompactionGate(agentId, scope);
     gate.markerOpen = true;
+    gate.markerOutOfBand = scope === "out_of_band";
     // The marker this arm was waiting for: the arm has done its job of covering the dispatch
     // window, and the marker now keeps the gate open on its own.
     const oldestArm = gate.arms.values().next();
@@ -3058,6 +3065,7 @@ export class AgentManager {
       return;
     }
     gate.markerOpen = false;
+    gate.markerOutOfBand = false;
     this.refreshCompactionGateBackstop(agentId, gate);
     this.settleCompactionGate(agentId);
   }
@@ -3659,6 +3667,13 @@ export class AgentManager {
     }
     // A settled cancel ended any compaction the run was doing, even on a path that published no
     // terminal event. Release its held prompts rather than leave them waiting on an idle agent.
+    // A running out-of-band compaction (pi, OMP) is not the run's: pi's abort returns only once
+    // its agent is idle, so a Stop pressed just before /compact settles after that compaction has
+    // started. Releasing it here let the next prompt reach pi, which refused it (2026-11-01).
+    if (this.compactionGates.get(agent.id)?.markerOutOfBand) {
+      this.releaseTurnScopedCompactionGate(agent.id);
+      return;
+    }
     this.releaseCompactionGate(agent.id);
   }
 

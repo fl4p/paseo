@@ -148,6 +148,8 @@ export class FakePiSession implements PiRuntimeSession {
   emitCompactEnd = true;
   /** When set, `compact` waits on it between `compaction_start` and `compaction_end`. */
   compactGate: Promise<void> | null = null;
+  /** When set, `abort` resolves only once it does: Pi's abort waits for its agent to go idle. */
+  abortGate: Promise<void> | null = null;
   getStateError: Error | null = null;
   getSessionStatsError: Error | null = null;
   promptAck: PiPromptAck = {};
@@ -275,6 +277,9 @@ export class FakePiSession implements PiRuntimeSession {
   async abort(): Promise<void> {
     this.controlRequests.push("abort");
     this.abortRequested = true;
+    if (this.abortGate) {
+      await this.abortGate;
+    }
   }
 
   async getState(): Promise<PiSessionState> {
