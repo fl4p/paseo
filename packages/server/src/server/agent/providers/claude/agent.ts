@@ -187,6 +187,8 @@ const fsPromises = promises;
 
 /** Whole budget for close() to stop Claude's process tree; the daemon allows 5 s per close. */
 const CLAUDE_CLOSE_BUDGET_MS = 4_000;
+/** Longest close() waits for a history load or session rebind before it tears the process down. */
+const CLAUDE_CLOSE_HISTORY_WAIT_MS = 500;
 /** Most of that budget one process-tree refresh may use before close kills the known tree. */
 const CLAUDE_CLOSE_REFRESH_MS = 1_000;
 /** Kept back from the orderly kill for the verified last-resort SIGKILL. */
@@ -3289,8 +3291,24 @@ class ClaudeAgentSession implements AgentSession {
       },
       "provider.claude.session_close.start",
     );
+    // The whole of close() runs inside the daemon's 5 s close budget, so the deadline starts here.
+    const deadline = Date.now() + CLAUDE_CLOSE_BUDGET_MS;
     this.closed = true;
-    await this.ensureHistoryReady();
+    // A rebind still retiring its query, or a history load, gets a short wait so close does not
+    // race it needlessly; process teardown never waits for it beyond that. Both check `closed`.
+    // Not ensureHistoryReady(): that would start a history load nobody needs any more.
+    if (this.historyReady) {
+      await withTimeout(
+        this.historyReady,
+        CLAUDE_CLOSE_HISTORY_WAIT_MS,
+        "Claude history readiness",
+      ).catch((error: unknown) => {
+        this.logger.warn(
+          { err: error, agentId: this.agentId },
+          "Claude history was not ready at close; tearing the process down anyway",
+        );
+      });
+    }
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
     this.cancelCurrentTurn?.();
     this.subscribers.clear();
@@ -3303,23 +3321,25 @@ class ClaudeAgentSession implements AgentSession {
     this.sidechainTracker.clear();
     this.settledSubagentToolCalls.clear();
     this.taskProtocolSource.reset();
-    await this.shutDownQueryForClose();
+    await this.shutDownQueryForClose(deadline);
     if (this.persistSession === false && this.claudeSessionId) {
       // Claude Code currently ignores --no-session-persistence outside --print mode
       // (see `claude --help`), so the SDK's persistSession=false is silently dropped
       // in stream-json mode. Sweep the transcript ourselves so ephemeral runs
       // (metadata generator, branch-name generator) don't show up as resumable.
-      const historyPath = await this.resolveHistoryPath(this.claudeSessionId);
-      if (historyPath) {
-        try {
-          await promises.rm(historyPath, { force: true });
-        } catch (error) {
-          this.logger.warn(
-            { err: error, historyPath, claudeSessionId: this.claudeSessionId },
-            "Failed to delete ephemeral Claude session transcript",
-          );
-        }
-      }
+      // The process is already gone; what is left of the budget bounds the wait, and a sweep
+      // that needs longer finishes on its own.
+      const sweep = this.deleteEphemeralTranscript(this.claudeSessionId);
+      await withTimeout(
+        sweep,
+        Math.max(0, deadline - Date.now()),
+        "Claude ephemeral transcript sweep",
+      ).catch(() => {
+        this.logger.warn(
+          { agentId: this.agentId, claudeSessionId: this.claudeSessionId },
+          "Ephemeral Claude transcript sweep is still running after close",
+        );
+      });
     }
     this.logger.trace(
       {
@@ -3832,7 +3852,7 @@ class ClaudeAgentSession implements AgentSession {
    * spawn so orphaned tool and MCP children are included, gets SIGTERM then SIGKILL, and a tree
    * that will not report exit is logged rather than thrown, since close has no caller to retry.
    */
-  private async shutDownQueryForClose(): Promise<void> {
+  private async shutDownQueryForClose(deadline: number): Promise<void> {
     const child = this.childProcess;
     const capture = this.processTreeCapture;
     this.input?.end();
@@ -3841,9 +3861,8 @@ class ClaudeAgentSession implements AgentSession {
     this.input = null;
     this.queryPumpPromise = null;
     this.childProcess = null;
-    // One deadline for every probe and kill phase, inside the daemon's 5 s close budget: each
-    // process enumeration may take up to 5 s itself, so per-step timeouts do not add up to a bound.
-    const deadline = Date.now() + CLAUDE_CLOSE_BUDGET_MS;
+    // One deadline, set when close() was entered, for every probe and kill phase: each process
+    // enumeration may take up to 5 s itself, so per-step timeouts do not add up to a bound.
     const remaining = () => Math.max(0, deadline - Date.now());
     // What the orderly kill may use; the rest is kept for the last-resort kill below.
     const orderly = () => Math.max(0, remaining() - CLAUDE_CLOSE_FALLBACK_RESERVE_MS);
@@ -3951,6 +3970,20 @@ class ClaudeAgentSession implements AgentSession {
       this.logger.warn(
         { err: error, pids: unverified(), agentId: this.agentId },
         "Could not verify Claude's remaining processes during close; not signalling them",
+      );
+    }
+  }
+
+  private async deleteEphemeralTranscript(sessionId: string): Promise<void> {
+    try {
+      const historyPath = await this.resolveHistoryPath(sessionId);
+      if (historyPath) {
+        await promises.rm(historyPath, { force: true });
+      }
+    } catch (error) {
+      this.logger.warn(
+        { err: error, claudeSessionId: sessionId },
+        "Failed to delete ephemeral Claude session transcript",
       );
     }
   }
