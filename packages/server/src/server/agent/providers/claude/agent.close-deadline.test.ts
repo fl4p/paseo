@@ -64,7 +64,7 @@ vi.mock("../../../../utils/process-tree.js", async (importOriginal) => {
     },
     killVerifiedProcessTree: async (...args: Parameters<typeof actual.killVerifiedProcessTree>) => {
       tree.calls.verifiedKill += 1;
-      if (tree.verifiedKill === "fixture") return { killed: [], mismatched: [] };
+      if (tree.verifiedKill === "fixture") return { killed: [], mismatched: [], protected: [] };
       return actual.killVerifiedProcessTree(...args);
     },
   };
