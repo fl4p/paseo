@@ -132,6 +132,7 @@ test("interruptAgentIfRunning rejects when graceful cancellation is refused", as
     agentManager: {
       getAgent: vi.fn(() => ({ id: agentId, provider: "codex", lifecycle: "running" })),
       hasInFlightRun: vi.fn(() => true),
+      hasRunningOutOfBandCompaction: () => false,
       cancelAgentRun: vi.fn(async () => ({ status: "refused" as const })),
     },
   });
@@ -153,6 +154,7 @@ test("cancel_agent_request force-stops when graceful cancellation is refused", a
         .mockReturnValueOnce({ id: agentId, lifecycle: "running" })
         .mockReturnValue(null),
       hasInFlightRun: vi.fn(() => true),
+      hasRunningOutOfBandCompaction: () => false,
       cancelAgentRun: vi.fn(async () => ({ status: "refused" as const })),
       forceStopAgentRun,
       discardHeldPrompts: vi.fn(() => 0),
@@ -186,6 +188,7 @@ test("cancel_agent_request reports a failed force stop only through its response
     agentManager: {
       getAgent,
       hasInFlightRun: vi.fn(() => true),
+      hasRunningOutOfBandCompaction: () => false,
       forceStopAgentRun: vi.fn(async () => {
         throw new Error("provider process did not exit");
       }),
@@ -220,6 +223,7 @@ test("legacy cancel_agent_request reports a failed force stop through the activi
     agentManager: {
       getAgent: vi.fn(() => ({ id: agentId, provider: "codex", lifecycle: "running" })),
       hasInFlightRun: vi.fn(() => true),
+      hasRunningOutOfBandCompaction: () => false,
       forceStopAgentRun: vi.fn(async () => {
         throw new Error("provider process did not exit");
       }),
@@ -964,6 +968,7 @@ describe("session authorization permissions", () => {
         // Idle: an in-flight run makes the fork cut at the last completed turn
         // instead, which these authorization cases are not about.
         hasInFlightRun: vi.fn(() => false),
+        hasRunningOutOfBandCompaction: () => false,
         forkProviderSession,
       },
     });

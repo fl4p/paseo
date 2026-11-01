@@ -201,7 +201,7 @@ async function startStalledCompaction() {
     runOptions: { clientMessageId: "client-held" },
   });
   expect(held.disposition).toBe("held");
-  return { manager, agent, session };
+  return { pi, manager, agent, session };
 }
 
 test("Stop reaches Pi and lifts the hold while a compaction is stalled", async () => {
@@ -222,14 +222,21 @@ test("Stop reaches Pi and lifts the hold while a compaction is stalled", async (
 }, 20_000);
 
 test("force-stop reaches Pi and lifts the hold while a compaction is stalled", async () => {
-  const { manager, agent, session } = await startStalledCompaction();
+  const { pi, manager, agent, session } = await startStalledCompaction();
   try {
     await expect(manager.forceStopAgentRun(agent.id)).resolves.toMatchObject({
       status: "settled",
     });
     expect(session.controlRequests).toContain("abort");
     expect(session.terminated).toBe(true);
-    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    // Unlike the UI Stop, force-stop does not discard the held prompt: once the hold lifts it is
+    // delivered to the reloaded runtime.
+    await expect.poll(() => manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    await expect
+      .poll(() => pi.latestSession().prompts.map((prompt) => prompt.message))
+      .toEqual(["while compacting"]);
+    expect(pi.latestSession()).not.toBe(session);
+    expect(session.prompts).toEqual([]);
   } finally {
     await manager.closeAgent(agent.id);
   }

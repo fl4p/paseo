@@ -56,6 +56,10 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
     return this.inFlightAgentIds.has(agentId);
   }
 
+  hasRunningOutOfBandCompaction(): boolean {
+    return false;
+  }
+
   async cancelAgentRun(agentId: string) {
     this.cancelledAgentIds.push(agentId);
     if (this.settledDuringCancellationAgentIds.delete(agentId)) {

@@ -273,6 +273,7 @@ function buildAgentManagerSpies() {
     getPluginTools: () => [],
     reloadStalePluginSession: async () => {},
     hasInFlightRun: vi.fn().mockReturnValue(false),
+    hasRunningOutOfBandCompaction: () => false,
     isHoldingPromptsForCompaction: vi.fn().mockReturnValue(false),
     steerOrReplaceActiveTurn: async () => ({ status: "inactive" as const }),
     tryRunOutOfBand: vi.fn().mockReturnValue(false),

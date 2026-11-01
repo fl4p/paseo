@@ -4018,11 +4018,16 @@ export class AgentManager {
       this.finishCanceledRun(agent);
       // The runtime is dead, and with it any out-of-band compaction it was running.
       this.outOfBandCompactions.delete(agentId);
+    });
+    try {
+      await this.reloadAgentSessionInternal(agentId);
+    } finally {
+      // Lift the dead compaction's hold only once the runtime is replaced: a prompt held behind it
+      // would otherwise be sent to the dying runtime and lost to the reload.
       if (this.compactionGates.get(agentId)?.markerOutOfBand) {
         this.releaseCompactionGate(agentId);
       }
-    });
-    await this.reloadAgentSessionInternal(agentId);
+    }
     return { status: "settled" };
   }
 
