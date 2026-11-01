@@ -3294,7 +3294,7 @@ class ClaudeAgentSession implements AgentSession {
     this.sidechainTracker.clear();
     this.settledSubagentToolCalls.clear();
     this.taskProtocolSource.reset();
-    await this.retireQuery();
+    await this.shutDownQueryForClose();
     if (this.persistSession === false && this.claudeSessionId) {
       // Claude Code currently ignores --no-session-persistence outside --print mode
       // (see `claude --help`), so the SDK's persistSession=false is silently dropped
@@ -3814,6 +3814,56 @@ class ClaudeAgentSession implements AgentSession {
       }
     }
     return { kind: "fresh-session" };
+  }
+
+  /**
+   * Close's half of retirement, bounded for the daemon's close deadline (upstream #7573). The SDK
+   * query is closed, never awaited: its control plane is gone, and waiting on return() or a drain
+   * would outlast the deadline when the provider stops answering. The process tree, captured at
+   * spawn so orphaned tool and MCP children are included, gets SIGTERM then SIGKILL, and a tree
+   * that will not report exit is logged rather than thrown, since close has no caller to retry.
+   */
+  private async shutDownQueryForClose(): Promise<void> {
+    const child = this.childProcess;
+    const capture = this.processTreeCapture;
+    this.input?.end();
+    this.query?.close?.();
+    this.query = null;
+    this.input = null;
+    this.queryPumpPromise = null;
+    this.childProcess = null;
+    const terminationOptions = { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 };
+    try {
+      let processTree = this.retiringProcessTree;
+      if (!processTree && capture) {
+        // The capture is a snapshot started at spawn; a capture that never settles must not
+        // hold close hostage, so fall back to the root's tree.
+        processTree = await withTimeout(capture, 250, "Claude process tree capture").catch(
+          () => null,
+        );
+      }
+      let result: string | undefined;
+      if (processTree) {
+        await refreshProcessTree(processTree);
+        result = await terminateCapturedProcessTree(processTree, terminationOptions);
+      } else if (child) {
+        result = await terminateWithTreeKill(child, terminationOptions);
+      }
+      if (result === "kill-timeout") {
+        this.logger.warn(
+          { pid: child?.pid, agentId: this.agentId },
+          "Claude process tree did not report exit after SIGKILL",
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        { err: error, pid: child?.pid, agentId: this.agentId },
+        "Claude process tree cleanup failed during close",
+      );
+    } finally {
+      this.retiringProcessTree = null;
+      this.processTreeCapture = null;
+    }
   }
 
   /**
