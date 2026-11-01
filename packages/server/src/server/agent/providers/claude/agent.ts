@@ -183,6 +183,29 @@ import { execCommand } from "../../../../utils/spawn.js";
 import { composeSystemPromptParts } from "../../system-prompt.js";
 
 const fsPromises = promises;
+
+/** Whole budget for close() to stop Claude's process tree; the daemon allows 5 s per close. */
+const CLAUDE_CLOSE_BUDGET_MS = 4_000;
+/** Most of that budget one process-tree refresh may use before close kills the known tree. */
+const CLAUDE_CLOSE_REFRESH_MS = 1_000;
+
+/** Last resort for close(): SIGKILL the processes already known to belong to Claude. */
+function killKnownProcesses(tree: ProcessTreeSnapshot | null, child: ChildProcess | null): void {
+  for (const pid of tree ? Array.from(tree.processes.keys()).toReversed() : []) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+  if (child && child.exitCode === null && child.signalCode === null) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+}
 const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
   "user",
   "project",
@@ -3832,22 +3855,48 @@ class ClaudeAgentSession implements AgentSession {
     this.input = null;
     this.queryPumpPromise = null;
     this.childProcess = null;
-    const terminationOptions = { gracefulTimeoutMs: 2_000, forceTimeoutMs: 2_000 };
+    // One deadline for every probe and kill phase, inside the daemon's 5 s close budget: each
+    // process enumeration may take up to 5 s itself, so per-step timeouts do not add up to a bound.
+    const deadline = Date.now() + CLAUDE_CLOSE_BUDGET_MS;
+    const remaining = () => Math.max(0, deadline - Date.now());
+    let processTree = this.retiringProcessTree;
     try {
-      let processTree = this.retiringProcessTree;
       if (!processTree && capture) {
         // The capture is a snapshot started at spawn; a capture that never settles must not
         // hold close hostage, so fall back to the root's tree.
-        processTree = await withTimeout(capture, 250, "Claude process tree capture").catch(
-          () => null,
-        );
+        processTree = await withTimeout(
+          capture,
+          Math.min(250, remaining()),
+          "Claude process tree capture",
+        ).catch(() => null);
       }
-      let result: string | undefined;
+      let result: string;
       if (processTree) {
-        await refreshProcessTree(processTree);
-        result = await terminateCapturedProcessTree(processTree, terminationOptions);
+        const tree = processTree;
+        // A failed or slow refresh still leaves the last known tree to kill.
+        await withTimeout(
+          refreshProcessTree(tree),
+          Math.min(CLAUDE_CLOSE_REFRESH_MS, remaining()),
+          "Claude process tree refresh",
+        ).catch((error: unknown) => {
+          this.logger.warn(
+            { err: error, pid: child?.pid, agentId: this.agentId },
+            "Claude process tree refresh failed during close; killing the last known tree",
+          );
+        });
+        result = await withTimeout(
+          terminateCapturedProcessTree(tree, this.closeTerminationOptions(remaining())),
+          remaining(),
+          "Claude process tree termination",
+        );
       } else if (child) {
-        result = await terminateWithTreeKill(child, terminationOptions);
+        result = await withTimeout(
+          terminateWithTreeKill(child, this.closeTerminationOptions(remaining())),
+          remaining(),
+          "Claude process termination",
+        );
+      } else {
+        return;
       }
       if (result === "kill-timeout") {
         this.logger.warn(
@@ -3856,14 +3905,26 @@ class ClaudeAgentSession implements AgentSession {
         );
       }
     } catch (error) {
+      // The orderly kill could not finish in time (or could not enumerate the tree): SIGKILL what
+      // is known rather than leave it running.
       this.logger.warn(
         { err: error, pid: child?.pid, agentId: this.agentId },
-        "Claude process tree cleanup failed during close",
+        "Claude process tree cleanup did not finish during close; sending SIGKILL to the known tree",
       );
+      killKnownProcesses(processTree, child);
     } finally {
       this.retiringProcessTree = null;
       this.processTreeCapture = null;
     }
+  }
+
+  private closeTerminationOptions(budgetMs: number): {
+    gracefulTimeoutMs: number;
+    forceTimeoutMs: number;
+  } {
+    // Leave the force phase room to finish before the overall deadline.
+    const gracefulTimeoutMs = Math.max(0, Math.min(1_500, Math.floor(budgetMs / 2) - 250));
+    return { gracefulTimeoutMs, forceTimeoutMs: Math.max(0, budgetMs - gracefulTimeoutMs - 500) };
   }
 
   /**
