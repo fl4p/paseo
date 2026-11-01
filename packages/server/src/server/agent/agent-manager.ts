@@ -105,6 +105,10 @@ import { extractAttention } from "../persistence-hooks.js";
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+/** Longest a force-stop waits for a provider runtime to confirm it is dead. */
+const FORCE_STOP_TERMINATE_TIMEOUT_MS = 15_000;
+/** Longest a force-stop waits for the agent to come back on a fresh runtime. */
+const FORCE_STOP_RELOAD_TIMEOUT_MS = 60_000;
 const IMPORTABLE_SESSION_LIST_TIMEOUT_MS = 90_000;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
@@ -190,6 +194,21 @@ interface TimeoutOptions {
   operation: Promise<void>;
   timeoutMs: number;
   onLateError?: (error: unknown) => void;
+}
+
+function resolveRescueTimeouts(
+  timeouts: AgentManagerRescueTimeouts | undefined,
+): Required<AgentManagerRescueTimeouts> {
+  return {
+    reloadSessionCloseMs: timeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
+    interruptSessionMs: timeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
+    forceStopTerminateMs: timeouts?.forceStopTerminateMs ?? FORCE_STOP_TERMINATE_TIMEOUT_MS,
+    forceStopReloadMs: timeouts?.forceStopReloadMs ?? FORCE_STOP_RELOAD_TIMEOUT_MS,
+  };
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function formatProviderList(providers: readonly string[]): string {
@@ -304,6 +323,8 @@ export interface ProviderAvailability {
 interface AgentManagerRescueTimeouts {
   reloadSessionCloseMs?: number;
   interruptSessionMs?: number;
+  forceStopTerminateMs?: number;
+  forceStopReloadMs?: number;
 }
 
 interface ProviderEnabledFlag {
@@ -886,12 +907,7 @@ export class AgentManager {
     this.resolvePaseoToolPolicy = options.resolvePaseoToolPolicy ?? (() => undefined);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
-    this.rescueTimeouts = {
-      reloadSessionCloseMs:
-        options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
-      interruptSessionMs:
-        options.rescueTimeouts?.interruptSessionMs ?? INTERRUPT_SESSION_TIMEOUT_MS,
-    };
+    this.rescueTimeouts = resolveRescueTimeouts(options.rescueTimeouts);
     this.beforeSteerUnavailableFallback = options.beforeSteerUnavailableFallback;
     this.agentStreamCoalescer = new AgentStreamCoalescer({
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
@@ -2068,6 +2084,8 @@ export class AgentManager {
       agentId,
       "the agent was closed while the message waited for a compaction",
     );
+    // A closed agent has no force-stop window left to defer the release for.
+    this.terminatingAgents.delete(agentId);
     this.releaseCompactionGate(agentId);
     const closedAgent = this.prepareAgentForClosure(agent, "agent closed");
 
@@ -2819,6 +2837,22 @@ export class AgentManager {
     void this.runForegroundMutation(agentId, async () => {
       if (!arm) {
         await runCommand();
+        return;
+      }
+      // The handler belongs to the session this command arrived on. A force-stop that is killing
+      // or has replaced that session would only lose the compaction in the dying runtime: refuse
+      // it visibly instead, and let the user send it again once the agent is back.
+      if (
+        this.terminatingAgents.has(agentId) ||
+        this.agents.get(agentId)?.session !== agent.session
+      ) {
+        disarm?.();
+        this.retireHeldPrompt(
+          agentId,
+          agent.provider,
+          options?.clientMessageId,
+          "Compaction not started: the agent was being force-stopped and restarted. Send /compact again once it is idle.",
+        );
         return;
       }
       // A compaction starts in the lane, so it orders after the mutations before it, but is not
@@ -4039,56 +4073,87 @@ export class AgentManager {
     );
     // From here until the runtime is replaced, nothing releases the compaction hold: the dying
     // runtime fails its pending /compact before it exits, and the failed compaction_end that
-    // produces would otherwise send a held prompt to it.
+    // produces would otherwise send a held prompt to it. Every way out of this window, including
+    // an unexpected exception and a deadline, ends it in the finally below.
     this.terminatingAgents.add(agentId);
+    let replaced = false;
+    let failure = "the force stop did not complete";
     try {
-      await target.session.terminate();
-    } catch (error) {
-      this.endTermination(
-        agentId,
-        `force stop could not confirm the agent's runtime is dead (${
-          error instanceof Error ? error.message : String(error)
-        })`,
-      );
-      // No resume over a runtime that may still be writing the thread. Say so and stop here;
-      // the provider's close() retries the kill, so a reload (or close) is the way to retry.
-      // Drain first: the events the dying provider emitted must not overwrite this error.
+      try {
+        await this.withDeadline(
+          target.session.terminate(),
+          this.rescueTimeouts.forceStopTerminateMs,
+          "the provider runtime did not confirm it exited",
+        );
+      } catch (error) {
+        failure = `force stop could not confirm the agent's runtime is dead (${describeError(error)})`;
+        // No resume over a runtime that may still be writing the thread. Say so and stop here;
+        // the provider's close() retries the kill, so a reload (or close) is the way to retry.
+        // Drain first: the events the dying provider emitted must not overwrite this error.
+        await this.drainSessionEvents(agentId);
+        agent.lastError = `Force stop could not confirm the agent's runtime is dead (${describeError(
+          error,
+        )}). Reload the agent to retry.`;
+        if (!this.runs.hasRun(agentId)) {
+          agent.lifecycle = "error";
+        }
+        this.touchUpdatedAt(agent);
+        this.emitState(agent);
+        throw error;
+      }
+      failure = "the agent could not be restarted after a force stop";
       await this.drainSessionEvents(agentId);
-      agent.lastError = `Force stop could not confirm the agent's runtime is dead (${
-        error instanceof Error ? error.message : String(error)
-      }). Reload the agent to retry.`;
-      if (!this.runs.hasRun(agentId)) {
-        agent.lifecycle = "error";
+      await this.runForegroundMutation(agentId, async () => {
+        const run = this.runs.getRun(agentId);
+        // The provider may have ended the turn itself while dying.
+        if (run && !run.settled) {
+          await this.forceSettleRun(agent, run, "forceStopAgentRun: terminated provider,");
+        }
+        this.finishCanceledRun(agent);
+        // The runtime is dead, and with it any out-of-band compaction it was running.
+        this.outOfBandCompactions.delete(agentId);
+      });
+      try {
+        await this.withDeadline(
+          this.reloadAgentSessionInternal(agentId),
+          this.rescueTimeouts.forceStopReloadMs,
+          "the agent did not come back on a new runtime in time",
+        );
+      } catch (error) {
+        failure = `the agent could not be restarted after a force stop (${describeError(error)})`;
+        throw error;
       }
-      this.touchUpdatedAt(agent);
-      this.emitState(agent);
-      throw error;
+      replaced = true;
+    } finally {
+      // Replaced: a prompt held behind the dead compaction goes to the new runtime. Otherwise the
+      // runtime is uncertain, so held prompts are discarded with the reason, never sent to it.
+      this.endTermination(agentId, replaced ? null : failure);
     }
-    await this.drainSessionEvents(agentId);
-    await this.runForegroundMutation(agentId, async () => {
-      const run = this.runs.getRun(agentId);
-      // The provider may have ended the turn itself while dying.
-      if (run && !run.settled) {
-        await this.forceSettleRun(agent, run, "forceStopAgentRun: terminated provider,");
-      }
-      this.finishCanceledRun(agent);
-      // The runtime is dead, and with it any out-of-band compaction it was running.
-      this.outOfBandCompactions.delete(agentId);
-    });
-    try {
-      await this.reloadAgentSessionInternal(agentId);
-    } catch (error) {
-      this.endTermination(
-        agentId,
-        `the agent could not be restarted after a force stop (${
-          error instanceof Error ? error.message : String(error)
-        })`,
-      );
-      throw error;
-    }
-    // The runtime is replaced: a prompt held behind the dead compaction goes to the new one.
-    this.endTermination(agentId, null);
     return { status: "settled" };
+  }
+
+  /** Rejects when `operation` has not settled within `timeoutMs`; the operation keeps running. */
+  private async withDeadline<T>(
+    operation: Promise<T>,
+    timeoutMs: number,
+    reason: string,
+  ): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error(`${reason} within ${timeoutMs} ms`)),
+            timeoutMs,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+      // A late rejection of the abandoned operation is not unhandled.
+      operation.catch(() => undefined);
+    }
   }
 
   /**

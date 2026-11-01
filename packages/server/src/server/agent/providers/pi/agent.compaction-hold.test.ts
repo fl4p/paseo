@@ -179,11 +179,14 @@ test("a Stop that settles after /compact was dispatched does not release the com
  * serialises foreground mutations per agent; the out-of-band compaction used to run inside that
  * lane, so Stop and force-stop queued behind it forever and the hold never lifted.
  */
-async function startStalledCompaction() {
+async function startStalledCompaction(
+  rescueTimeouts?: ConstructorParameters<typeof AgentManager>[0]["rescueTimeouts"],
+) {
   const pi = new FakePi();
   const manager = new AgentManager({
     clients: { pi: new PiRpcAgentClient({ logger, runtime: pi }) },
     logger,
+    ...(rescueTimeouts ? { rescueTimeouts } : {}),
   });
   const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
     workspaceId: undefined,
@@ -377,6 +380,131 @@ test("a held prompt is discarded, not lost, when the reload after a force-stop f
   } finally {
     unsubscribe();
     await manager.closeAgent(agent.id).catch(() => undefined);
+  }
+}, 15_000);
+
+// From the third Codex review (2026-11-01): the force-stop window must always end, and a /compact
+// sent into it must not be lost in the dying runtime.
+
+interface TerminationInternals {
+  terminatingAgents: Set<string>;
+  finishCanceledRun: (...args: unknown[]) => void;
+}
+
+function discardedPrompts(events: AgentManagerEvent[]): string[] {
+  return events.flatMap((event) =>
+    event.type === "agent_stream" && event.event.type === "prompt_discarded"
+      ? [event.event.clientMessageId ?? ""]
+      : [],
+  );
+}
+
+test("a terminate that never confirms ends the force-stop window at its deadline", async () => {
+  const { manager, agent, session } = await startStalledCompaction({ forceStopTerminateMs: 300 });
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  let releaseTerminate!: () => void;
+  vi.spyOn(session, "terminate").mockImplementationOnce(
+    () =>
+      new Promise<void>((resolve) => {
+        releaseTerminate = resolve;
+      }),
+  );
+  try {
+    await expect(manager.forceStopAgentRun(agent.id)).rejects.toThrow(/did not confirm/);
+    expect(asInternals<TerminationInternals>(manager).terminatingAgents.has(agent.id)).toBe(false);
+    expect(discardedPrompts(events)).toEqual(["client-held"]);
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    expect(session.prompts).toEqual([]);
+  } finally {
+    releaseTerminate?.();
+    unsubscribe();
+    await manager.closeAgent(agent.id);
+  }
+}, 15_000);
+
+test("a failure between the kill and the reload still ends the force-stop window", async () => {
+  const { manager, agent, session } = await startStalledCompaction();
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  const internals = asInternals<TerminationInternals>(manager);
+  const failure = new Error("post-termination state update failed");
+  const spy = vi.spyOn(internals, "finishCanceledRun").mockImplementationOnce(() => {
+    throw failure;
+  });
+  try {
+    await expect(manager.forceStopAgentRun(agent.id)).rejects.toBe(failure);
+    expect(session.terminated).toBe(true);
+    expect(internals.terminatingAgents.has(agent.id)).toBe(false);
+    expect(discardedPrompts(events)).toEqual(["client-held"]);
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    expect(session.prompts).toEqual([]);
+  } finally {
+    spy.mockRestore();
+    unsubscribe();
+    await manager.closeAgent(agent.id).catch(() => undefined);
+  }
+}, 15_000);
+
+test("a reload that never finishes ends the force-stop window at its deadline", async () => {
+  const pi = new FakePi();
+  const client = new PiRpcAgentClient({ logger, runtime: pi });
+  const manager = new AgentManager({
+    clients: { pi: client },
+    logger,
+    rescueTimeouts: { forceStopReloadMs: 300 },
+  });
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const session = pi.latestSession();
+  session.compactGate = new Promise<void>(() => {});
+  vi.spyOn(client, "resumeSession").mockImplementationOnce(() => new Promise(() => {}));
+  vi.spyOn(client, "createSession").mockImplementationOnce(() => new Promise(() => {}));
+  try {
+    await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+    await expect.poll(() => session.compactRequests.length).toBe(1);
+    const held = await startAgentRun(manager, agent.id, "held across a hung reload", logger, {
+      replaceRunning: true,
+      runOptions: { clientMessageId: "client-hung-reload" },
+    });
+    expect(held.disposition).toBe("held");
+    await expect(manager.forceStopAgentRun(agent.id)).rejects.toThrow(/did not come back/);
+    expect(asInternals<TerminationInternals>(manager).terminatingAgents.has(agent.id)).toBe(false);
+    expect(discardedPrompts(events)).toEqual(["client-hung-reload"]);
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+  } finally {
+    unsubscribe();
+  }
+}, 15_000);
+
+test("a /compact sent while a force-stop kills the runtime is refused, not lost", async () => {
+  const { pi, manager, agent, session } = await startStalledCompaction();
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  session.terminateExitDelayMs = 400;
+  const stopping = manager.forceStopAgentRun(agent.id);
+  try {
+    await expect.poll(() => session.terminated, { timeout: 4_000 }).toBe(true);
+    const before = session.compactRequests.length;
+    await startAgentRun(manager, agent.id, "/compact", logger, {
+      replaceRunning: true,
+      runOptions: { clientMessageId: "client-compact-in-kill" },
+    });
+    await expect(stopping).resolves.toEqual({ status: "settled" });
+    expect(session.compactRequests).toHaveLength(before);
+    expect(pi.latestSession()).not.toBe(session);
+    expect(discardedPrompts(events)).toEqual(["client-compact-in-kill"]);
+    // The prompt held before the kill still reaches the new runtime.
+    await expect.poll(() => manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    await expect
+      .poll(() => pi.latestSession().prompts.map((prompt) => prompt.message))
+      .toEqual(["while compacting"]);
+  } finally {
+    unsubscribe();
+    await manager.closeAgent(agent.id);
   }
 }, 15_000);
 
