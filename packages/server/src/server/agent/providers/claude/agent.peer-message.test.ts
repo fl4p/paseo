@@ -10,7 +10,7 @@ import { claudeProjectDirSync } from "./project-dir.js";
 import type { AgentStreamEvent } from "../../agent-sdk-types.js";
 
 interface TestClaudeSession {
-  translateMessageToEvents(message: SDKMessage): AgentStreamEvent[];
+  translateMessageToEvents(message: SDKMessage): Promise<AgentStreamEvent[]>;
   close(): Promise<void>;
 }
 
@@ -77,22 +77,21 @@ function turnStartedFrame(): SDKMessage {
   } as unknown as SDKMessage;
 }
 
-function timelineItems(session: TestClaudeSession, message: SDKMessage): unknown[] {
-  return session
-    .translateMessageToEvents(message)
+async function timelineItems(session: TestClaudeSession, message: SDKMessage): Promise<unknown[]> {
+  return (await session.translateMessageToEvents(message))
     .filter((event) => event.type === "timeline")
     .map((event) => event.item);
 }
 
 describe("peer messages", () => {
-  test("replays a peer message the generic isMeta filter would drop", () => {
-    expect(convertClaudeHistoryEntry(PEER_ENTRY, () => [])).toEqual([EXPECTED_ITEM]);
+  test("replays a peer message the generic isMeta filter would drop", async () => {
+    expect(await convertClaudeHistoryEntry(PEER_ENTRY, () => [])).toEqual([EXPECTED_ITEM]);
   });
 
-  test("keeps skipping meta entries that carry no peer origin", () => {
+  test("keeps skipping meta entries that carry no peer origin", async () => {
     const { origin: _origin, ...withoutOrigin } = PEER_ENTRY;
 
-    expect(convertClaudeHistoryEntry(withoutOrigin, () => [])).toEqual([]);
+    expect(await convertClaudeHistoryEntry(withoutOrigin, () => [])).toEqual([]);
   });
 
   test("emits a peer message carried only by the result frame", async () => {
@@ -100,8 +99,7 @@ describe("peer messages", () => {
     try {
       const frame = PEER_RESULT_FRAME as unknown as SDKMessage;
 
-      const items = session
-        .translateMessageToEvents(frame)
+      const items = (await session.translateMessageToEvents(frame))
         .filter((event) => event.type === "timeline")
         .map((event) => event.item);
 
@@ -114,10 +112,11 @@ describe("peer messages", () => {
   test("does not show a delivery twice when both carriers arrive", async () => {
     const session = await createSessionForTest();
     try {
-      session.translateMessageToEvents(PEER_ENTRY as unknown as SDKMessage);
+      await session.translateMessageToEvents(PEER_ENTRY as unknown as SDKMessage);
 
-      const repeats = session
-        .translateMessageToEvents(PEER_RESULT_FRAME as unknown as SDKMessage)
+      const repeats = (
+        await session.translateMessageToEvents(PEER_RESULT_FRAME as unknown as SDKMessage)
+      )
         .filter((event) => event.type === "timeline")
         .map((event) => event.item)
         .filter((item) => item.type === "user_message");
@@ -133,10 +132,10 @@ describe("peer messages", () => {
     try {
       const message = PEER_ENTRY as unknown as SDKMessage;
 
-      expect(session.translateMessageToEvents(message)).toEqual([
+      expect(await session.translateMessageToEvents(message)).toEqual([
         { type: "timeline", item: EXPECTED_ITEM, provider: "claude" },
       ]);
-      expect(session.translateMessageToEvents(message)).toEqual([]);
+      expect(await session.translateMessageToEvents(message)).toEqual([]);
     } finally {
       await session.close();
     }
@@ -178,10 +177,10 @@ describe("peer messages at turn start", () => {
   test("emits the message when the turn it started begins", async () => {
     const session = await createSessionForTest(cwd);
     try {
-      timelineItems(session, turnStartedFrame());
+      await timelineItems(session, turnStartedFrame());
       appendFileSync(transcript, `${JSON.stringify(PEER_ENTRY)}\n`);
 
-      expect(timelineItems(session, turnStartedFrame())).toContainEqual(EXPECTED_ITEM);
+      expect(await timelineItems(session, turnStartedFrame())).toContainEqual(EXPECTED_ITEM);
     } finally {
       await session.close();
       rmSync(cwd, { recursive: true, force: true });
@@ -191,13 +190,13 @@ describe("peer messages at turn start", () => {
   test("does not repeat it when the turn's result frame carries it too", async () => {
     const session = await createSessionForTest(cwd);
     try {
-      timelineItems(session, turnStartedFrame());
+      await timelineItems(session, turnStartedFrame());
       appendFileSync(transcript, `${JSON.stringify(PEER_ENTRY)}\n`);
-      timelineItems(session, turnStartedFrame());
+      await timelineItems(session, turnStartedFrame());
 
-      const repeats = timelineItems(session, PEER_RESULT_FRAME as unknown as SDKMessage).filter(
-        (item) => (item as { type?: string }).type === "user_message",
-      );
+      const repeats = (
+        await timelineItems(session, PEER_RESULT_FRAME as unknown as SDKMessage)
+      ).filter((item) => (item as { type?: string }).type === "user_message");
 
       expect(repeats).toEqual([]);
     } finally {

@@ -6,7 +6,7 @@ import { ClaudeAgentClient } from "./agent.js";
 import type { AgentStreamEvent, AgentTimelineItem } from "../../agent-sdk-types.js";
 
 interface TestClaudeSession {
-  translateMessageToEvents(message: SDKMessage): AgentStreamEvent[];
+  translateMessageToEvents(message: SDKMessage): Promise<AgentStreamEvent[]>;
   close(): Promise<void>;
 }
 
@@ -62,14 +62,14 @@ describe("claude compaction markers", () => {
     const session = await createSessionForTest();
     try {
       const emitted = [
-        ...compactionItems(session.translateMessageToEvents(compactingStatus)),
-        ...compactionItems(session.translateMessageToEvents(compactingStatus)),
-        ...compactionItems(session.translateMessageToEvents(compactingStatus)),
+        ...compactionItems(await session.translateMessageToEvents(compactingStatus)),
+        ...compactionItems(await session.translateMessageToEvents(compactingStatus)),
+        ...compactionItems(await session.translateMessageToEvents(compactingStatus)),
       ];
 
       expect(emitted).toEqual([{ type: "compaction", status: "loading" }]);
 
-      const completed = compactionItems(session.translateMessageToEvents(compactBoundary));
+      const completed = compactionItems(await session.translateMessageToEvents(compactBoundary));
       expect(completed).toEqual([
         {
           type: "compaction",
@@ -80,7 +80,7 @@ describe("claude compaction markers", () => {
       ]);
 
       // A later compaction opens a fresh marker.
-      expect(compactionItems(session.translateMessageToEvents(compactingStatus))).toEqual([
+      expect(compactionItems(await session.translateMessageToEvents(compactingStatus))).toEqual([
         { type: "compaction", status: "loading" },
       ]);
     } finally {
@@ -91,16 +91,16 @@ describe("claude compaction markers", () => {
   test("terminalizes the marker when the turn ends without a compact boundary", async () => {
     const session = await createSessionForTest();
     try {
-      expect(compactionItems(session.translateMessageToEvents(compactingStatus))).toEqual([
+      expect(compactionItems(await session.translateMessageToEvents(compactingStatus))).toEqual([
         { type: "compaction", status: "loading" },
       ]);
 
-      expect(compactionItems(session.translateMessageToEvents(successResult))).toEqual([
+      expect(compactionItems(await session.translateMessageToEvents(successResult))).toEqual([
         { type: "compaction", status: "completed" },
       ]);
 
       // Already terminalized: the next result must not add another marker.
-      expect(compactionItems(session.translateMessageToEvents(successResult))).toEqual([]);
+      expect(compactionItems(await session.translateMessageToEvents(successResult))).toEqual([]);
     } finally {
       await session.close();
     }
@@ -109,9 +109,11 @@ describe("claude compaction markers", () => {
   test("does not terminalize twice when the boundary arrives before the result", async () => {
     const session = await createSessionForTest();
     try {
-      session.translateMessageToEvents(compactingStatus);
-      expect(compactionItems(session.translateMessageToEvents(compactBoundary))).toHaveLength(1);
-      expect(compactionItems(session.translateMessageToEvents(successResult))).toEqual([]);
+      await session.translateMessageToEvents(compactingStatus);
+      expect(compactionItems(await session.translateMessageToEvents(compactBoundary))).toHaveLength(
+        1,
+      );
+      expect(compactionItems(await session.translateMessageToEvents(successResult))).toEqual([]);
     } finally {
       await session.close();
     }
@@ -141,8 +143,8 @@ describe("claude compaction outcomes", () => {
   test("reports a failed compaction as failed instead of as a successful one", async () => {
     const session = await createSessionForTest();
     try {
-      session.translateMessageToEvents(compactingStatus);
-      const items = timelineItems(session.translateMessageToEvents(compactionFailedStatus));
+      await session.translateMessageToEvents(compactingStatus);
+      const items = timelineItems(await session.translateMessageToEvents(compactionFailedStatus));
 
       // The marker itself says it failed; the error row survives only to carry the CLI's reason.
       expect(items).toEqual([
@@ -151,7 +153,7 @@ describe("claude compaction outcomes", () => {
       ]);
 
       // The marker is closed, so the next compaction is visible again.
-      expect(compactionItems(session.translateMessageToEvents(compactingStatus))).toEqual([
+      expect(compactionItems(await session.translateMessageToEvents(compactingStatus))).toEqual([
         { type: "compaction", status: "loading" },
       ]);
     } finally {
@@ -162,8 +164,10 @@ describe("claude compaction outcomes", () => {
   test("closes the marker on a successful compact_result without claiming an error", async () => {
     const session = await createSessionForTest();
     try {
-      session.translateMessageToEvents(compactingStatus);
-      const items = timelineItems(session.translateMessageToEvents(compactionSucceededStatus));
+      await session.translateMessageToEvents(compactingStatus);
+      const items = timelineItems(
+        await session.translateMessageToEvents(compactionSucceededStatus),
+      );
 
       expect(items).toEqual([{ type: "compaction", status: "completed" }]);
     } finally {
@@ -174,13 +178,13 @@ describe("claude compaction outcomes", () => {
   test("shows one separator when the result precedes the compact boundary", async () => {
     const session = await createSessionForTest();
     try {
-      session.translateMessageToEvents(compactingStatus);
-      expect(compactionItems(session.translateMessageToEvents(successResult))).toEqual([
+      await session.translateMessageToEvents(compactingStatus);
+      expect(compactionItems(await session.translateMessageToEvents(successResult))).toEqual([
         { type: "compaction", status: "completed" },
       ]);
       // The boundary owns no marker of its own here; a second completed item would render a
       // second "Context compacted" separator.
-      expect(compactionItems(session.translateMessageToEvents(compactBoundary))).toEqual([]);
+      expect(compactionItems(await session.translateMessageToEvents(compactBoundary))).toEqual([]);
     } finally {
       await session.close();
     }

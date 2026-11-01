@@ -5610,6 +5610,7 @@ test("delivers a discarded prompt to a single-source client that is not viewing 
   const session = createSessionForTest({
     messages,
     agentManager: {
+      getAgent: vi.fn(() => null),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         agentEventListeners.push(listener);
         return () => {};
@@ -5668,6 +5669,7 @@ test("delivers a discarded prompt to every socket source, viewing that agent or 
     messages,
     targetedMessages,
     agentManager: {
+      getAgent: vi.fn(() => null),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         agentEventListeners.push(listener);
         return () => {};
@@ -5731,6 +5733,7 @@ test("delivers a discarded prompt once as a session event to every source that s
     messages,
     targetedMessages,
     agentManager: {
+      getAgent: vi.fn(() => null),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         agentEventListeners.push(listener);
         return () => {};
@@ -5835,6 +5838,7 @@ test("delivers a discarded prompt once as a session event on the single-source p
   const session = createSessionForTest({
     messages,
     agentManager: {
+      getAgent: vi.fn(() => null),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         agentEventListeners.push(listener);
         return () => {};
@@ -5896,6 +5900,7 @@ function createDiscardProducerFixture() {
     messages: [],
     targetedMessages,
     agentManager: {
+      getAgent: vi.fn(() => null),
       subscribe: vi.fn((listener: (event: AgentManagerEvent) => void) => {
         activeListeners.add(listener);
         return () => {

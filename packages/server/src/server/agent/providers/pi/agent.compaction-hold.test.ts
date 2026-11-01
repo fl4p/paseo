@@ -78,7 +78,7 @@ test("a prompt sent during a Pi compaction is held and delivered once the compac
  * waits for its agent to go idle, so the Stop settles only after the compaction has started; that
  * settle released the out-of-band compaction's hold and the prompt reached Pi, which refused it.
  */
-test("a Stop that settles after /compact started does not release the compaction's hold", async () => {
+test("a Stop that settles after /compact was dispatched does not release the compaction's hold", async () => {
   const pi = new FakePi();
   const manager = new AgentManager({
     clients: { pi: new PiRpcAgentClient({ logger, runtime: pi }) },
@@ -119,6 +119,13 @@ test("a Stop that settles after /compact started does not release the compaction
       activeTurnBehavior: "interrupt",
     });
     expect(compact.disposition).toBe("out_of_band");
+    // Upstream serializes foreground mutations, so the /compact waits behind the Stop. The hold
+    // is armed at dispatch, before it waits.
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(true);
+
+    // Pi goes idle: the Stop settles while the /compact is pending, and the compaction starts.
+    finishAbort();
+    await expect(stop).resolves.toEqual({ status: "settled" });
     await expect
       .poll(() =>
         timelineItems(events).some(
@@ -126,10 +133,6 @@ test("a Stop that settles after /compact started does not release the compaction
         ),
       )
       .toBe(true);
-
-    // Pi goes idle: the Stop settles while Pi is compacting.
-    finishAbort();
-    await expect(stop).resolves.toEqual({ status: "settled" });
 
     const followUp = await startAgentRun(manager, agent.id, "?", logger, {
       replaceRunning: true,

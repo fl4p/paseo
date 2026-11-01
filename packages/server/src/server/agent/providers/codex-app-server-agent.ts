@@ -5022,6 +5022,8 @@ export class CodexAppServerAgentSession implements AgentSession {
       { threadId: this.currentThreadId, backupThreadId },
       "Codex rewind kept the pre-rewind conversation in a backup thread",
     );
+    // A thread with turns to rewind has its rollout on disk, whichever path the rewind took.
+    this.markCurrentThreadSaved(this.currentThreadId);
     // An in-place rewind keeps the thread id but not its history, so both paths restage it.
     this.stagedHistory = await this.readThreadHistory(this.client);
     this.reconcileAsyncQuestionsAfterRewind(this.stagedHistory.timeline);

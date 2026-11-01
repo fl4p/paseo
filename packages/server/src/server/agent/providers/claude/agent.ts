@@ -3639,7 +3639,7 @@ class ClaudeAgentSession implements AgentSession {
     const previousReady = this.ensureHistoryReady();
     const rebind = (async () => {
       await previousReady;
-      await this.retireQuery();
+      await this.retireQuery(undefined, { routeRetiringEvents: false });
       if (this.closed) return;
       const oldSessionId = this.claudeSessionId;
       this.claudeSessionId = sessionId;
@@ -3816,7 +3816,15 @@ class ClaudeAgentSession implements AgentSession {
     return { kind: "fresh-session" };
   }
 
-  private async retireQuery(onRetired?: () => void): Promise<void> {
+  /**
+   * `routeRetiringEvents` keeps the old query's late frames flowing while it shuts down (task
+   * announcements an account switch must recover). A session rebind passes false: the old
+   * session's late output must not land in the new session's timeline.
+   */
+  private async retireQuery(
+    onRetired?: () => void,
+    options: { routeRetiringEvents?: boolean } = {},
+  ): Promise<void> {
     const oldQuery = this.query;
     const oldInput = this.input;
     const retiredChild = this.childProcess;
@@ -3834,7 +3842,7 @@ class ClaudeAgentSession implements AgentSession {
     this.queryPumpPromise = null;
     this.queryRestartNeeded = false;
     this.childProcess = null;
-    if (oldQuery) this.retiringQueries.add(oldQuery);
+    if (oldQuery && options.routeRetiringEvents !== false) this.retiringQueries.add(oldQuery);
     try {
       const [settled] = await Promise.allSettled([
         Promise.resolve().then(() => {

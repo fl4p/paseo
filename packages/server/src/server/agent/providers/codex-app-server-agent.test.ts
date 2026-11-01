@@ -2146,20 +2146,27 @@ describe("Codex app-server provider", () => {
       id: "turn-1",
       items: [codexUserItem("user-1", "First"), codexAgentItem("First answer.")],
     };
-    const codex = createReopenableCodexAgent({
-      "saved-thread": [
-        firstTurn,
-        { id: "turn-2", items: [codexUserItem("user-2", "Second"), codexAgentItem("Second.")] },
-      ],
-      "forked-thread": [firstTurn],
+    const secondTurn = {
+      id: "turn-2",
+      items: [codexUserItem("user-2", "Second"), codexAgentItem("Second.")],
+    };
+    const threads: Record<string, unknown[]> = { "forked-thread": [firstTurn, secondTurn] };
+    let rolledBack = (): boolean => false;
+    // The in-place rollback trims the saved thread itself; the fork is the untouched backup.
+    Object.defineProperty(threads, "saved-thread", {
+      enumerable: true,
+      get: () => (rolledBack() ? [firstTurn] : [firstTurn, secondTurn]),
     });
+    const codex = createReopenableCodexAgent(threads);
     try {
       await codex.loadCloseAndReopen();
+      rolledBack = () => codex.latestAppServer().recordedRollbacks.length > 0;
 
       await codex.manager.rewind(codex.agentId, "user-2", "conversation");
 
+      // The fork rewinds in place (prompt cache kept); the forked copy is the backup.
       expect(codex.latestAppServer().recordedRollbacks).toEqual([
-        { threadId: "forked-thread", numTurns: 1 },
+        { threadId: "saved-thread", numTurns: 1 },
       ]);
       expect(codex.manager.getTimeline(codex.agentId)).toEqual([
         expect.objectContaining({ type: "user_message", messageId: "user-1", text: "First" }),

@@ -97,8 +97,8 @@ describe("ClaudePeerTranscriptTail", () => {
   });
 
   test("an unreadable transcript costs position, not a crash", async () => {
-    expect(new ClaudePeerTranscriptTail().read(join(dir, "missing.jsonl"))).toEqual([]);
-    expect(new ClaudePeerTranscriptTail().read(null)).toEqual([]);
+    expect(await new ClaudePeerTranscriptTail().read(join(dir, "missing.jsonl"))).toEqual([]);
+    expect(await new ClaudePeerTranscriptTail().read(null)).toEqual([]);
   });
 
   test("follows a different transcript from wherever it is after a reset", async () => {

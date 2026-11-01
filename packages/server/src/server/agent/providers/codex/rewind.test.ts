@@ -282,7 +282,7 @@ describe("Codex Rewind", () => {
           model: "gpt-5.4-mini",
           serviceTier: null,
           config: { model_provider: "custom" },
-          excludeTurns: false,
+          excludeTurns: true,
           persistExtendedHistory: true,
           beforeTurnId: "turn-second",
         },

@@ -110,11 +110,14 @@ class TranscriptWritingClaudeSdk extends FakeClaudeSdk {
   }
 }
 
-function timelineFromTranscript(path: string): AgentTimelineItem[] {
-  return readFileSync(path, "utf8")
+async function timelineFromTranscript(path: string): Promise<AgentTimelineItem[]> {
+  const lines = readFileSync(path, "utf8")
     .split("\n")
-    .filter((line) => line.trim().length > 0)
-    .flatMap((line) => convertClaudeHistoryEntry(JSON.parse(line), mapTextBlocks));
+    .filter((line) => line.trim().length > 0);
+  const items = await Promise.all(
+    lines.map((line) => convertClaudeHistoryEntry(JSON.parse(line), mapTextBlocks)),
+  );
+  return items.flat();
 }
 
 /** Minimal stand-in for the provider's block mapper: text blocks become messages. */
@@ -191,7 +194,7 @@ describe("forkAgentSessionNatively", () => {
         return { providerHandleId: fork.sessionId, provider: "claude", cwd: "/workspace" };
       },
       importProviderSession: async (input) => {
-        const timeline = timelineFromTranscript(join(dir, `${input.providerHandleId}.jsonl`));
+        const timeline = await timelineFromTranscript(join(dir, `${input.providerHandleId}.jsonl`));
         importedTimelines.push(timeline);
         importedConfigs.push(input.config);
         return { agentId: "agent-forked", timelineSize: timeline.length, createdWorkspace: null };
