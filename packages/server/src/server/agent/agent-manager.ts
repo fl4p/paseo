@@ -827,7 +827,13 @@ export class AgentManager {
    * Out-of-band compactions (pi, OMP /compact) the provider is running. They run outside the
    * foreground lane, so a Stop can reach the provider while one is in flight.
    */
-  private readonly outOfBandCompactions = new Map<string, Promise<void>>();
+  private readonly outOfBandCompactions = new Map<string, Set<Promise<void>>>();
+  /**
+   * Agents whose runtime a force-stop is killing and reloading. The dying runtime fails its pending
+   * RPCs before it exits, and the compaction_end that failure produces must not let a held prompt
+   * through to it; see `escalateStop`.
+   */
+  private readonly terminatingAgents = new Set<string>();
   /** Per agent, the prompts held behind a compaction, oldest first. */
   private readonly heldPrompts = new Map<string, HeldPrompt[]>();
   private readonly runs = new AgentRunState();
@@ -3145,18 +3151,31 @@ export class AgentManager {
     return this.replaceAgentRunNow(agentId, prompt, options);
   }
 
+  /**
+   * Each compaction is tracked on its own: a duplicate /compact that the provider refuses at once
+   * must not end the tracking of the one still running.
+   */
   private trackOutOfBandCompaction(agentId: string, running: Promise<void>): void {
-    this.outOfBandCompactions.set(agentId, running);
+    let tracked = this.outOfBandCompactions.get(agentId);
+    if (!tracked) {
+      tracked = new Set();
+      this.outOfBandCompactions.set(agentId, tracked);
+    }
+    tracked.add(running);
     void running.finally(() => {
-      if (this.outOfBandCompactions.get(agentId) === running) {
-        this.outOfBandCompactions.delete(agentId);
-      }
+      const current = this.outOfBandCompactions.get(agentId);
+      if (!current?.delete(running)) return;
+      if (current.size === 0) this.outOfBandCompactions.delete(agentId);
     });
   }
 
   /** An out-of-band compaction is running: Stop has work to stop even with no run in flight. */
   hasRunningOutOfBandCompaction(agentId: string): boolean {
-    return this.outOfBandCompactions.has(agentId);
+    return (this.outOfBandCompactions.get(agentId)?.size ?? 0) > 0;
+  }
+
+  private runningOutOfBandCompactions(agentId: string): ReadonlySet<Promise<void>> {
+    return new Set(this.outOfBandCompactions.get(agentId));
   }
 
   /**
@@ -3179,7 +3198,7 @@ export class AgentManager {
     // A turn-scoped gate outliving every run can only be a provider that never closed its marker.
     // Holding behind it would strand the prompt on an idle agent. An out-of-band compaction runs
     // with no turn at all, so this can never speak for it; its backstop timer does.
-    if (gate.requiresRun && !this.hasInFlightRun(agentId)) {
+    if (gate.requiresRun && !this.hasInFlightRun(agentId) && !this.terminatingAgents.has(agentId)) {
       this.releaseCompactionGate(agentId);
       return false;
     }
@@ -3443,6 +3462,11 @@ export class AgentManager {
   private releaseCompactionGate(agentId: string): void {
     const gate = this.compactionGates.get(agentId);
     if (!gate) {
+      return;
+    }
+    if (this.terminatingAgents.has(agentId)) {
+      // A force-stop is replacing the runtime; `endTermination` settles the gate afterwards.
+      this.logger.trace({ agentId }, "agent.manager.compaction.release_deferred");
       return;
     }
     this.compactionGates.delete(agentId);
@@ -3886,9 +3910,9 @@ export class AgentManager {
       this.runs.getRun(agentId) ??
       (agent.lifecycle === "running" ? this.runs.trackAutonomousRun(agentId, null) : null);
     if (!run) {
-      const compaction = this.outOfBandCompactions.get(agentId);
-      return compaction
-        ? this.cancelOutOfBandCompaction(agent, compaction)
+      const compactions = this.runningOutOfBandCompactions(agentId);
+      return compactions.size > 0
+        ? this.cancelOutOfBandCompaction(agent, compactions)
         : { status: "not_running" };
     }
 
@@ -3919,11 +3943,11 @@ export class AgentManager {
    */
   private async cancelOutOfBandCompaction(
     agent: ActiveManagedAgent,
-    compaction: Promise<void>,
+    compactions: ReadonlySet<Promise<void>>,
   ): Promise<AgentRunCancellationResult> {
     const acknowledged = await this.interruptSession(agent.session, agent.id);
     const settlement = await this.waitWithTimeout({
-      operation: compaction,
+      operation: Promise.all(compactions).then(() => undefined),
       timeoutMs: acknowledged
         ? INTERRUPT_SESSION_TIMEOUT_MS
         : this.rescueTimeouts.interruptSessionMs,
@@ -3964,26 +3988,48 @@ export class AgentManager {
     if (!refusing?.session?.terminate) {
       return graceful;
     }
-    // Escalate against exactly the session and run that refused, never whatever runs later.
-    const target = { session: refusing.session, run: this.runs.getRun(agentId) };
+    // Escalate against exactly the session, run and compactions that refused, never whatever runs
+    // later.
+    const target = {
+      session: refusing.session,
+      run: this.runs.getRun(agentId),
+      compactions: this.runningOutOfBandCompactions(agentId),
+    };
     return this.trackAgentRegistrationOperation(
       this.runLifecycleMutation(agentId, () => this.escalateStop(agentId, target)),
     );
   }
 
+  /** Whether what refused a force-stop's graceful cancel is still running. */
+  private isStillRefusing(
+    agentId: string,
+    target: { run: TrackedAgentRun | null; compactions: ReadonlySet<Promise<void>> },
+  ): boolean {
+    if (target.run) {
+      return !target.run.settled && this.runs.getRun(agentId) === target.run;
+    }
+    if (target.compactions.size > 0) {
+      // Only the compactions that refused: a turn started after they ended is not this Stop's.
+      const running = this.outOfBandCompactions.get(agentId);
+      return Array.from(target.compactions).some((compaction) => running?.has(compaction) ?? false);
+    }
+    return this.hasInFlightRun(agentId);
+  }
+
   private async escalateStop(
     agentId: string,
-    target: { session: AgentSession; run: TrackedAgentRun | null },
+    target: {
+      session: AgentSession;
+      run: TrackedAgentRun | null;
+      compactions: ReadonlySet<Promise<void>>;
+    },
   ): Promise<AgentRunCancellationResult> {
     const agent = this.agents.get(agentId);
     if (!agent || agent.session !== target.session || !target.session.terminate) {
       // Replaced or closed while this Stop waited for the lane.
       return { status: "settled" };
     }
-    const stillRefusing = target.run
-      ? !target.run.settled && this.runs.getRun(agentId) === target.run
-      : this.hasInFlightRun(agentId) || this.hasRunningOutOfBandCompaction(agentId);
-    if (!stillRefusing) {
+    if (!this.isStillRefusing(agentId, target)) {
       // The refused run ended while this Stop waited; a run started since is not this Stop's.
       return { status: "settled" };
     }
@@ -3991,9 +4037,19 @@ export class AgentManager {
       { agentId, provider: agent.provider },
       "forceStopAgentRun: cancellation not acknowledged, terminating the provider runtime",
     );
+    // From here until the runtime is replaced, nothing releases the compaction hold: the dying
+    // runtime fails its pending /compact before it exits, and the failed compaction_end that
+    // produces would otherwise send a held prompt to it.
+    this.terminatingAgents.add(agentId);
     try {
       await target.session.terminate();
     } catch (error) {
+      this.endTermination(
+        agentId,
+        `force stop could not confirm the agent's runtime is dead (${
+          error instanceof Error ? error.message : String(error)
+        })`,
+      );
       // No resume over a runtime that may still be writing the thread. Say so and stop here;
       // the provider's close() retries the kill, so a reload (or close) is the way to retry.
       // Drain first: the events the dying provider emitted must not overwrite this error.
@@ -4021,14 +4077,43 @@ export class AgentManager {
     });
     try {
       await this.reloadAgentSessionInternal(agentId);
-    } finally {
-      // Lift the dead compaction's hold only once the runtime is replaced: a prompt held behind it
-      // would otherwise be sent to the dying runtime and lost to the reload.
-      if (this.compactionGates.get(agentId)?.markerOutOfBand) {
-        this.releaseCompactionGate(agentId);
-      }
+    } catch (error) {
+      this.endTermination(
+        agentId,
+        `the agent could not be restarted after a force stop (${
+          error instanceof Error ? error.message : String(error)
+        })`,
+      );
+      throw error;
     }
+    // The runtime is replaced: a prompt held behind the dead compaction goes to the new one.
+    this.endTermination(agentId, null);
     return { status: "settled" };
+  }
+
+  /**
+   * End a force-stop's termination window. Everything the dead runtime held the gate for is gone:
+   * its markers and the arms of commands it had been handed. A /compact still queued behind the
+   * Stop keeps its arm. With `failure`, there is no runtime to send the held prompts to, so they
+   * are discarded with that reason (the client is told) instead of waiting forever.
+   */
+  private endTermination(agentId: string, failure: string | null): void {
+    if (!this.terminatingAgents.delete(agentId)) {
+      return;
+    }
+    if (failure !== null) {
+      this.discardHeldPrompts(agentId, failure);
+    }
+    const gate = this.compactionGates.get(agentId);
+    if (!gate) {
+      return;
+    }
+    gate.markerOpen = false;
+    gate.markerOutOfBand = false;
+    for (const arm of Array.from(gate.arms)) {
+      if (arm.dispatched) gate.arms.delete(arm);
+    }
+    this.settleCompactionGate(agentId);
   }
 
   private async forceSettleRun(

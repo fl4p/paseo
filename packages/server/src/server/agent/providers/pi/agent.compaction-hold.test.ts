@@ -1,11 +1,12 @@
 import pino from "pino";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 import { AgentManager, type AgentManagerEvent } from "../../agent-manager.js";
 import { startAgentRun } from "../../agent-prompt.js";
 import { cancelAgentRunCommand } from "../../lifecycle-command.js";
 import type { AgentTimelineItem } from "../../agent-sdk-types.js";
 import { PiRpcAgentClient } from "./agent.js";
+import { asInternals } from "../../../test-utils/class-mocks.js";
 import { FakePi } from "./test-utils/fake-pi.js";
 
 /**
@@ -241,6 +242,143 @@ test("force-stop reaches Pi and lifts the hold while a compaction is stalled", a
     await manager.closeAgent(agent.id);
   }
 }, 20_000);
+
+function newPiManager() {
+  const pi = new FakePi();
+  const manager = new AgentManager({
+    clients: { pi: new PiRpcAgentClient({ logger, runtime: pi }) },
+    logger,
+  });
+  return { pi, manager };
+}
+
+// The next three come from a Codex review of the Stop/force-stop redesign (2026-11-01).
+
+test("a duplicate /compact does not hide the compaction still running from Stop", async () => {
+  const { manager, agent, session } = await startStalledCompaction();
+  try {
+    // Pi refuses the second /compact at once; its completion must not end the first's tracking.
+    await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+    await new Promise((resolveTick) => setTimeout(resolveTick, 30));
+    expect(manager.hasRunningOutOfBandCompaction(agent.id)).toBe(true);
+    await expect(manager.cancelAgentRun(agent.id)).resolves.toEqual({ status: "refused" });
+    expect(session.controlRequests).toContain("abort");
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(true);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+}, 15_000);
+
+test("a compaction failed by the kill does not release its hold before the reload", async () => {
+  const { pi, manager } = newPiManager();
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const session = pi.latestSession();
+  session.compactGate = new Promise<void>(() => {});
+  // The real transport rejects pending RPCs first and only then waits for the process to exit.
+  session.terminateExitDelayMs = 100;
+  try {
+    await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+    await expect.poll(() => session.compactRequests.length).toBe(1);
+    const held = await startAgentRun(manager, agent.id, "held across kill", logger, {
+      replaceRunning: true,
+    });
+    expect(held.disposition).toBe("held");
+    await expect(manager.forceStopAgentRun(agent.id)).resolves.toEqual({ status: "settled" });
+    expect(session.terminated).toBe(true);
+    await expect
+      .poll(() => pi.latestSession().prompts.map((prompt) => prompt.message))
+      .toEqual(["held across kill"]);
+    expect(pi.latestSession()).not.toBe(session);
+    expect(session.prompts).toEqual([]);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+}, 15_000);
+
+test("a delayed force-stop escalation does not kill a turn started after the compaction ended", async () => {
+  const { pi, manager } = newPiManager();
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const session = pi.latestSession();
+  let endCompaction!: () => void;
+  let releaseLane: (() => void) | undefined;
+  session.compactGate = new Promise<void>((resolve) => {
+    endCompaction = resolve;
+  });
+  try {
+    await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+    await expect.poll(() => session.compactRequests.length).toBe(1);
+    // Something else holds the lifecycle lane, so the escalation has to wait for it.
+    const lane = asInternals<{
+      runLifecycleMutation(agentId: string, run: () => Promise<void>): Promise<void>;
+    }>(manager).runLifecycleMutation(
+      agent.id,
+      () =>
+        new Promise<void>((resolve) => {
+          releaseLane = resolve;
+        }),
+    );
+    const stopping = manager.forceStopAgentRun(agent.id);
+    // The graceful Stop refuses after its 2 s wait; the escalation is now queued.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 2_200));
+    endCompaction();
+    await expect.poll(() => manager.hasRunningOutOfBandCompaction(agent.id)).toBe(false);
+    await startAgentRun(manager, agent.id, "new unrelated turn", logger, { replaceRunning: true });
+    await expect.poll(() => session.prompts.length).toBe(1);
+    releaseLane?.();
+    await lane;
+    await expect(stopping).resolves.toEqual({ status: "settled" });
+    expect(session.terminated).toBe(false);
+  } finally {
+    releaseLane?.();
+    await manager.closeAgent(agent.id);
+  }
+}, 15_000);
+
+test("a held prompt is discarded, not lost, when the reload after a force-stop fails", async () => {
+  const pi = new FakePi();
+  const client = new PiRpcAgentClient({ logger, runtime: pi });
+  const manager = new AgentManager({ clients: { pi: client }, logger });
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const session = pi.latestSession();
+  session.compactGate = new Promise<void>(() => {});
+  try {
+    await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+    await expect.poll(() => session.compactRequests.length).toBe(1);
+    const held = await startAgentRun(manager, agent.id, "held across a failed reload", logger, {
+      replaceRunning: true,
+      runOptions: { clientMessageId: "client-failed-reload" },
+    });
+    expect(held.disposition).toBe("held");
+    const reloadFailure = new Error("pi failed to start");
+    vi.spyOn(client, "resumeSession").mockRejectedValueOnce(reloadFailure);
+    vi.spyOn(client, "createSession").mockRejectedValueOnce(reloadFailure);
+    await expect(manager.forceStopAgentRun(agent.id)).rejects.toBe(reloadFailure);
+    await expect
+      .poll(() =>
+        events.some(
+          (event) =>
+            event.type === "agent_stream" &&
+            event.event.type === "prompt_discarded" &&
+            event.event.clientMessageId === "client-failed-reload",
+        ),
+      )
+      .toBe(true);
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    expect(session.prompts).toEqual([]);
+    expect(pi.latestSession().prompts).toEqual([]);
+  } finally {
+    unsubscribe();
+    await manager.closeAgent(agent.id).catch(() => undefined);
+  }
+}, 15_000);
 
 test("a Pi compaction that fails after it started is marked failed, not compacted", async () => {
   const pi = new FakePi();

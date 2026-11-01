@@ -292,12 +292,12 @@ export class FakePiSession implements PiRuntimeSession {
   async compact(customInstructions?: string): Promise<void> {
     this.compactRequests.push(customInstructions === undefined ? {} : { customInstructions });
     if (this.compactStartGate) {
-      await this.compactStartGate;
+      await this.untilTerminated(this.compactStartGate);
     }
     this.emit({ type: "compaction_start", reason: "manual" });
-    await this.compactCompletion;
+    await this.untilTerminated(this.compactCompletion);
     if (this.compactGate) {
-      await this.compactGate;
+      await this.untilTerminated(this.compactGate);
     }
     if (this.emitCompactEnd) {
       this.emit({ type: "compaction_end", reason: "manual" });
@@ -453,9 +453,33 @@ export class FakePiSession implements PiRuntimeSession {
   async close(): Promise<void> {}
 
   terminated = false;
+  /** How long terminate() waits for the "process" to exit after failing the pending RPCs. */
+  terminateExitDelayMs = 20;
+  private rejectTermination!: (error: Error) => void;
+  private readonly terminationSignal = (() => {
+    const signal = new Promise<never>((_resolve, reject) => {
+      this.rejectTermination = reject;
+    });
+    // Observed by untilTerminated(); a session nobody is waiting on must not raise unhandled.
+    signal.catch(() => undefined);
+    return signal;
+  })();
 
+  /**
+   * Like the real JsonlRpcProcess.terminate(): pending RPCs are rejected first, and the process
+   * exit is awaited after that, so a caller sees the RPC failures while termination still runs.
+   */
   async terminate(): Promise<void> {
     this.terminated = true;
+    this.rejectTermination(new Error("Pi RPC session was terminated"));
+    await new Promise((resolveExit) => setTimeout(resolveExit, this.terminateExitDelayMs));
+  }
+
+  private async untilTerminated<T>(operation: Promise<T> | null): Promise<T | null> {
+    if (this.terminated) {
+      throw new Error("Pi RPC session was terminated");
+    }
+    return Promise.race([operation, this.terminationSignal]);
   }
 
   emit(event: PiRuntimeEvent): void {
