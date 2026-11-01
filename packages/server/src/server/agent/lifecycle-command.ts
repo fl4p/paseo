@@ -13,6 +13,8 @@ export type LifecycleAgentSnapshot = Pick<ManagedAgent, "id" | "cwd" | "lifecycl
 export interface LifecycleAgentManager {
   getAgent(agentId: string): LifecycleAgentSnapshot | null;
   hasInFlightRun(agentId: string): boolean;
+  /** A compaction running outside any turn (pi, OMP /compact) is also something Stop stops. */
+  hasRunningOutOfBandCompaction?(agentId: string): boolean;
   cancelAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
   /** Cancel that terminates a provider that will not acknowledge, when the provider can be. */
   forceStopAgentRun(agentId: string): Promise<AgentRunCancellationResult>;
@@ -71,7 +73,9 @@ async function requestAgentRunCancellation(
     throw new Error(`Agent ${agentId} not found`);
   }
 
-  const hasInFlightRun = agentManager.hasInFlightRun(agentId);
+  const hasInFlightRun =
+    agentManager.hasInFlightRun(agentId) ||
+    (agentManager.hasRunningOutOfBandCompaction?.(agentId) ?? false);
   if (!hasInFlightRun) {
     logger.trace(
       { agentId, lifecycle: agent.lifecycle, hasInFlightRun },

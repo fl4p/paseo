@@ -395,6 +395,11 @@ interface CompactionGate {
 
 interface CompactionArm {
   scope: "turn" | "out_of_band";
+  /**
+   * The command this arm covers has been handed to the provider. An out-of-band /compact queued
+   * in the foreground lane behind a Stop is not yet: that Stop cannot have ended it.
+   */
+  dispatched: boolean;
 }
 
 /**
@@ -818,6 +823,11 @@ export class AgentManager {
   private readonly foregroundMutationTails = new Map<string, Promise<void>>();
   /** Agents with a compaction running or armed; see `holdPromptUntilCompactionEnds`. */
   private readonly compactionGates = new Map<string, CompactionGate>();
+  /**
+   * Out-of-band compactions (pi, OMP /compact) the provider is running. They run outside the
+   * foreground lane, so a Stop can reach the provider while one is in flight.
+   */
+  private readonly outOfBandCompactions = new Map<string, Promise<void>>();
   /** Per agent, the prompts held behind a compaction, oldest first. */
   private readonly heldPrompts = new Map<string, HeldPrompt[]>();
   private readonly runs = new AgentRunState();
@@ -2780,8 +2790,11 @@ export class AgentManager {
     };
     // Arm before the command runs: the window between dispatching /compact and the provider's
     // first marker is exactly where a prompt used to cancel the compaction.
-    const disarm = handler.compaction ? this.armCompactionGate(agent.id, "out_of_band") : null;
-    void this.runForegroundMutation(agentId, async () => {
+    const arm: CompactionArm | null = handler.compaction
+      ? { scope: "out_of_band", dispatched: false }
+      : null;
+    const disarm = arm ? this.armCompactionGate(agent.id, "out_of_band", arm) : null;
+    const runCommand = async (): Promise<void> => {
       try {
         const outcome = await handler.run({ emit: dispatch });
         if (outcome && outcome.compactionStarted === false) {
@@ -2796,6 +2809,17 @@ export class AgentManager {
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
       }
+    };
+    void this.runForegroundMutation(agentId, async () => {
+      if (!arm) {
+        await runCommand();
+        return;
+      }
+      // A compaction starts in the lane, so it orders after the mutations before it, but is not
+      // awaited there: a summarization request that never answers would otherwise queue every
+      // later Stop behind it, and the provider would never be asked to abort.
+      arm.dispatched = true;
+      this.trackOutOfBandCompaction(agentId, runCommand());
     });
     return true;
   }
@@ -3121,6 +3145,20 @@ export class AgentManager {
     return this.replaceAgentRunNow(agentId, prompt, options);
   }
 
+  private trackOutOfBandCompaction(agentId: string, running: Promise<void>): void {
+    this.outOfBandCompactions.set(agentId, running);
+    void running.finally(() => {
+      if (this.outOfBandCompactions.get(agentId) === running) {
+        this.outOfBandCompactions.delete(agentId);
+      }
+    });
+  }
+
+  /** An out-of-band compaction is running: Stop has work to stop even with no run in flight. */
+  hasRunningOutOfBandCompaction(agentId: string): boolean {
+    return this.outOfBandCompactions.has(agentId);
+  }
+
   /**
    * Whether a prompt sent now would be held until a running compaction ends, instead of replacing
    * or steering the turn that runs it.
@@ -3153,8 +3191,11 @@ export class AgentManager {
    * provider marker has not arrived yet. Returns the disarm for the caller to run if the
    * compaction never starts.
    */
-  private armCompactionGate(agentId: string, scope: CompactionArm["scope"]): () => void {
-    const arm: CompactionArm = { scope };
+  private armCompactionGate(
+    agentId: string,
+    scope: CompactionArm["scope"],
+    arm: CompactionArm = { scope, dispatched: true },
+  ): () => void {
     const gate = this.ensureCompactionGate(agentId, scope);
     gate.arms.add(arm);
     this.logger.trace({ agentId, scope }, "agent.manager.compaction.armed");
@@ -3845,7 +3886,10 @@ export class AgentManager {
       this.runs.getRun(agentId) ??
       (agent.lifecycle === "running" ? this.runs.trackAutonomousRun(agentId, null) : null);
     if (!run) {
-      return { status: "not_running" };
+      const compaction = this.outOfBandCompactions.get(agentId);
+      return compaction
+        ? this.cancelOutOfBandCompaction(agent, compaction)
+        : { status: "not_running" };
     }
 
     const interruptAcknowledged = await this.interruptSession(agent.session, agentId);
@@ -3868,6 +3912,30 @@ export class AgentManager {
   }
 
   /**
+   * Stop while an out-of-band compaction runs with no turn. The provider is asked to abort; a
+   * compaction that then ends settles the Stop. One that keeps running (pi 0.84's abort RPC does
+   * not reach a manual compaction, and a dead summarization server never answers) refuses it, so
+   * force-stop can terminate the runtime.
+   */
+  private async cancelOutOfBandCompaction(
+    agent: ActiveManagedAgent,
+    compaction: Promise<void>,
+  ): Promise<AgentRunCancellationResult> {
+    const acknowledged = await this.interruptSession(agent.session, agent.id);
+    const settlement = await this.waitWithTimeout({
+      operation: compaction,
+      timeoutMs: acknowledged
+        ? INTERRUPT_SESSION_TIMEOUT_MS
+        : this.rescueTimeouts.interruptSessionMs,
+    });
+    if (settlement !== "completed") {
+      return { status: "refused" };
+    }
+    this.finishCanceledRun(agent);
+    return { status: "settled" };
+  }
+
+  /**
    * Stop for a turn the provider will not cancel. Tries the graceful cancel first; if the
    * provider never acknowledges it (a pi turn blocked in a tool whose child ignores the abort),
    * kill the provider's runtime via AgentSession.terminate, settle the turn as canceled, and
@@ -3881,7 +3949,11 @@ export class AgentManager {
     // The ordinary Stop stays where it always was: the foreground lane only, never queued behind a
     // reload or an archive. Only an escalation takes the lifecycle lane.
     const current = this.agents.get(agentId);
-    if (!current || current.session == null || !this.hasInFlightRun(agentId)) {
+    if (
+      !current ||
+      current.session == null ||
+      (!this.hasInFlightRun(agentId) && !this.hasRunningOutOfBandCompaction(agentId))
+    ) {
       return { status: "not_running" };
     }
     const graceful = await this.cancelAgentRun(agentId);
@@ -3910,7 +3982,7 @@ export class AgentManager {
     }
     const stillRefusing = target.run
       ? !target.run.settled && this.runs.getRun(agentId) === target.run
-      : this.hasInFlightRun(agentId);
+      : this.hasInFlightRun(agentId) || this.hasRunningOutOfBandCompaction(agentId);
     if (!stillRefusing) {
       // The refused run ended while this Stop waited; a run started since is not this Stop's.
       return { status: "settled" };
@@ -3944,6 +4016,11 @@ export class AgentManager {
         await this.forceSettleRun(agent, run, "forceStopAgentRun: terminated provider,");
       }
       this.finishCanceledRun(agent);
+      // The runtime is dead, and with it any out-of-band compaction it was running.
+      this.outOfBandCompactions.delete(agentId);
+      if (this.compactionGates.get(agentId)?.markerOutOfBand) {
+        this.releaseCompactionGate(agentId);
+      }
     });
     await this.reloadAgentSessionInternal(agentId);
     return { status: "settled" };
@@ -4003,8 +4080,18 @@ export class AgentManager {
     // A running out-of-band compaction (pi, OMP) is not the run's: pi's abort returns only once
     // its agent is idle, so a Stop pressed just before /compact settles after that compaction has
     // started. Releasing it here let the next prompt reach pi, which refused it (2026-11-01).
-    if (this.compactionGates.get(agent.id)?.markerOutOfBand) {
+    const gate = this.compactionGates.get(agent.id);
+    if (gate?.markerOutOfBand) {
       this.releaseTurnScopedCompactionGate(agent.id);
+      return;
+    }
+    // A /compact queued in the foreground lane behind this Stop has not reached the provider yet,
+    // so the Stop cannot have ended it. Keep its arm; drop everything the Stop did end.
+    const pending = gate ? Array.from(gate.arms).filter((arm) => !arm.dispatched) : [];
+    if (gate && pending.length > 0) {
+      gate.markerOpen = false;
+      gate.arms = new Set(pending);
+      this.refreshCompactionGateBackstop(agent.id, gate);
       return;
     }
     this.releaseCompactionGate(agent.id);

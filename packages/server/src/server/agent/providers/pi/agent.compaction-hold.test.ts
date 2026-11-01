@@ -3,6 +3,7 @@ import { expect, test } from "vitest";
 
 import { AgentManager, type AgentManagerEvent } from "../../agent-manager.js";
 import { startAgentRun } from "../../agent-prompt.js";
+import { cancelAgentRunCommand } from "../../lifecycle-command.js";
 import type { AgentTimelineItem } from "../../agent-sdk-types.js";
 import { PiRpcAgentClient } from "./agent.js";
 import { FakePi } from "./test-utils/fake-pi.js";
@@ -123,9 +124,29 @@ test("a Stop that settles after /compact was dispatched does not release the com
     // is armed at dispatch, before it waits.
     expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(true);
 
-    // Pi goes idle: the Stop settles while the /compact is pending, and the compaction starts.
+    // Real Pi announces the compaction only after its own preparation. Delay compaction_start so
+    // the window between the Stop settling and the first marker is real.
+    let announceCompaction!: () => void;
+    session.compactStartGate = new Promise<void>((resolve) => {
+      announceCompaction = resolve;
+    });
+
+    // Pi goes idle: the Stop settles while the /compact is still queued behind it.
     finishAbort();
     await expect(stop).resolves.toEqual({ status: "settled" });
+    await expect.poll(() => session.compactRequests.length).toBe(1);
+    // No marker yet, and the hold must still stand: the Stop did not end a /compact that had not
+    // reached Pi when it settled.
+    expect(
+      timelineItems(events).some((item) => item.type === "compaction" && item.status === "loading"),
+    ).toBe(false);
+    const inWindow = await startAgentRun(manager, agent.id, "in the window", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "interrupt",
+      runOptions: { clientMessageId: "client-in-window" },
+    });
+    expect(inWindow.disposition).toBe("held");
+    announceCompaction();
     await expect
       .poll(() =>
         timelineItems(events).some(
@@ -143,13 +164,76 @@ test("a Stop that settles after /compact was dispatched does not release the com
     expect(session.prompts.map((prompt) => prompt.message)).toEqual(["?"]);
 
     endCompaction();
-    await expect.poll(() => session.prompts.length).toBe(2);
+    await expect.poll(() => session.prompts.length).toBeGreaterThanOrEqual(2);
+    expect(session.prompts[1]?.message).toBe("in the window");
     expect(session.compactRequests).toHaveLength(1);
   } finally {
     unsubscribe();
     await manager.closeAgent(agent.id);
   }
 });
+
+/**
+ * A `/compact` that never finishes (a hung summary request) must not make Stop useless. Upstream
+ * serialises foreground mutations per agent; the out-of-band compaction used to run inside that
+ * lane, so Stop and force-stop queued behind it forever and the hold never lifted.
+ */
+async function startStalledCompaction() {
+  const pi = new FakePi();
+  const manager = new AgentManager({
+    clients: { pi: new PiRpcAgentClient({ logger, runtime: pi }) },
+    logger,
+  });
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  const session = pi.latestSession();
+  session.compactGate = new Promise<void>(() => {});
+  const compact = await startAgentRun(manager, agent.id, "/compact", logger, {
+    replaceRunning: true,
+    activeTurnBehavior: "interrupt",
+  });
+  expect(compact.disposition).toBe("out_of_band");
+  await expect.poll(() => session.compactRequests.length).toBe(1);
+  const held = await startAgentRun(manager, agent.id, "while compacting", logger, {
+    replaceRunning: true,
+    activeTurnBehavior: "interrupt",
+    runOptions: { clientMessageId: "client-held" },
+  });
+  expect(held.disposition).toBe("held");
+  return { manager, agent, session };
+}
+
+test("Stop reaches Pi and lifts the hold while a compaction is stalled", async () => {
+  const { manager, agent, session } = await startStalledCompaction();
+  try {
+    const stopped = await cancelAgentRunCommand({ agentManager: manager, logger }, agent.id);
+    expect(stopped.cancelled).toBe(true);
+    expect(session.controlRequests).toContain("abort");
+    // pi has no RPC that aborts a manual compaction, so the escalation terminates the runtime.
+    expect(session.terminated).toBe(true);
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    expect(manager.hasInFlightRun(agent.id)).toBe(false);
+    // The held prompt was discarded by the Stop, not delivered.
+    expect(session.prompts).toEqual([]);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+}, 20_000);
+
+test("force-stop reaches Pi and lifts the hold while a compaction is stalled", async () => {
+  const { manager, agent, session } = await startStalledCompaction();
+  try {
+    await expect(manager.forceStopAgentRun(agent.id)).resolves.toMatchObject({
+      status: "settled",
+    });
+    expect(session.controlRequests).toContain("abort");
+    expect(session.terminated).toBe(true);
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+  } finally {
+    await manager.closeAgent(agent.id);
+  }
+}, 20_000);
 
 test("a Pi compaction that fails after it started is marked failed, not compacted", async () => {
   const pi = new FakePi();

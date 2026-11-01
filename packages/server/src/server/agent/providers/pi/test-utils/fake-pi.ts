@@ -179,6 +179,11 @@ export class FakePiSession implements PiRuntimeSession {
   emitCompactEnd = true;
   /** When set, `compact` waits on it between `compaction_start` and `compaction_end`. */
   compactGate: Promise<void> | null = null;
+  /**
+   * When set, `compact` waits on it before `compaction_start`: real Pi announces the compaction
+   * only after its own abort and preparation, so a dispatched /compact has a window with no marker.
+   */
+  compactStartGate: Promise<void> | null = null;
   /** When set, `abort` resolves only once it does: Pi's abort waits for its agent to go idle. */
   abortGate: Promise<void> | null = null;
   getStateError: Error | null = null;
@@ -286,6 +291,9 @@ export class FakePiSession implements PiRuntimeSession {
 
   async compact(customInstructions?: string): Promise<void> {
     this.compactRequests.push(customInstructions === undefined ? {} : { customInstructions });
+    if (this.compactStartGate) {
+      await this.compactStartGate;
+    }
     this.emit({ type: "compaction_start", reason: "manual" });
     await this.compactCompletion;
     if (this.compactGate) {
