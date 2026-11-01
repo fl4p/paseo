@@ -322,6 +322,33 @@ describe("user message identity", () => {
     expect(first[0]).toBe(second[0]);
   });
 
+  it("preserves prefixTokens and isInitialPrefix when merging canonical user messages", () => {
+    const local = createUserMessage({
+      clientMessageId: "client-1",
+      text: "hello",
+      timestamp: new Date("2026-07-26T10:00:00.000Z"),
+    });
+    const canonical = createUserMessage({
+      id: "provider-1",
+      messageId: "provider-1",
+      clientMessageId: "client-1",
+      text: "hello",
+      timestamp: new Date("2026-07-26T10:00:01.000Z"),
+      prefixTokens: 15000,
+      prefixTrunkDelta: 15000,
+      isInitialPrefix: true,
+    });
+
+    const result = upsertUserMessage([local], canonical);
+    expect(result[0]).toMatchObject({
+      clientMessageId: "client-1",
+      messageId: "provider-1",
+      prefixTokens: 15000,
+      prefixTrunkDelta: 15000,
+      isInitialPrefix: true,
+    });
+  });
+
   it("keeps local presentation when a later canonical row omits provider identity", () => {
     const timestamp = new Date("2026-07-27T10:00:00.000Z");
     const local = createUserMessage({

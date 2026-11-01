@@ -407,6 +407,9 @@ export type AgentTimelineItem =
       messageId?: string;
       clientMessageId?: string;
       origin?: PeerMessageOrigin;
+      prefixTokens?: number;
+      prefixTrunkDelta?: number;
+      isInitialPrefix?: boolean;
     }
   | { type: "assistant_message"; text: string; messageId?: string }
   | { type: "reasoning"; text: string }

@@ -163,6 +163,21 @@ function mergeIdentityEntries(existing: WorkingEntry, entry: WorkingEntry): Work
         seqStart: existing.seqStart,
         ...mergeIdentityMetadata(existing, entry, "identity"),
       };
+    case "user_message":
+      if (existing.item.type !== "user_message") return null;
+      return {
+        ...existing,
+        item: {
+          ...existing.item,
+          ...entry.item,
+          prefixTokens: entry.item.prefixTokens ?? existing.item.prefixTokens,
+          prefixTrunkDelta: entry.item.prefixTrunkDelta ?? existing.item.prefixTrunkDelta,
+          isInitialPrefix: entry.item.isInitialPrefix ?? existing.item.isInitialPrefix,
+        },
+        timestamp: existing.timestamp,
+        seqEnd: Math.max(existing.seqEnd, entry.seqEnd),
+        ...mergeIdentityMetadata(existing, entry, "identity"),
+      };
     default:
       return null;
   }

@@ -1,0 +1,25 @@
+[Unit]
+Description=Paseo daemon (patched source build: Pi tool-result images)
+Documentation=https://paseo.sh
+# Replaces the packaged paseo.service, which runs @getpaseo/cli 0.8.0 and drops image
+# content blocks from Pi tool results. /etc takes precedence over /usr/lib for the same
+# unit name, so this file is what `paseo-source.service` resolves to after a reload.
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+User=fab
+Group=fab
+WorkingDirectory=/home/fab/src/paseo-patch/packages/server
+Environment=HOME=/home/fab
+Environment=PASEO_HOME=/home/fab/.paseo
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/home/fab/.local/bin
+ExecStart=/usr/bin/node dist/scripts/supervisor-entrypoint.js
+Restart=on-failure
+RestartSec=5
+# the supervisor owns the daemon worker as a child; kill the whole tree on stop
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

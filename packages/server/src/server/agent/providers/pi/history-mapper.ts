@@ -1,6 +1,10 @@
 import { mapCustomMessageToToolCall } from "../custom-message.js";
 import type { AgentStreamEvent, AgentTimelineItem, ToolCallDetail } from "../../agent-sdk-types.js";
 import {
+  materializeProviderImage,
+  renderProviderImageOutputAsAssistantMarkdown,
+} from "../provider-image-output.js";
+import {
   createPiExtensionHost,
   type PiExtensionEventOutput,
   type PiExtensionHost,
@@ -12,6 +16,7 @@ import {
   mapToolDetail,
   parseToolArgs,
   parseToolResult,
+  splitPiToolResultImages,
   type PiToolResult,
   type PiTrackedToolCall,
 } from "./tool-call-mapper.js";
@@ -58,6 +63,23 @@ export function getUserMessageText(content: string | (PiTextContent | PiImageCon
   return textParts.join("\n\n");
 }
 
+function findRespondingAssistantUsage(
+  messages: readonly PiAgentMessage[],
+  startIndex: number,
+): { input?: number; cacheRead?: number } | undefined {
+  for (let j = startIndex; j < messages.length; j++) {
+    const next = messages[j];
+    if (!next || next.role === "user") break;
+    if (next.role === "assistant") {
+      const u = (next as { usage?: { input?: number; cacheRead?: number } }).usage;
+      if (typeof u?.input === "number") {
+        return u;
+      }
+    }
+  }
+  return undefined;
+}
+
 export class PiHistoryMapper {
   private readonly pendingToolCalls = new Map<string, PiTrackedToolCall>();
   private readonly hydrations: Promise<AgentStreamEvent[]>[] = [];
@@ -74,12 +96,27 @@ export class PiHistoryMapper {
 
   mapMessages(messages: readonly PiAgentMessage[]): AgentStreamEvent[] {
     const events: AgentStreamEvent[] = [];
+    let userTurnCount = 0;
 
-    for (const message of messages) {
+    for (let i = 0; i < messages.length; i++) {
+      const message = messages[i];
+      if (!message) continue;
       switch (message.role) {
-        case "user":
-          events.push(...this.mapUserMessage(message));
+        case "user": {
+          let prefixTokens: number | undefined;
+          let isInitialPrefix: boolean | undefined;
+
+          const u = findRespondingAssistantUsage(messages, i + 1);
+          if (typeof u?.input === "number") {
+            const isFirst = userTurnCount === 0;
+            prefixTokens = isFirst || !u.cacheRead ? u.input : Math.max(0, u.input - u.cacheRead);
+            isInitialPrefix = isFirst;
+            userTurnCount += 1;
+          }
+
+          events.push(...this.mapUserMessage(message, prefixTokens, isInitialPrefix));
           break;
+        }
         case "custom":
           events.push(...this.mapCustomMessage(message));
           break;
@@ -103,7 +140,11 @@ export class PiHistoryMapper {
     return (await Promise.all(this.hydrations)).flat();
   }
 
-  private mapUserMessage(message: Extract<PiAgentMessage, { role: "user" }>): AgentStreamEvent[] {
+  private mapUserMessage(
+    message: Extract<PiAgentMessage, { role: "user" }>,
+    prefixTokens?: number,
+    isInitialPrefix?: boolean,
+  ): AgentStreamEvent[] {
     const text = getUserMessageText(message.content);
     this.userIndex += 1;
     if (!text) {
@@ -118,6 +159,10 @@ export class PiHistoryMapper {
           type: "user_message",
           text,
           ...(userEntry ? { messageId: userEntry.id } : {}),
+          ...(typeof prefixTokens === "number"
+            ? { prefixTokens, prefixTrunkDelta: prefixTokens }
+            : {}),
+          ...(isInitialPrefix !== undefined ? { isInitialPrefix } : {}),
         },
       },
     ];
@@ -215,16 +260,29 @@ export class PiHistoryMapper {
       this.pendingToolCalls.get(message.toolCallId) ?? parseToolArgs(message.toolName, null);
     this.pendingToolCalls.delete(message.toolCallId);
     const result = parseToolResult({ content: message.content, details: message.details });
+    // Pull image blocks out of the result so base64 never reaches the tool output, then render
+    // each one as an assistant_message markdown image after the tool_call (mirroring the live
+    // path and the Claude provider, upstream #1717).
+    const { images, result: splitResult } = splitPiToolResultImages(result);
     const mapping = this.extensionHost.mapToolCall({
       callId: message.toolCallId,
       toolName: tracked.toolName,
       args: tracked.args,
       status: message.isError ? "failed" : "completed",
-      result,
+      result: splitResult,
     });
-    const detail = this.mapToolDetail(message.toolCallId, tracked, result, mapping?.detail);
+    const detail = this.mapToolDetail(message.toolCallId, tracked, splitResult, mapping?.detail);
     if (!detail) {
       return [];
+    }
+    const imageEvents: AgentStreamEvent[] = [];
+    for (const image of images) {
+      const imageItem = renderProviderImageOutputAsAssistantMarkdown(image, {
+        materialize: materializeProviderImage,
+      });
+      if (imageItem) {
+        imageEvents.push({ type: "timeline", provider: this.provider, item: imageItem });
+      }
     }
     return [
       {
@@ -235,9 +293,10 @@ export class PiHistoryMapper {
           name: mapping?.name ?? tracked.toolName,
           isError: Boolean(message.isError),
           detail,
-          errorText: extractTextFromToolResult(result) ?? "Tool call failed",
+          errorText: extractTextFromToolResult(splitResult) ?? "Tool call failed",
         }),
       },
+      ...imageEvents,
       ...this.extensionEvents(mapping),
     ];
   }
