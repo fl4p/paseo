@@ -21,7 +21,10 @@ import type { AgentScreenAgent } from "@/hooks/use-agent-screen-state-machine";
 import { usePaneContext } from "@/panels/pane-context";
 import { definePanel, type PanelDescriptor } from "@/panels/panel-registry";
 import { useSessionStore } from "@/stores/session-store";
-import { useSubagentsForParent } from "@/subagents/select";
+import type { SheetTab } from "@/stores/workspace-layout-store";
+import { ParentAgentCallout } from "@/subagents/parent";
+import { type SubagentRow, useSubagentsForParent } from "@/subagents/select";
+import { useSubagentSheetTab } from "@/subagents/sheet-tab";
 import { SubagentsTrack } from "@/subagents/track";
 import {
   providerSubagentKey,
@@ -36,6 +39,7 @@ import type { StreamItem } from "@/types/stream";
 import { deriveSidebarStateBucket } from "@/utils/sidebar-agent-state";
 import { TIMELINE_FETCH_PAGE_SIZE } from "@/timeline/timeline-fetch-policy";
 import type { TurnPresentation } from "@/timeline/turn-liveness";
+import { buildWorkspaceTabPersistenceKey } from "@/workspace-tabs/model";
 
 const ThemedSquare = withUnistyles(Square, (theme) => ({
   color: theme.colors.foregroundMuted,
@@ -61,10 +65,12 @@ function ProviderSubagentChildTrack({
   serverId,
   rows,
   onOpenProviderSubagent,
+  sheetTabFor,
 }: {
   serverId: string;
   rows: ReturnType<typeof useSubagentsForParent>;
   onOpenProviderSubagent: (parentAgentId: string, subagentId: string) => void;
+  sheetTabFor: (row: SubagentRow) => SheetTab | null;
 }) {
   if (rows.length === 0) return null;
   return (
@@ -74,6 +80,7 @@ function ProviderSubagentChildTrack({
         rows={rows}
         onOpenSubagent={NOOP_SUBAGENT}
         onOpenProviderSubagent={onOpenProviderSubagent}
+        sheetTabFor={sheetTabFor}
         onArchiveSubagent={NOOP_SUBAGENT}
       />
     </ComposerTrackBar>
@@ -234,7 +241,7 @@ function useProviderSubagentDescriptor(
 // oxlint-disable-next-line complexity -- merge of local per-subagent Stop and upstream projected timeline
 function ProviderSubagentPanel() {
   const { t } = useTranslation();
-  const { serverId, target, openFileInWorkspace, openTab } = usePaneContext();
+  const { serverId, workspaceId, tabId, target, openFileInWorkspace, openTab } = usePaneContext();
   invariant(target.kind === "provider_subagent", "ProviderSubagentPanel requires provider target");
   const key = providerSubagentKey(serverId, target.parentAgentId, target.subagentId);
   const streamId = `provider:${encodeURIComponent(target.parentAgentId)}:${encodeURIComponent(target.subagentId)}`;
@@ -263,6 +270,10 @@ function ProviderSubagentPanel() {
     providerParentSubagentId: target.subagentId,
   });
   const childTrackClearance = resolveChildTrackClearance(childRows.length, isCompact);
+  const sheetTabFor = useSubagentSheetTab(
+    buildWorkspaceTabPersistenceKey({ serverId, workspaceId }),
+    tabId,
+  );
   const openProviderChild = useCallback(
     (parentAgentId: string, subagentId: string) => {
       openTab({ kind: "provider_subagent", parentAgentId, subagentId });
@@ -377,26 +388,30 @@ function ProviderSubagentPanel() {
         parentAgentId={target.parentAgentId}
         subagentId={target.subagentId}
       />
-      <AgentStreamView
-        agentId={streamId}
-        serverId={serverId}
-        context={streamContext}
-        streamItems={timeline?.tail ?? EMPTY_STREAM_ITEMS}
-        streamHead={timeline?.head ?? EMPTY_STREAM_ITEMS}
-        turnPresentation={turnPresentation}
-        pendingPermissions={EMPTY_PERMISSIONS}
-        isAuthoritativeHistoryReady
-        onOpenWorkspaceFile={openFileInWorkspace}
-        readOnly
-        historyPagination={historyPagination}
-        bottomOverlayTailClearance={childTrackClearance.tail}
-        bottomOverlayControlClearance={childTrackClearance.controls}
-      />
-      <ProviderSubagentChildTrack
-        serverId={serverId}
-        rows={childRows}
-        onOpenProviderSubagent={openProviderChild}
-      />
+      <View style={styles.stream}>
+        <AgentStreamView
+          agentId={streamId}
+          serverId={serverId}
+          context={streamContext}
+          streamItems={timeline?.tail ?? EMPTY_STREAM_ITEMS}
+          streamHead={timeline?.head ?? EMPTY_STREAM_ITEMS}
+          turnPresentation={turnPresentation}
+          pendingPermissions={EMPTY_PERMISSIONS}
+          isAuthoritativeHistoryReady
+          onOpenWorkspaceFile={openFileInWorkspace}
+          readOnly
+          historyPagination={historyPagination}
+          bottomOverlayTailClearance={childTrackClearance.tail}
+          bottomOverlayControlClearance={childTrackClearance.controls}
+        />
+        <ProviderSubagentChildTrack
+          serverId={serverId}
+          rows={childRows}
+          onOpenProviderSubagent={openProviderChild}
+          sheetTabFor={sheetTabFor}
+        />
+      </View>
+      <ParentAgentCallout serverId={serverId} parentAgentId={target.parentAgentId} />
     </View>
   );
 }
@@ -430,6 +445,7 @@ const styles = StyleSheet.create((theme) => ({
     color: theme.colors.foreground,
     fontSize: theme.fontSize.sm,
   },
+  stream: { flex: 1, minHeight: 0 },
   unsupported: { flex: 1, alignItems: "center", justifyContent: "center", padding: 24 },
   unsupportedText: { color: theme.colors.foregroundMuted, textAlign: "center" },
 }));

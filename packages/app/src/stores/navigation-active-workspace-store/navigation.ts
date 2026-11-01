@@ -1,7 +1,6 @@
 import type { Agent, WorkspaceDescriptor } from "@/stores/session-store";
 import { pickAttentionAgent } from "@/utils/agent-attention";
 import {
-  buildHostWorkspaceOpenRoute,
   buildHostWorkspaceRoute,
   decodeWorkspaceIdFromPathSegment,
   parseHostWorkspaceRouteFromPathname,
@@ -13,6 +12,7 @@ import {
 import type { ActiveWorkspaceSelection } from "@/stores/last-workspace-selection";
 import { buildWorkspaceTabPersistenceKey, type WorkspaceTabTarget } from "@/workspace-tabs/model";
 import { prepareWorkspaceTab, type PrepareWorkspaceTabDeps } from "@/utils/prepare-workspace-tab";
+import type { OpenWorkspaceTabInput } from "@/stores/workspace-layout-store";
 import type { WorkspaceTabPlacement } from "@/stores/workspace-layout-actions";
 
 export interface RouteSelectionInput {
@@ -62,8 +62,11 @@ export interface NavigateToWorkspaceDeps extends PrepareWorkspaceTabDeps {
    * unchanged, so it cannot tell on its own whether the user is still on that workspace.
    */
   getLastWorkspaceSelection: () => ActiveWorkspaceSelection | null;
+  deferOpenTab: (input: OpenWorkspaceTabInput) => null;
   rememberLastWorkspace: (selection: ActiveWorkspaceSelection) => void;
   navigateToRoute: (route: string) => void;
+  revealTab: (workspaceKey: string, tabId: string | null) => void;
+  revealWorkspace: () => void;
 }
 
 export interface NavigateToLastWorkspaceDeps extends NavigateToWorkspaceDeps {}
@@ -116,13 +119,15 @@ export function navigateToWorkspace(
     workspaces,
     workspaceId: input.workspaceId,
   });
-  const shouldDeferAgentOpen = Boolean(
-    input.target?.kind === "agent" && (!resolvedWorkspaceId || !deps.isWorkspaceLayoutHydrated()),
-  );
+  const shouldDeferOpen = !resolvedWorkspaceId || !deps.isWorkspaceLayoutHydrated();
+  const openTab: NavigateToWorkspaceDeps["openTab"] = (request) => {
+    if (shouldDeferOpen) return deps.deferOpenTab(request);
+    const tabId = deps.openTab(request);
+    deps.revealTab(request.workspaceKey, tabId);
+    return tabId;
+  };
   if (input.target) {
-    if (!shouldDeferAgentOpen) {
-      prepareWorkspaceTab({ ...input, target: input.target }, deps);
-    }
+    prepareWorkspaceTab({ ...input, target: input.target }, { openTab });
   } else {
     const workspaceAgents = resolvedWorkspaceId
       ? Array.from(deps.getSessionAgents(input.serverId)).filter(
@@ -176,16 +181,12 @@ export function navigateToWorkspace(
         });
       }
     }
+    // An ephemeral reveal changes no persisted focus, so the workspace itself is revealed either
+    // way (compact layouts show the agent pane).
+    deps.revealWorkspace();
   }
 
-  const route =
-    input.target?.kind === "agent" && shouldDeferAgentOpen
-      ? buildHostWorkspaceOpenRoute(
-          input.serverId,
-          input.workspaceId,
-          `agent:${input.target.agentId}`,
-        )
-      : buildHostWorkspaceRoute(input.serverId, input.workspaceId);
+  const route = buildHostWorkspaceRoute(input.serverId, input.workspaceId);
   deps.rememberLastWorkspace({ serverId: input.serverId, workspaceId: input.workspaceId });
   deps.navigateToRoute(route);
   return route;

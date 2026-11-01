@@ -1,4 +1,4 @@
-import { existsSync, promises as fsPromises } from "node:fs";
+import { promises as fsPromises } from "node:fs";
 import type { Logger } from "pino";
 
 import { writeFileAtomic } from "../../../atomic-file.js";
@@ -534,18 +534,23 @@ export async function repairForkedSessionCompaction(input: {
  * answers with the session's `.jsonl` path, or `null` when it cannot be found.
  */
 export function createClaudeForkTranscriptStore(
-  resolvePath: (sessionId: string) => string | null,
+  resolvePath: (sessionId: string) => Promise<string | null> | string | null,
 ): ClaudeForkTranscriptStore {
   return {
-    read(sessionId) {
-      const path = resolvePath(sessionId);
-      if (!path || !existsSync(path)) {
+    async read(sessionId) {
+      const path = await resolvePath(sessionId);
+      if (!path) {
         return null;
       }
-      return fsPromises.readFile(path, "utf8");
+      try {
+        return await fsPromises.readFile(path, "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+      }
     },
     async write(sessionId, content) {
-      const path = resolvePath(sessionId);
+      const path = await resolvePath(sessionId);
       if (!path) {
         throw new Error(`Cannot locate the transcript of Claude session ${sessionId}`);
       }

@@ -1,4 +1,4 @@
-import fs from "node:fs";
+import { open, stat } from "node:fs/promises";
 
 import { type ClaudePeerMessage, readClaudePeerMessage } from "./peer-message.js";
 
@@ -26,13 +26,14 @@ export class ClaudePeerTranscriptTail {
     this.offset = null;
   }
 
-  read(historyPath: string | null): ClaudePeerMessage[] {
+  /** Callers await each read before the next; the offset is not guarded against overlap. */
+  async read(historyPath: string | null): Promise<ClaudePeerMessage[]> {
     if (!historyPath) {
       return [];
     }
     let size: number;
     try {
-      size = fs.statSync(historyPath).size;
+      size = (await stat(historyPath)).size;
     } catch {
       return [];
     }
@@ -45,7 +46,7 @@ export class ClaudePeerTranscriptTail {
     const from = Math.max(previous, size - ClaudePeerTranscriptTail.maxBytes);
     let chunk: string;
     try {
-      chunk = readRange(historyPath, from, size);
+      chunk = await readRange(historyPath, from, size);
     } catch {
       this.offset = size;
       return [];
@@ -68,14 +69,14 @@ export class ClaudePeerTranscriptTail {
 }
 
 /** Only the requested window is read; the transcript itself grows without bound. */
-function readRange(historyPath: string, from: number, to: number): string {
+async function readRange(historyPath: string, from: number, to: number): Promise<string> {
   const buffer = Buffer.alloc(to - from);
-  const fd = fs.openSync(historyPath, "r");
+  const handle = await open(historyPath, "r");
   try {
-    const read = fs.readSync(fd, buffer, 0, buffer.length, from);
-    return buffer.subarray(0, read).toString("utf8");
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, from);
+    return buffer.subarray(0, bytesRead).toString("utf8");
   } finally {
-    fs.closeSync(fd);
+    await handle.close();
   }
 }
 

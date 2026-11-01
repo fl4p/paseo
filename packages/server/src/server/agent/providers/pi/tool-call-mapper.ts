@@ -53,6 +53,7 @@ interface PiToolResultObject {
   stdout?: string;
   text?: string;
   content?: PiToolResultContent[];
+  structuredContent?: unknown;
   exitCode?: number;
   code?: number;
   details?: PiToolResultDetails;
@@ -68,11 +69,11 @@ interface PiToolResultTextContent {
   text: string;
 }
 
-interface PiToolResultImageContent {
-  type: "image";
-  data?: unknown;
-  mimeType?: unknown;
-}
+const PiToolResultImageContentSchema = z.object({
+  type: z.literal("image"),
+  data: z.string().min(1),
+  mimeType: z.string().optional(),
+});
 
 interface PiToolResultUnknownContent {
   type: string;
@@ -268,18 +269,34 @@ export function splitPiToolResultImages(result: PiToolResult): {
   if (!replaced) {
     return { images: [], result };
   }
-  return { images, result: { ...result, content } };
+  return {
+    images,
+    result: {
+      ...result,
+      content,
+      ...(result.structuredContent === undefined
+        ? {}
+        : { structuredContent: withoutImageData(result.structuredContent) }),
+    },
+  };
 }
 
-function toPiImageOutput(block: PiToolResultContent): ProviderImageOutput | null {
-  const candidate = block as PiToolResultImageContent;
-  if (candidate.type !== "image" || typeof candidate.data !== "string") {
-    return null;
-  }
-  return {
-    data: candidate.data,
-    mimeType: typeof candidate.mimeType === "string" ? candidate.mimeType : null,
-  };
+function withoutImageData(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutImageData);
+  if (value === null || typeof value !== "object") return value;
+  const image = toPiImageOutput(value);
+  return Object.fromEntries(
+    Object.entries(value).map(([key, child]) => [
+      key,
+      image && key === "data" ? "[image]" : withoutImageData(child),
+    ]),
+  );
+}
+
+function toPiImageOutput(block: unknown): ProviderImageOutput | null {
+  const parsed = PiToolResultImageContentSchema.safeParse(block);
+  if (!parsed.success) return null;
+  return { data: parsed.data.data, mimeType: parsed.data.mimeType ?? null };
 }
 
 export function extractTextFromToolResult(result: PiToolResult): string | undefined {

@@ -94,7 +94,7 @@ export class PiHistoryMapper {
     private readonly extensionHost: PiExtensionHost = createPiExtensionHost(),
   ) {}
 
-  mapMessages(messages: readonly PiAgentMessage[]): AgentStreamEvent[] {
+  async mapMessages(messages: readonly PiAgentMessage[]): Promise<AgentStreamEvent[]> {
     const events: AgentStreamEvent[] = [];
     let userTurnCount = 0;
 
@@ -124,7 +124,7 @@ export class PiHistoryMapper {
           events.push(...this.mapAssistantMessage(message));
           break;
         case "toolResult": {
-          events.push(...this.mapToolResultMessage(message));
+          events.push(...(await this.mapToolResultMessage(message)));
           break;
         }
         case "bashExecution":
@@ -253,9 +253,9 @@ export class PiHistoryMapper {
     return events;
   }
 
-  private mapToolResultMessage(
+  private async mapToolResultMessage(
     message: Extract<PiAgentMessage, { role: "toolResult" }>,
-  ): AgentStreamEvent[] {
+  ): Promise<AgentStreamEvent[]> {
     const tracked =
       this.pendingToolCalls.get(message.toolCallId) ?? parseToolArgs(message.toolName, null);
     this.pendingToolCalls.delete(message.toolCallId);
@@ -277,12 +277,10 @@ export class PiHistoryMapper {
     }
     const imageEvents: AgentStreamEvent[] = [];
     for (const image of images) {
-      const imageItem = renderProviderImageOutputAsAssistantMarkdown(image, {
+      const item = await renderProviderImageOutputAsAssistantMarkdown(image, {
         materialize: materializeProviderImage,
       });
-      if (imageItem) {
-        imageEvents.push({ type: "timeline", provider: this.provider, item: imageItem });
-      }
+      if (item) imageEvents.push({ type: "timeline", provider: this.provider, item });
     }
     return [
       {
@@ -357,9 +355,10 @@ export async function* streamPiHistory(
   signal?: AbortSignal,
 ): AsyncGenerator<AgentStreamEvent> {
   const mapper = new PiHistoryMapper(provider, userEntries, hooks, extensionHost);
-  for (const event of mapper.mapMessages(messages)) {
+  for (const message of messages) {
     if (signal?.aborted) return;
-    if (event) {
+    for (const event of await mapper.mapMessages([message])) {
+      if (signal?.aborted) return;
       yield event;
     }
   }

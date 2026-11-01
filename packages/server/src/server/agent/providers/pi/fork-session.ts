@@ -1,4 +1,4 @@
-import { existsSync, promises as fsPromises } from "node:fs";
+import { promises as fsPromises } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import type { Logger } from "pino";
@@ -320,11 +320,15 @@ export async function forkPiSession(options: {
   sessionDir?: string;
   logger?: Logger;
 }): Promise<{ sessionId: string; sessionPath: string }> {
-  if (!existsSync(options.sourceSessionPath)) {
-    throw new Error(`Cannot locate the transcript of Pi session at ${options.sourceSessionPath}`);
+  let content: string;
+  try {
+    content = await fsPromises.readFile(options.sourceSessionPath, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    throw new Error(`Cannot locate the transcript of Pi session at ${options.sourceSessionPath}`, {
+      cause: error,
+    });
   }
-
-  const content = await fsPromises.readFile(options.sourceSessionPath, "utf8");
   const entries = parsePiTranscriptEntries(content);
   const header = extractSessionHeader(entries);
 
@@ -443,7 +447,5 @@ export async function deleteForkedPiSession(options: {
   if (forkPath === sourcePath) {
     throw new Error(`Refusing to delete the source Pi session ${forkPath}`);
   }
-  if (existsSync(forkPath)) {
-    await fsPromises.unlink(forkPath);
-  }
+  await fsPromises.rm(forkPath, { force: true });
 }

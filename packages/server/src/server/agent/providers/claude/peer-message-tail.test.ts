@@ -38,21 +38,21 @@ describe("ClaudePeerTranscriptTail", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  test("does not re-read the history that was already on disk", () => {
+  test("does not re-read the history that was already on disk", async () => {
     writeFileSync(transcript, peerLine("old", "already replayed"));
     const tail = new ClaudePeerTranscriptTail();
 
-    expect(tail.read(transcript)).toEqual([]);
+    expect(await tail.read(transcript)).toEqual([]);
   });
 
-  test("finds a peer message appended since the last read", () => {
+  test("finds a peer message appended since the last read", async () => {
     writeFileSync(transcript, ordinaryLine("earlier turn"));
     const tail = new ClaudePeerTranscriptTail();
-    tail.read(transcript);
+    await tail.read(transcript);
 
     appendFileSync(transcript, ordinaryLine("noise") + peerLine("m-1", "the decision landed"));
 
-    expect(tail.read(transcript)).toEqual([
+    expect(await tail.read(transcript)).toEqual([
       {
         text: "the decision landed",
         msgId: "m-1",
@@ -61,53 +61,53 @@ describe("ClaudePeerTranscriptTail", () => {
     ]);
   });
 
-  test("reads each message once", () => {
+  test("reads each message once", async () => {
     writeFileSync(transcript, "");
     const tail = new ClaudePeerTranscriptTail();
-    tail.read(transcript);
+    await tail.read(transcript);
     appendFileSync(transcript, peerLine("m-1", "once"));
-    tail.read(transcript);
+    await tail.read(transcript);
 
-    expect(tail.read(transcript)).toEqual([]);
+    expect(await tail.read(transcript)).toEqual([]);
   });
 
-  test("keeps a half-written line for the next read instead of dropping it", () => {
+  test("keeps a half-written line for the next read instead of dropping it", async () => {
     writeFileSync(transcript, "");
     const tail = new ClaudePeerTranscriptTail();
-    tail.read(transcript);
+    await tail.read(transcript);
 
     const line = peerLine("m-1", "torn write");
     const split = Math.floor(line.length / 2);
     appendFileSync(transcript, line.slice(0, split));
-    expect(tail.read(transcript)).toEqual([]);
+    expect(await tail.read(transcript)).toEqual([]);
 
     appendFileSync(transcript, line.slice(split));
-    expect(tail.read(transcript).map((message) => message.msgId)).toEqual(["m-1"]);
+    expect((await tail.read(transcript)).map((message) => message.msgId)).toEqual(["m-1"]);
   });
 
-  test("still finds the newest message when a turn appended more than the read window", () => {
+  test("still finds the newest message when a turn appended more than the read window", async () => {
     writeFileSync(transcript, "");
     const tail = new ClaudePeerTranscriptTail();
-    tail.read(transcript);
+    await tail.read(transcript);
 
     appendFileSync(transcript, ordinaryLine("x".repeat(256 * 1024)));
     appendFileSync(transcript, peerLine("m-1", "after a very long turn"));
 
-    expect(tail.read(transcript).map((message) => message.msgId)).toEqual(["m-1"]);
+    expect((await tail.read(transcript)).map((message) => message.msgId)).toEqual(["m-1"]);
   });
 
-  test("an unreadable transcript costs position, not a crash", () => {
+  test("an unreadable transcript costs position, not a crash", async () => {
     expect(new ClaudePeerTranscriptTail().read(join(dir, "missing.jsonl"))).toEqual([]);
     expect(new ClaudePeerTranscriptTail().read(null)).toEqual([]);
   });
 
-  test("follows a different transcript from wherever it is after a reset", () => {
+  test("follows a different transcript from wherever it is after a reset", async () => {
     writeFileSync(transcript, "");
     const tail = new ClaudePeerTranscriptTail();
-    tail.read(transcript);
+    await tail.read(transcript);
     appendFileSync(transcript, peerLine("m-1", "before the reset"));
     tail.reset();
 
-    expect(tail.read(transcript)).toEqual([]);
+    expect(await tail.read(transcript)).toEqual([]);
   });
 });
