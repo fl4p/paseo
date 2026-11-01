@@ -516,14 +516,20 @@ function fitEntry(
     return { entry, cost: entry.text.length + 1, truncated: false };
   }
   const cap = cost - 1;
-  if (cap <= FORK_CONTEXT_ENTRY_TRUNCATION_MARKER.length) {
+  const marker = `\n${FORK_CONTEXT_ENTRY_TRUNCATION_MARKER}\n`;
+  if (cap <= marker.length) {
     // Not even the marker fits: the budget is too small for this entry to say
     // anything, so drop it rather than emit a stub that breaks the cap.
     return { entry: null, cost: 0, truncated: true };
   }
-  const kept = entry.text.slice(0, cap - FORK_CONTEXT_ENTRY_TRUNCATION_MARKER.length);
+  // Keep both ends, as upstream does: the start states what the entry is about and the end of a
+  // long reply is usually its conclusion.
+  const available = cap - marker.length;
+  const headLength = Math.ceil(available / 2);
+  const tailLength = available - headLength;
+  const tail = tailLength > 0 ? entry.text.slice(-tailLength) : "";
   return {
-    entry: activityEntry(`${kept}${FORK_CONTEXT_ENTRY_TRUNCATION_MARKER}`),
+    entry: activityEntry(`${entry.text.slice(0, headLength)}${marker}${tail}`),
     cost: cap + 1,
     truncated: true,
   };

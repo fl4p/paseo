@@ -649,6 +649,27 @@ describe("fork context budget and compaction boundary", () => {
     expect(result.attachment.text.length).toBeLessThan(2500);
   });
 
+  it("bounds one oversized fork message without losing its beginning and end", () => {
+    // Ported from upstream (#8280 era, there against a 100k budget): an entry cut to fit keeps
+    // both ends, because the end of a long reply is usually its conclusion.
+    const result = buildAgentForkContextAttachment({
+      rows: [
+        row(1, {
+          type: "assistant_message",
+          text: "Beginning. " + "x".repeat(1_100_000) + " The end.",
+        }),
+      ],
+      agentTitle: "T".repeat(200_000),
+      cwd: "/" + "p".repeat(200_000),
+    });
+    const text = result.attachment.text;
+    expect(text.length).toBeLessThanOrEqual(60_000 + 4_000);
+    expect(text).toContain("[Assistant] Beginning.");
+    expect(text).toContain("message truncated to fit the context budget");
+    expect(text).toContain("The end.");
+    expect(text).toMatch(/\n<\/chat-history-summary>$/);
+  });
+
   it("says in the header that history was omitted, not that it was cut short", () => {
     const filler = "x".repeat(400);
     const rows: AgentTimelineRow[] = [
