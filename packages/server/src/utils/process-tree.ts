@@ -19,8 +19,8 @@ export interface ProcessTreeSnapshot {
   readonly root: ProcessIdentity;
 }
 
-async function readProcesses(): Promise<ProcessIdentity[]> {
-  const options = { timeout: 5_000, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" as const };
+async function readProcesses(timeoutMs = 5_000): Promise<ProcessIdentity[]> {
+  const options = { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024, encoding: "utf8" as const };
   if (process.platform === "win32") {
     const { stdout } = await execFileAsync(
       "powershell.exe",
@@ -165,4 +165,69 @@ export async function terminateCapturedProcessTree(
     options.forceTimeoutMs ?? 2_000,
   );
   return killed ? "killed" : "kill-timeout";
+}
+
+export interface VerifiedKillResult {
+  /** PIDs that still matched the snapshot and were sent SIGKILL. */
+  killed: number[];
+  /** The snapshot's own process group, sent SIGKILL because its leader is still the root. */
+  killedGroup?: number;
+  /** PIDs now held by a different process (start time or group changed); never signalled. */
+  mismatched: number[];
+}
+
+/**
+ * Last-resort SIGKILL for a snapshot whose orderly termination could not finish. A PID in a stale
+ * snapshot may since belong to an unrelated process, so one quick enumeration decides: only a PID
+ * whose start time (and process group, where both are known) still match is signalled. Exited and
+ * reused PIDs are dropped from the snapshot. Throws if the enumeration fails; the caller then
+ * signals nothing beyond what it can verify by other means.
+ */
+export async function killVerifiedProcessTree(
+  snapshot: ProcessTreeSnapshot,
+  timeoutMs: number,
+): Promise<VerifiedKillResult> {
+  const rows = await readProcesses(Math.max(1, timeoutMs));
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const result: VerifiedKillResult = { killed: [], mismatched: [] };
+  const leader = snapshot.groupId === undefined ? undefined : byPid.get(snapshot.groupId);
+  if (
+    snapshot.groupId !== undefined &&
+    snapshot.groupId > 0 &&
+    process.platform !== "win32" &&
+    leader &&
+    !leader.zombie &&
+    leader.started === snapshot.root.started
+  ) {
+    try {
+      process.kill(-snapshot.groupId, "SIGKILL");
+      result.killedGroup = snapshot.groupId;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+  }
+  for (const [pid, identity] of Array.from(snapshot.processes).toReversed()) {
+    const row = byPid.get(pid);
+    if (!row || row.zombie) {
+      snapshot.processes.delete(pid);
+      continue;
+    }
+    const sameGroup =
+      identity.groupId === undefined ||
+      row.groupId === undefined ||
+      identity.groupId === row.groupId;
+    if (!identity.started || row.started !== identity.started || !sameGroup) {
+      snapshot.processes.delete(pid);
+      result.mismatched.push(pid);
+      continue;
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+      result.killed.push(pid);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      snapshot.processes.delete(pid);
+    }
+  }
+  return result;
 }

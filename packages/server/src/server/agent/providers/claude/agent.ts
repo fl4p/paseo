@@ -175,6 +175,7 @@ import { withTimeout } from "../../../../utils/promise-timeout.js";
 import { terminateWithTreeKill } from "../../../../utils/tree-kill.js";
 import {
   captureProcessTree,
+  killVerifiedProcessTree,
   refreshProcessTree,
   terminateCapturedProcessTree,
   type ProcessTreeSnapshot,
@@ -188,24 +189,9 @@ const fsPromises = promises;
 const CLAUDE_CLOSE_BUDGET_MS = 4_000;
 /** Most of that budget one process-tree refresh may use before close kills the known tree. */
 const CLAUDE_CLOSE_REFRESH_MS = 1_000;
+/** Kept back from the orderly kill for the verified last-resort SIGKILL. */
+const CLAUDE_CLOSE_FALLBACK_RESERVE_MS = 750;
 
-/** Last resort for close(): SIGKILL the processes already known to belong to Claude. */
-function killKnownProcesses(tree: ProcessTreeSnapshot | null, child: ChildProcess | null): void {
-  for (const pid of tree ? Array.from(tree.processes.keys()).toReversed() : []) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }
-  if (child && child.exitCode === null && child.signalCode === null) {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }
-}
 const CLAUDE_SETTING_SOURCES: NonNullable<ClaudeOptions["settingSources"]> = [
   "user",
   "project",
@@ -3859,6 +3845,8 @@ class ClaudeAgentSession implements AgentSession {
     // process enumeration may take up to 5 s itself, so per-step timeouts do not add up to a bound.
     const deadline = Date.now() + CLAUDE_CLOSE_BUDGET_MS;
     const remaining = () => Math.max(0, deadline - Date.now());
+    // What the orderly kill may use; the rest is kept for the last-resort kill below.
+    const orderly = () => Math.max(0, remaining() - CLAUDE_CLOSE_FALLBACK_RESERVE_MS);
     let processTree = this.retiringProcessTree;
     try {
       if (!processTree && capture) {
@@ -3866,7 +3854,7 @@ class ClaudeAgentSession implements AgentSession {
         // hold close hostage, so fall back to the root's tree.
         processTree = await withTimeout(
           capture,
-          Math.min(250, remaining()),
+          Math.min(250, orderly()),
           "Claude process tree capture",
         ).catch(() => null);
       }
@@ -3876,7 +3864,7 @@ class ClaudeAgentSession implements AgentSession {
         // A failed or slow refresh still leaves the last known tree to kill.
         await withTimeout(
           refreshProcessTree(tree),
-          Math.min(CLAUDE_CLOSE_REFRESH_MS, remaining()),
+          Math.min(CLAUDE_CLOSE_REFRESH_MS, orderly()),
           "Claude process tree refresh",
         ).catch((error: unknown) => {
           this.logger.warn(
@@ -3885,14 +3873,14 @@ class ClaudeAgentSession implements AgentSession {
           );
         });
         result = await withTimeout(
-          terminateCapturedProcessTree(tree, this.closeTerminationOptions(remaining())),
-          remaining(),
+          terminateCapturedProcessTree(tree, this.closeTerminationOptions(orderly())),
+          orderly(),
           "Claude process tree termination",
         );
       } else if (child) {
         result = await withTimeout(
-          terminateWithTreeKill(child, this.closeTerminationOptions(remaining())),
-          remaining(),
+          terminateWithTreeKill(child, this.closeTerminationOptions(orderly())),
+          orderly(),
           "Claude process termination",
         );
       } else {
@@ -3911,10 +3899,59 @@ class ClaudeAgentSession implements AgentSession {
         { err: error, pid: child?.pid, agentId: this.agentId },
         "Claude process tree cleanup did not finish during close; sending SIGKILL to the known tree",
       );
-      killKnownProcesses(processTree, child);
+      await this.killKnownProcessTree(processTree, child, remaining());
     } finally {
       this.retiringProcessTree = null;
       this.processTreeCapture = null;
+    }
+  }
+
+  /**
+   * Last resort for close(). The root goes through its ChildProcess handle, whose PID the OS cannot
+   * hand to another process while the handle is unreaped. The rest of the snapshot may be stale, so
+   * only processes whose identity one quick enumeration confirms are signalled; if that
+   * enumeration cannot run, they are left alone and named in a warning.
+   */
+  private async killKnownProcessTree(
+    tree: ProcessTreeSnapshot | null,
+    child: ChildProcess | null,
+    budgetMs: number,
+  ): Promise<void> {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    if (!tree) {
+      return;
+    }
+    const unverified = () => Array.from(tree.processes.keys()).filter((pid) => pid !== child?.pid);
+    if (budgetMs <= 0) {
+      this.logger.warn(
+        { pids: unverified(), agentId: this.agentId },
+        "No time left to verify Claude's remaining processes during close; not signalling them",
+      );
+      return;
+    }
+    try {
+      const result = await withTimeout(
+        killVerifiedProcessTree(tree, budgetMs),
+        budgetMs,
+        "Claude process identity probe",
+      );
+      if (result.mismatched.length > 0) {
+        this.logger.warn(
+          { pids: result.mismatched, agentId: this.agentId },
+          "Skipped PIDs from Claude's process tree that now belong to other processes",
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        { err: error, pids: unverified(), agentId: this.agentId },
+        "Could not verify Claude's remaining processes during close; not signalling them",
+      );
     }
   }
 

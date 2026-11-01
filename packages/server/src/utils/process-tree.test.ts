@@ -4,7 +4,11 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
-import { captureProcessTree, terminateCapturedProcessTree } from "./process-tree.js";
+import {
+  captureProcessTree,
+  killVerifiedProcessTree,
+  terminateCapturedProcessTree,
+} from "./process-tree.js";
 
 const roots: string[] = [];
 const children: ChildProcess[] = [];
@@ -131,4 +135,44 @@ test.runIf(process.platform !== "win32")(
     expect(() => process.kill(parent.pid!, 0)).not.toThrow();
     expect(() => process.kill(pid, 0)).not.toThrow();
   },
+);
+
+function spawnSleeper(): ChildProcess {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+    stdio: "ignore",
+  });
+  children.push(child);
+  return child;
+}
+
+function isRunning(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null;
+}
+
+test.skipIf(process.platform === "win32")(
+  "the verified last-resort kill never signals a PID whose start time no longer matches",
+  async () => {
+    const reused = spawnSleeper();
+    const owned = spawnSleeper();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const snapshot = await captureProcessTree(owned.pid!);
+    const reusedIdentity = (await captureProcessTree(reused.pid!)).root;
+    // The snapshot remembers a process at `reused.pid` that started at another time: the PID has
+    // since been given to an unrelated process.
+    snapshot.processes.set(reused.pid!, { ...reusedIdentity, started: "Sat Jan  1 00:00:00 2000" });
+    const exited = once(owned, "exit");
+
+    const result = await killVerifiedProcessTree(snapshot, 2_000);
+
+    await exited;
+    expect(result.killed).toEqual([owned.pid]);
+    expect(result.mismatched).toEqual([reused.pid]);
+    expect(snapshot.processes.has(reused.pid!)).toBe(false);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(isRunning(reused)).toBe(true);
+    // An exited process is dropped from the snapshot on the next pass.
+    await killVerifiedProcessTree(snapshot, 2_000);
+    expect(snapshot.processes.has(owned.pid!)).toBe(false);
+  },
+  15_000,
 );
