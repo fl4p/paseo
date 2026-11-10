@@ -1,13 +1,13 @@
-import type { AgentFeature, AgentFeatureToggle } from "../../agent-sdk-types.js";
-import { claudeAccountFeature, type ClaudeAccount } from "./accounts.js";
+import type { AgentOptionControl, AgentOptionToggleControl } from "../../agent-sdk-types.js";
+import { claudeAccountControl, type ClaudeAccount } from "./accounts.js";
 import { claudeManifestModelSupportsFastMode } from "./model-manifest.js";
 import { claudeServedModelSupportsFastMode } from "./served-catalog.js";
 
-export const CLAUDE_FAST_MODE_FEATURE: Omit<AgentFeatureToggle, "value"> = {
+export const CLAUDE_FAST_MODE_CONTROL: AgentOptionToggleControl = {
   type: "toggle",
-  id: "fast_mode",
+  key: "fast_mode",
   label: "Fast",
-  description: "Lower latency Opus responses at higher token cost",
+  description: "Lower latency responses at higher token cost",
   tooltip: "Toggle fast mode",
   icon: "zap",
 };
@@ -17,22 +17,12 @@ export function claudeModelSupportsFastMode(modelId: string | null | undefined):
   return claudeManifestModelSupportsFastMode(modelId) || claudeServedModelSupportsFastMode(modelId);
 }
 
-export function buildClaudeFeatures(input: {
-  modelId: string | null | undefined;
-  fastModeEnabled: boolean;
-  accounts?: ClaudeAccount[];
-  account?: unknown;
-}): AgentFeature[] {
-  const accounts = claudeAccountFeature(input.accounts ?? [], input.account);
-  if (!claudeModelSupportsFastMode(input.modelId)) {
-    return accounts;
-  }
-
+export function buildClaudeControls(
+  modelId: string | null | undefined,
+  accounts: ClaudeAccount[] = [],
+): AgentOptionControl[] {
   return [
-    ...accounts,
-    {
-      ...CLAUDE_FAST_MODE_FEATURE,
-      value: input.fastModeEnabled,
-    },
+    ...claudeAccountControl(accounts),
+    ...(claudeModelSupportsFastMode(modelId) ? [{ ...CLAUDE_FAST_MODE_CONTROL }] : []),
   ];
 }

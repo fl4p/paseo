@@ -17,7 +17,7 @@ import { z } from "zod";
 import {
   type AgentCapabilityFlags,
   type AgentClient,
-  type AgentFeature,
+  type AgentDraftControls,
   type AgentLaunchContext,
   type AgentMetadata,
   type AgentMode,
@@ -264,6 +264,7 @@ interface PiRpcAgentSessionOptions {
   currentModeId?: string | null;
   persistedSessionFile?: string;
   cleanup?: () => void;
+  closeAfterHistory?: boolean;
   extensionTimeoutMs?: number;
   logger: Logger;
   usagePollScheduler?: PiUsagePollScheduler;
@@ -698,8 +699,6 @@ function createPiPaseoExtensionFile({
 	        requestId,
 	        // Rewind targets: rows can still show entries that a rewind or compaction left off the branch.
 	        treeEntries: toCapturedUserEntries(ctx.sessionManager.getEntries()),
-	        // The entries getMessages() replays, so the nth one is the nth replayed user message.
-	        contextEntries: toCapturedUserEntries(ctx.sessionManager.buildContextEntries()),
 	      }),
 	    "info",
 	  );
@@ -1255,7 +1254,6 @@ export class PiRpcAgentSession implements AgentSession {
   } | null = null;
   private hasRecordedInitialPrefix = false;
   currentLeafOverrideId: string | null | undefined;
-  private readonly contextUserEntries: PiCapturedEntry[] = [];
   private readonly treeUserEntriesById = new Map<string, PiCapturedEntry>();
   private readonly pendingExtensionResults = new Map<string, PendingExtensionResult>();
   private compactionPromise: Promise<void> | null = null;
@@ -1268,6 +1266,7 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly logger: Logger;
   private readonly usagePoller: PiUsagePoller;
   private closed = false;
+  private runtimeDead = false;
   private readonly closeController = new AbortController();
   private readonly pendingExtensionHydrations = new Set<Promise<void>>();
   private pendingOutput: Promise<void> | null = null;
@@ -1301,6 +1300,7 @@ export class PiRpcAgentSession implements AgentSession {
     this.currentModeId = options.currentModeId ?? null;
     this.persistedSessionFile = options.persistedSessionFile;
     this.cleanup = options.cleanup;
+    this.closeAfterHistory = options.closeAfterHistory ?? false;
     this.extensionTimeoutMs = options.extensionTimeoutMs ?? DEFAULT_PI_EXTENSION_RESULT_TIMEOUT_MS;
     this.logger = options.logger;
     this.extensionHost = createPiExtensionHost(this.logger);
@@ -1332,6 +1332,7 @@ export class PiRpcAgentSession implements AgentSession {
   private readonly config: AgentSessionConfig;
   private readonly persistedSessionFile?: string;
   private readonly cleanup?: () => void;
+  private readonly closeAfterHistory: boolean;
   private readonly extensionTimeoutMs: number;
 
   get id(): string | null {
@@ -1351,6 +1352,9 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async startTurn(prompt: AgentPromptInput, options?: AgentRunOptions): Promise<StartTurnResult> {
+    if (this.runtimeDead) {
+      throw new Error("Pi process exited. Reload agent before sending another message.");
+    }
     if (this.activeTurnId) {
       throw new Error("A Pi turn is already active");
     }
@@ -1511,16 +1515,21 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
-    await this.requestEntryCapture("history");
-    yield* streamPiHistory(
-      this.provider,
-      await this.runtimeSession.getMessages(),
-      this.contextUserEntries,
-      {},
-      // At most eight 2 MiB child files per replay; later cards retain their summaries.
-      createPiExtensionHost(this.logger, undefined, 16 * 1024 * 1024),
-      this.closeController.signal,
-    );
+    try {
+      await this.requestEntryCapture("history");
+      const history = await this.runtimeSession.getHistory();
+      yield* streamPiHistory(
+        this.provider,
+        history.messages,
+        history.userEntries,
+        {},
+        // At most eight 2 MiB child files per replay; later cards retain their summaries.
+        createPiExtensionHost(this.logger, undefined, 16 * 1024 * 1024),
+        this.closeController.signal,
+      );
+    } finally {
+      if (this.closeAfterHistory) await this.close();
+    }
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
@@ -1848,10 +1857,10 @@ export class PiRpcAgentSession implements AgentSession {
     return null;
   }
 
-  async setModel(modelId: string | null): Promise<void> {
+  async setModel(modelId: string | null): Promise<{ model: string | null }> {
     const parsedReference = parseModelReference(modelId);
     if (!parsedReference) {
-      return;
+      return { model: modelToId(this.state.model) };
     }
     if (!parsedReference.provider) {
       throw new Error(`Pi model id must include a provider: ${modelId}`);
@@ -1860,6 +1869,7 @@ export class PiRpcAgentSession implements AgentSession {
     const model = await this.runtimeSession.setModel(parsedReference.provider, parsedReference.id);
     await this.refreshState();
     this.config.model = `${model.provider}/${model.id}`;
+    return { model: modelToId(this.state.model) };
   }
 
   async setThinkingOption(thinkingOptionId: string | null): Promise<void> {
@@ -2178,13 +2188,9 @@ export class PiRpcAgentSession implements AgentSession {
     }
   }
 
-  private recordCapturedUserEntries(input: {
-    treeEntries: PiCapturedEntry[];
-    contextEntries: PiCapturedEntry[];
-  }): void {
-    this.contextUserEntries.splice(0, this.contextUserEntries.length, ...input.contextEntries);
+  private recordCapturedUserEntries(entries: PiCapturedEntry[]): void {
     this.treeUserEntriesById.clear();
-    for (const entry of input.treeEntries) {
+    for (const entry of entries) {
       this.treeUserEntriesById.set(entry.id, entry);
     }
   }
@@ -2228,10 +2234,7 @@ export class PiRpcAgentSession implements AgentSession {
     if (!payload) {
       return false;
     }
-    this.recordCapturedUserEntries({
-      treeEntries: parseCapturedEntries(payload.treeEntries),
-      contextEntries: parseCapturedEntries(payload.contextEntries),
-    });
+    this.recordCapturedUserEntries(parseCapturedEntries(payload.treeEntries));
     if (typeof payload.requestId === "string") {
       this.resolveExtensionResult(payload.requestId, undefined);
     }
@@ -2367,6 +2370,7 @@ export class PiRpcAgentSession implements AgentSession {
   }
 
   private handleProcessExit(error: string): void {
+    this.runtimeDead = true;
     this.rejectAllExtensionResults(new Error(error));
     if (this.terminating && this.cancelActiveTurnForTermination()) {
       return;
@@ -3005,6 +3009,7 @@ export class PiRpcAgentClient implements AgentClient {
         capabilities: capabilitiesForSession(mcp !== null),
         persistedSessionFile: sessionCopy ? sessionFile : undefined,
         cleanup: cleanupTempFiles,
+        closeAfterHistory: options?.purpose === "history",
         extensionTimeoutMs: providerOptions.extensionTimeoutMs,
         logger: this.logger,
         usagePollScheduler: this.usagePollScheduler,
@@ -3095,8 +3100,8 @@ export class PiRpcAgentClient implements AgentClient {
     }
   }
 
-  async listFeatures(_config: AgentSessionConfig): Promise<AgentFeature[]> {
-    return [];
+  async listControls(config: AgentSessionConfig): Promise<AgentDraftControls> {
+    return { controls: [], options: config.providerOptions ?? {} };
   }
 
   async listImportableSessions(

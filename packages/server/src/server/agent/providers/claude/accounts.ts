@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { z } from "zod";
-import type { AgentFeatureSelect } from "../../agent-sdk-types.js";
+import type { AgentOptionSelectControl } from "../../agent-sdk-types.js";
 import { claudeProjectDirSync } from "./project-dir.js";
 
 export const CLAUDE_ACCOUNT_FEATURE = "account";
@@ -47,28 +47,24 @@ export function resolveClaudeAccount(
   accounts: ClaudeAccount[],
   value: unknown,
 ): ClaudeAccount | null {
-  if (value === undefined || value === DEFAULT_CLAUDE_ACCOUNT) return null;
+  if (value === undefined || value === null || value === DEFAULT_CLAUDE_ACCOUNT) return null;
   const account = accounts.find((entry) => entry.id === value);
   if (!account) throw new ClaudeAccountError(`Unknown Claude account: ${String(value)}`);
   return account;
 }
 
-export function claudeAccountFeature(
-  accounts: ClaudeAccount[],
-  value: unknown,
-): AgentFeatureSelect[] {
-  const account = resolveClaudeAccount(accounts, value);
+export function claudeAccountControl(accounts: ClaudeAccount[]): AgentOptionSelectControl[] {
   if (accounts.length === 0) return [];
   return [
     {
       type: "select",
-      id: CLAUDE_ACCOUNT_FEATURE,
+      key: CLAUDE_ACCOUNT_FEATURE,
       label: "Account",
       tooltip: "Choose a Claude subscription account (running subagents resume after switching)",
-      value: account?.id ?? DEFAULT_CLAUDE_ACCOUNT,
-      options: [
-        { id: DEFAULT_CLAUDE_ACCOUNT, label: "Default account" },
-        ...accounts.map(({ id, label }) => ({ id, label })),
+      defaultValue: DEFAULT_CLAUDE_ACCOUNT,
+      choices: [
+        { value: DEFAULT_CLAUDE_ACCOUNT, label: "Default account" },
+        ...accounts.map(({ id, label }) => ({ value: id, label })),
       ],
     },
   ];

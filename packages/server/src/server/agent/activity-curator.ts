@@ -16,6 +16,12 @@ const DEFAULT_MAX_ITEMS = 0;
 const MAX_TOOL_INPUT_CHARS = 400;
 const MAX_TOOL_SUMMARY_CHARS = 200;
 const MAX_FORK_METADATA_CHARS = 1_000;
+// A fork copies only these kinds, so only they can make a checkpoint stale.
+const FORK_CONTEXT_KINDS: readonly AgentTimelineItem["type"][] = [
+  "user_message",
+  "assistant_message",
+  "tool_call",
+];
 
 interface ActivityCuratorOptions {
   maxItems?: number;
@@ -319,7 +325,14 @@ function selectRowsUpToForkBoundary(input: {
     );
   }
   const boundarySeq = projectedRows[boundaryIndex].seqEnd;
-  if (projectedRows.some((row) => row.seqStart <= boundarySeq && row.seqEnd > boundarySeq)) {
+  if (
+    projectedRows.some(
+      (row) =>
+        FORK_CONTEXT_KINDS.includes(row.item.type) &&
+        row.seqStart <= boundarySeq &&
+        row.seqEnd > boundarySeq,
+    )
+  ) {
     throw new Error(
       "This checkpoint changed after it was created. Fork from a later completed response instead.",
     );
@@ -720,7 +733,7 @@ export function buildAgentForkContextAttachment(input: {
   const curated = curateProjectedActivityEntries(selected.items, {
     maxItems: 0,
     labelAssistantMessages: true,
-    includeKinds: ["user_message", "assistant_message", "tool_call"],
+    includeKinds: FORK_CONTEXT_KINDS,
     includeExternalToolInput: false,
   });
   const maxChars = input.maxChars ?? DEFAULT_FORK_CONTEXT_MAX_CHARS;

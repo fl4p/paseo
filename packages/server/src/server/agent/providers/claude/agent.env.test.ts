@@ -45,7 +45,7 @@ describe("Claude SDK env", () => {
       providerParams: { accounts: { work: { label: "Work", configDir: "/tmp/selected-account" } } },
     });
     const session = await client.createSession(
-      { provider: "claude", cwd: process.cwd(), featureValues: { account: "work" } },
+      { provider: "claude", cwd: process.cwd(), providerOptions: { account: "work" } },
       {
         env: {
           CLAUDE_CONFIG_DIR: "/tmp/launch-account",

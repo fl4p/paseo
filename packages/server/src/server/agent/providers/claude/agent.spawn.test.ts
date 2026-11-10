@@ -79,10 +79,9 @@ describe("Claude spawn override", () => {
           env: {},
           signal: new AbortController().signal,
         });
-        await expect(session.setFeature?.("account", "work")).rejects.toThrow(expectedError);
-        expect(session.features).toContainEqual(
-          expect.objectContaining({ id: "account", value: "default" }),
-        );
+        await expect(session.applyOptions?.({ account: "work" })).rejects.toThrow(expectedError);
+        // Still on the default account: selecting it again is a no-op rather than a switch.
+        await expect(session.applyOptions?.({ account: "default" })).resolves.toBeUndefined();
         await expect(session.listCommands?.()).rejects.toThrow(expectedError);
       } finally {
         terminate.mockResolvedValue("already-exited");

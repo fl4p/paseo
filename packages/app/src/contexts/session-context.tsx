@@ -12,7 +12,6 @@ import {
   refreshAgentInitializationTimeout,
 } from "@/hooks/use-agent-initialization";
 import type { StreamItem } from "@/types/stream";
-import { deriveAgentStreamTurnLiveness } from "@/timeline/session-stream-reducers";
 import { planTimelineTailFetch } from "@/timeline/timeline-sync-plan";
 import { requestTimelineReplacement } from "@/timeline/timeline-replacement";
 import { type ViewedTimelineOwner } from "@/timeline/viewed-timeline-sync";
@@ -361,8 +360,6 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
     const onStream = (message: SessionOutboundMessage) => {
       if (message.type !== "agent_stream") return;
       const { agentId, event, timestamp, seq, epoch } = message.payload;
-      const parsedTimestamp = new Date(timestamp);
-      const streamEvent = event;
       if (event.type === "prompt_discarded") {
         // COMPAT(promptDiscardedEvents): daemons that predate the `agent_prompt_discarded`
         // session event send the discard only in this form, and only for an observed timeline.
@@ -380,18 +377,7 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       ) {
         voiceRuntime?.onTurnEvent(serverId, agentId, event.type);
       }
-      const turnLiveness = deriveAgentStreamTurnLiveness([
-        { event: streamEvent, seq, epoch, timestamp: parsedTimestamp },
-      ]);
-      if (turnLiveness.length > 0) {
-        getHostRuntimeStore().applyAgentTurnLiveness(serverId, agentId, turnLiveness);
-      }
-      sync.enqueueStreamEvent(agentId, {
-        event: streamEvent,
-        seq,
-        epoch,
-        timestamp: parsedTimestamp,
-      });
+      sync.applyStreamEvent(agentId, { event, seq, epoch, timestamp: new Date(timestamp) });
 
       // NOTE: We don't update lastActivityAt on every stream event to prevent
       // cascading rerenders. The agent_update handler updates agent.lastActivityAt
@@ -410,8 +396,10 @@ function SessionProviderInternal({ children, serverId, client }: SessionProvider
       });
     };
     const sync = getHostRuntimeStore().createViewedTimelineOwner(serverId, {
-      observe: (agentIds) => {
-        const observation = client.observeTimeline(agentIds);
+      canCheckFreshness: () =>
+        client.getLastServerInfoMessage()?.features?.timelineFreshnessCheck === true,
+      observe: (agentIds, cursors) => {
+        const observation = client.observeTimeline(agentIds, { cursors });
         observation.subscribe({
           snapshot: () => {},
           update: (message) => {

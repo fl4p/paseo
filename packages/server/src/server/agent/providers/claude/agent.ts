@@ -1,6 +1,8 @@
 import { setImmediate } from "node:timers/promises";
 import { ClaudeRuntimeSafety } from "./runtime-safety.js";
-import { validateProviderOptions } from "../../provider-options.js";
+import type { ProviderOptions } from "@getpaseo/protocol/agent-types";
+import { applyProviderOptionsPatch } from "../../option-controls.js";
+import { assertChangesAreLive, validateProviderOptions } from "../../provider-options.js";
 import type { ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -67,7 +69,7 @@ import { foldSubagentObservations, type SubagentObservation } from "./subagents/
 import { observeReplayWorkflows } from "./subagents/workflow-replay-source.js";
 import { limitAgentTimelineItemContent } from "../../agent-timeline-content.js";
 import { readClaudeWorkflowResultFile } from "./subagents/workflow-output.js";
-import { buildClaudeFeatures, claudeModelSupportsFastMode } from "./feature-definitions.js";
+import { buildClaudeControls, claudeModelSupportsFastMode } from "./feature-definitions.js";
 import {
   buildBinaryDiagnosticRows,
   buildCommandResolutionDiagnosticRows,
@@ -126,7 +128,8 @@ import {
   type AgentCapabilityFlags,
   type AgentClient,
   type AgentCreateSessionOptions,
-  type AgentFeature,
+  type AgentDraftControls,
+  type AgentOptionControl,
   type AgentLaunchContext,
   type AgentMetadata,
   type AgentMode,
@@ -481,6 +484,12 @@ interface SlashCommandInvocation {
   commandName: string;
   args?: string;
   rawInput: string;
+}
+
+// Claude Code reserves `__`-prefixed commands for its own server-launched sessions
+// (for example `/__remote-workflow`); a user cannot run them from a Paseo agent.
+function isClaudeInternalSlashCommand(commandName: string): boolean {
+  return commandName.startsWith("__");
 }
 
 function classifyClaudeSlashCommand(commandName: string): AgentSlashCommand["kind"] {
@@ -1126,9 +1135,6 @@ function coerceSessionMetadata(metadata: AgentMetadata | undefined): Partial<Age
   if (typeof metadata.modeId === "string") {
     result.modeId = metadata.modeId;
   }
-  if (isMetadata(metadata.featureValues)) {
-    result.featureValues = metadata.featureValues;
-  }
   if (typeof metadata.model === "string") {
     result.model = metadata.model;
   }
@@ -1138,6 +1144,14 @@ function coerceSessionMetadata(metadata: AgentMetadata | undefined): Partial<Age
   const providerOptions = ClaudeProviderOptionsSchema.safeParse(metadata.providerOptions);
   if (providerOptions.success) {
     result.providerOptions = providerOptions.data;
+  }
+  // COMPAT(claudeAccountFeatureValues): handles saved before the options refactor kept the
+  // selected subscription account in featureValues.
+  const legacyAccount = isMetadata(metadata.featureValues)
+    ? metadata.featureValues.account
+    : undefined;
+  if (typeof legacyAccount === "string" && result.providerOptions?.account === undefined) {
+    result.providerOptions = { ...result.providerOptions, account: legacyAccount };
   }
   if (typeof metadata.systemPrompt === "string") {
     result.systemPrompt = metadata.systemPrompt;
@@ -1834,14 +1848,11 @@ export class ClaudeAgentClient implements AgentClient {
     });
   }
 
-  async listFeatures(config: AgentSessionConfig): Promise<AgentFeature[]> {
-    const claudeConfig = this.assertConfig(config);
-    return buildClaudeFeatures({
-      modelId: claudeConfig.model,
-      fastModeEnabled: claudeConfig.featureValues?.fast_mode === true,
-      accounts: this.accounts,
-      account: claudeConfig.featureValues?.account,
-    });
+  async listControls(config: AgentSessionConfig): Promise<AgentDraftControls> {
+    return {
+      controls: buildClaudeControls(this.assertConfig(config).model, this.accounts),
+      options: config.providerOptions ?? {},
+    };
   }
 
   async listImportableSessions(
@@ -1973,7 +1984,7 @@ export class ClaudeAgentClient implements AgentClient {
     if (config.provider !== "claude") {
       throw new Error(`ClaudeAgentClient received config for provider '${config.provider}'`);
     }
-    resolveClaudeAccount(this.accounts, config.featureValues?.account);
+    resolveClaudeAccount(this.accounts, config.providerOptions?.account);
     const model = config.model?.trim();
     // `accounts` is Paseo's own provider option (read by parseClaudeAccounts at client level),
     // not a Claude Agent SDK option, so it never reaches the strict SDK options schema.
@@ -2388,6 +2399,7 @@ class ClaudeAgentSession implements AgentSession {
   private readonly resolveBinary: () => Promise<string>;
   private query: Query | null = null;
   private readonly runtimeSafety = new ClaudeRuntimeSafety();
+  private readonly backgroundStops = new Map<string, (outcome: string) => void>();
   private processingSdkMessages = 0;
   private readonly usageSessionKey = randomUUID();
   private harnessEnvironmentCache: { account: unknown; env: Record<string, string> } | null = null;
@@ -2465,6 +2477,7 @@ class ClaudeAgentSession implements AgentSession {
   private historySessionId: string | null = null;
   private replayingHistory = false;
   private turnState: TurnState = "idle";
+  private readonly turnNamespace = randomUUID();
   private nextTurnOrdinal = 1;
   private cancelCurrentTurn: (() => void) | null = null;
   private cachedRuntimeInfo: AgentRuntimeInfo | null = null;
@@ -2486,6 +2499,8 @@ class ClaudeAgentSession implements AgentSession {
   private compactionMarkerClosedWithoutBoundary = false;
   private queryPumpPromise: Promise<void> | null = null;
   private queryRestartNeeded = false;
+  /** True from the moment a query's launch options are copied until the query exists. */
+  private queryStarting = false;
   private pendingInterruptAbort = false;
   /**
    * Whether Claude's main session is inside one of its own turns: set by system/init and by a
@@ -2495,6 +2510,12 @@ class ClaudeAgentSession implements AgentSession {
   private mainTurnInFlight = false;
   private foregroundHasVisibleActivity = false;
   private activeTurnHasAssistantText = false;
+  /**
+   * The reply Claude Code writes when a turn stops on an API error ("You've hit your session
+   * limit", "API Error: 529 ..."), held back until the result says whether the turn failed: a
+   * failed turn shows the same text as its error, so showing both would repeat it.
+   */
+  private withheldErrorReply: AgentTimelineItem[] = [];
   private readonly contextUsage: ClaudeContextUsageState;
   private userMessageIds: string[] = [];
   private readonly emittedUserMessageIds = new Set<string>();
@@ -2504,6 +2525,7 @@ class ClaudeAgentSession implements AgentSession {
   private pendingFreshSessionId: string | null = null;
   private recentStderr = "";
   private closed = false;
+  readonly openOptionsPatch: Record<string, unknown> = {};
 
   constructor(config: ClaudeAgentConfig, options: ClaudeAgentSessionOptions) {
     this.config = config;
@@ -2550,19 +2572,21 @@ class ClaudeAgentSession implements AgentSession {
     if (this.currentMode !== "plan") {
       this.planResumeMode = this.currentMode;
     }
+
+    // Fast cannot run on this model, so the session opens with it off. Off rather than removed
+    // keeps a `config.json` default of `fast_mode: true` from filling it back in.
+    if (config.providerOptions.fast_mode === true && !claudeModelSupportsFastMode(config.model)) {
+      this.config.providerOptions = { ...config.providerOptions, fast_mode: false };
+      this.openOptionsPatch = { fast_mode: false };
+    }
   }
 
   get id(): string | null {
     return this.claudeSessionId;
   }
 
-  get features(): AgentFeature[] {
-    return buildClaudeFeatures({
-      modelId: this.config.model,
-      fastModeEnabled: this.config.featureValues?.fast_mode === true,
-      accounts: this.accounts,
-      account: this.config.featureValues?.account,
-    });
+  get controls(): AgentOptionControl[] {
+    return buildClaudeControls(this.config.model, this.accounts);
   }
 
   async getRuntimeInfo(): Promise<AgentRuntimeInfo> {
@@ -2572,7 +2596,7 @@ class ClaudeAgentSession implements AgentSession {
     const info: AgentRuntimeInfo = {
       provider: "claude",
       sessionId: this.claudeSessionId,
-      model: this.lastOptionsModel,
+      model: this.lastOptionsModel ?? this.config.model ?? null,
       modeId: this.currentMode ?? null,
       ...(this.lastRuntimeModel
         ? {
@@ -2646,6 +2670,7 @@ class ClaudeAgentSession implements AgentSession {
     this.activeForegroundTurnId = turnId;
     this.foregroundHasVisibleActivity = false;
     this.activeTurnHasAssistantText = false;
+    this.withheldErrorReply = [];
     this.contextUsage.beginTurn();
     this.transitionTurnState("foreground", "foreground turn started");
     this.clearRecentStderr();
@@ -2692,6 +2717,7 @@ class ClaudeAgentSession implements AgentSession {
       this.activeForegroundQuery = this.query;
       this.activeForegroundInput = this.input;
       this.startQueryPump();
+      this.runtimeSafety.notePromptSent();
       this.input.push(sdkMessage);
       setTimeout(() => {
         if (this.activeForegroundTurnId === turnId) {
@@ -2775,6 +2801,33 @@ class ClaudeAgentSession implements AgentSession {
     return () => {
       this.subscribers.delete(callback);
     };
+  }
+
+  async stopBackgroundWork(id: string): Promise<void> {
+    const query = this.query;
+    if (!query || !this.runtimeSafety.canStop(id))
+      throw new Error("Background work is no longer available");
+    if (this.backgroundStops.has(id)) throw new Error("Stop is already pending");
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let finish!: (outcome: string) => void;
+    const outcome = new Promise<string>((resolve) => {
+      finish = resolve;
+      this.backgroundStops.set(id, resolve);
+    });
+    try {
+      const result = await Promise.race([
+        Promise.all([query.stopTask(id), outcome]).then(([, value]) => value),
+        outcome.then((value) => (value === "stopped" ? new Promise<string>(() => {}) : value)),
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => resolve("timeout"), 15000);
+        }),
+      ]);
+      if (result !== "stopped") throw new Error(`Background work stop: ${result}`);
+      if (this.query !== query) throw new Error("Background work connection changed");
+    } finally {
+      clearTimeout(timer);
+      if (this.backgroundStops.get(id) === finish) this.backgroundStops.delete(id);
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -2896,15 +2949,27 @@ class ClaudeAgentSession implements AgentSession {
     this.currentMode = normalized;
   }
 
-  async setModel(modelId: string | null): Promise<void> {
+  async setModel(modelId: string | null): Promise<{ model: string | null }> {
     const normalizedModelId =
       typeof modelId === "string" && modelId.trim().length > 0 ? modelId.trim() : null;
     const activeQuery = await this.ensureQuery();
     await activeQuery.setModel(normalizedModelId ?? undefined);
     this.config.model = normalizedModelId ?? undefined;
     this.reconcileThinkingOptionForModel(normalizedModelId);
-    if (!claudeModelSupportsFastMode(this.config.model) && this.config.featureValues?.fast_mode) {
-      await this.applyFastModeFeature(false, activeQuery);
+    if (this.config.providerOptions.fast_mode) {
+      const supported = claudeModelSupportsFastMode(this.config.model);
+      await activeQuery.applyFlagSettings({ fastMode: supported });
+      if (!supported) {
+        // Fast cannot run on this model. Reporting it off rather than removed keeps a
+        // `config.json` default of `fast_mode: true` from filling it back in.
+        this.config.providerOptions = { ...this.config.providerOptions, fast_mode: false };
+        this.pushEvent({
+          type: "options_changed",
+          provider: "claude",
+          patch: { fast_mode: false },
+        });
+      }
+      this.cachedRuntimeInfo = null;
     }
     this.contextUsage.setInitialContextWindowMaxTokens(
       getClaudeContextWindowMaxTokens(this.config.model),
@@ -2914,6 +2979,7 @@ class ClaudeAgentSession implements AgentSession {
     this.cachedRuntimeInfo = null;
     // Model change affects persistence metadata, so invalidate cached handle.
     this.persistence = null;
+    return { model: this.lastOptionsModel ?? this.config.model ?? null };
   }
 
   private reconcileThinkingOptionForModel(modelId: string | null): void {
@@ -2956,23 +3022,44 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
-  async setFeature(featureId: string, value: unknown): Promise<void> {
-    if (featureId === CLAUDE_ACCOUNT_FEATURE) {
-      await this.switchAccount(value);
-      return;
+  async applyOptions(options: ProviderOptions): Promise<void> {
+    // The account is not a live SDK option: switchAccount retires and relaunches the query
+    // itself, carrying the conversation and resumable subagents over to the selected account.
+    if (Object.hasOwn(options, CLAUDE_ACCOUNT_FEATURE)) {
+      const { [CLAUDE_ACCOUNT_FEATURE]: account, ...rest } = options;
+      await this.switchAccount(account);
+      if (Object.keys(rest).length === 0) return;
+      options = rest;
     }
-    if (featureId !== "fast_mode") {
-      throw new Error(`Unknown Claude feature: ${featureId}`);
+    // Every option but Fast is read when the query is built, and replacing a started query would
+    // end its background work, so once it exists only Fast can change.
+    if (this.query || this.queryStarting) {
+      assertChangesAreLive({
+        provider: "claude",
+        patch: options,
+        current: this.config.providerOptions,
+        live: ["fast_mode"],
+      });
     }
-
-    const enabled = Boolean(value);
-    if (enabled && !claudeModelSupportsFastMode(this.config.model)) {
+    const providerOptions =
+      validateProviderOptions(
+        "claude",
+        ClaudeProviderOptionsSchema,
+        applyProviderOptionsPatch({ options: this.config.providerOptions, patch: options }),
+      ) ?? {};
+    if (providerOptions.fast_mode === true && !claudeModelSupportsFastMode(this.config.model)) {
       throw new Error(
         `Claude fast mode is not available for model '${this.config.model ?? "default"}'`,
       );
     }
-
-    await this.applyFastModeFeature(enabled);
+    const fastModeChanged =
+      (providerOptions.fast_mode === true) !== (this.config.providerOptions.fast_mode === true);
+    if (fastModeChanged) {
+      await this.query?.applyFlagSettings({ fastMode: providerOptions.fast_mode === true });
+      this.cachedRuntimeInfo = null;
+    }
+    // Held until the runtime accepts, so a rejected change is retried instead of skipped.
+    this.config.providerOptions = providerOptions;
   }
 
   private accountMigrationTasks(): string[] {
@@ -3008,7 +3095,7 @@ class ClaudeAgentSession implements AgentSession {
   private async switchAccount(value: unknown): Promise<void> {
     const account = resolveClaudeAccount(this.accounts, value);
     const selectedId = account?.id ?? DEFAULT_CLAUDE_ACCOUNT;
-    const currentId = this.config.featureValues?.account ?? DEFAULT_CLAUDE_ACCOUNT;
+    const currentId = this.config.providerOptions.account ?? DEFAULT_CLAUDE_ACCOUNT;
     if (this.switchingAccount) throw new ClaudeAccountError("Account switch already in progress.");
     if (selectedId === currentId) return;
     if (this.closed) throw new ClaudeAccountError("Claude session is closed.");
@@ -3049,7 +3136,7 @@ class ClaudeAgentSession implements AgentSession {
       await validateClaudeAccountSubagents(sourcePath, migration.taskIds);
       const sessionId = await this.copyAccountConversation(account, sourceConfigDir, sourcePath);
       if (this.closed) throw new ClaudeAccountError("Claude session closed during account switch.");
-      this.config.featureValues = { ...this.config.featureValues, account: selectedId };
+      this.config.providerOptions = { ...this.config.providerOptions, account: selectedId };
       this.claudeSessionId = sessionId;
       this.persistence = null;
       this.cachedRuntimeInfo = null;
@@ -3097,18 +3184,6 @@ class ClaudeAgentSession implements AgentSession {
       });
     }
     return sessionId;
-  }
-
-  private async applyFastModeFeature(enabled: boolean, query?: Query): Promise<void> {
-    this.config.featureValues = {
-      ...this.config.featureValues,
-      fast_mode: enabled,
-    };
-    const activeQuery = query ?? this.query;
-    if (activeQuery) {
-      await activeQuery.applyFlagSettings({ fastMode: enabled });
-    }
-    this.cachedRuntimeInfo = null;
   }
 
   getPendingPermissions(): AgentPermissionRequest[] {
@@ -3294,6 +3369,9 @@ class ClaudeAgentSession implements AgentSession {
     // The whole of close() runs inside the daemon's 5 s close budget, so the deadline starts here.
     const deadline = Date.now() + CLAUDE_CLOSE_BUDGET_MS;
     this.closed = true;
+    // Once closed, the pump stops at its next message and detaches the query in its finally, which
+    // can happen during the waits below. Keep the handles so shutdown still closes the SDK query.
+    const open = { query: this.query, input: this.input };
     // A rebind still retiring its query, or a history load, gets a short wait so close does not
     // race it needlessly; process teardown never waits for it beyond that. Both check `closed`.
     // Not ensureHistoryReady(): that would start a history load nobody needs any more.
@@ -3310,7 +3388,9 @@ class ClaudeAgentSession implements AgentSession {
       });
     }
     this.rejectAllPendingPermissions(new Error("Claude session closed"));
-    this.cancelCurrentTurn?.();
+    // AgentManager settles the run after runtime release. Preserve cleanup records
+    // without reporting this closure as an explicit turn cancellation.
+    this.flushPendingToolCalls();
     this.subscribers.clear();
     this.activeForegroundTurnId = null;
     this.activeForegroundQuery = null;
@@ -3321,7 +3401,7 @@ class ClaudeAgentSession implements AgentSession {
     this.sidechainTracker.clear();
     this.settledSubagentToolCalls.clear();
     this.taskProtocolSource.reset();
-    await this.shutDownQueryForClose(deadline);
+    await this.shutDownQueryForClose(deadline, open);
     if (this.persistSession === false && this.claudeSessionId) {
       // Claude Code currently ignores --no-session-persistence outside --print mode
       // (see `claude --help`), so the SDK's persistSession=false is silently dropped
@@ -3357,6 +3437,7 @@ class ClaudeAgentSession implements AgentSession {
     const commands = await q.supportedCommands();
     const commandMap = new Map<string, AgentSlashCommand>();
     for (const cmd of commands) {
+      if (isClaudeInternalSlashCommand(cmd.name)) continue;
       if (!commandMap.has(cmd.name)) {
         commandMap.set(cmd.name, {
           name: cmd.name,
@@ -3852,11 +3933,14 @@ class ClaudeAgentSession implements AgentSession {
    * spawn so orphaned tool and MCP children are included, gets SIGTERM then SIGKILL, and a tree
    * that will not report exit is logged rather than thrown, since close has no caller to retry.
    */
-  private async shutDownQueryForClose(deadline: number): Promise<void> {
+  private async shutDownQueryForClose(
+    deadline: number,
+    open: { query: Query | null; input: { end(): void } | null },
+  ): Promise<void> {
     const child = this.childProcess;
     const capture = this.processTreeCapture;
-    this.input?.end();
-    this.query?.close?.();
+    (this.input ?? open.input)?.end();
+    (this.query ?? open.query)?.close?.();
     this.query = null;
     this.input = null;
     this.queryPumpPromise = null;
@@ -4002,12 +4086,14 @@ class ClaudeAgentSession implements AgentSession {
    * announcements an account switch must recover). A session rebind passes false: the old
    * session's late output must not land in the new session's timeline.
    */
+  // oxlint-disable-next-line complexity -- merge of account-switch drain handling (local) plus background-work stops (upstream)
   private async retireQuery(
     onRetired?: () => void,
     options: { routeRetiringEvents?: boolean } = {},
   ): Promise<void> {
     const oldQuery = this.query;
     const oldInput = this.input;
+    for (const finish of this.backgroundStops.values()) finish("connection lost");
     const retiredChild = this.childProcess;
     const retiredPump = this.queryPumpPromise;
     // Capture before SDK close can orphan tool/MCP processes. Keep this snapshot if cleanup
@@ -4062,7 +4148,16 @@ class ClaudeAgentSession implements AgentSession {
         ]);
         onRetired?.();
         this.failRunningRuntimeTasks();
-        if (drained.status === "rejected") throw drained.reason;
+        if (drained.status === "rejected") {
+          // Only an account switch needs the drained stream: its late task announcements decide
+          // what is recovered. Any other restart goes on; the retired query's late events are
+          // already ignored once it leaves retiringQueries.
+          if (onRetired) throw drained.reason;
+          this.logger.warn(
+            { err: drained.reason, agentId: this.agentId },
+            "Retired Claude stream did not settle; continuing the restart",
+          );
+        }
       }
       if (settled.status === "rejected") throw settled.reason;
     } finally {
@@ -4087,14 +4182,27 @@ class ClaudeAgentSession implements AgentSession {
     this.persistence = null;
 
     const input = createAsyncMessageInput<SDKUserMessage>();
-    const selectedAccount = this.config.featureValues?.account;
-    const options = await this.buildOptions(launchMode);
-    if (this.switchingAccount || selectedAccount !== this.config.featureValues?.account) {
-      throw new ClaudeAccountError("The account changed while Claude was starting. Please retry.");
+    const selectedAccount = this.config.providerOptions.account;
+    // buildOptions copies the launch options before it waits, so from here they are fixed.
+    this.queryStarting = true;
+    let options: ClaudeOptions;
+    try {
+      options = await this.buildOptions(launchMode);
+      // Closure can finish while launch options are being prepared.
+      if (this.closed) throw new Error("Claude session is closed");
+      if (this.switchingAccount || selectedAccount !== this.config.providerOptions.account) {
+        throw new ClaudeAccountError(
+          "The account changed while Claude was starting. Please retry.",
+        );
+      }
+    } catch (error) {
+      this.queryStarting = false;
+      throw error;
     }
     this.logger.debug({ options: summarizeClaudeOptionsForLog(options) }, "claude query");
     this.input = input;
     this.runtimeSafety.reset();
+    this.dispatchEvents([{ type: "background_work", provider: "claude", items: null }]);
     // A fresh Claude process has no turn of its own in flight.
     this.mainTurnInFlight = false;
     this.query = claudeQuery(
@@ -4103,7 +4211,7 @@ class ClaudeAgentSession implements AgentSession {
         runtimeSettings: this.runtimeSettings,
         launchEnv: this.launchEnv,
         accountEnv: claudeAccountEnv(
-          resolveClaudeAccount(this.accounts, this.config.featureValues?.account),
+          resolveClaudeAccount(this.accounts, this.config.providerOptions.account),
         ),
         queryFactory: this.queryFactory,
         onChildProcess: (child) => {
@@ -4116,6 +4224,7 @@ class ClaudeAgentSession implements AgentSession {
         },
       },
     );
+    this.queryStarting = false;
     const fastMode = this.resolveFastModeSetting();
     if (fastMode !== null) {
       await this.query.applyFlagSettings({ fastMode });
@@ -4226,7 +4335,7 @@ class ClaudeAgentSession implements AgentSession {
    * must follow it.
    */
   private get harnessEnvironment(): Record<string, string> {
-    const account = this.config.featureValues?.account;
+    const account = this.config.providerOptions.account;
     if (!this.harnessEnvironmentCache || this.harnessEnvironmentCache.account !== account) {
       this.harnessEnvironmentCache = { account, env: this.buildSdkEnv() };
     }
@@ -4239,7 +4348,7 @@ class ClaudeAgentSession implements AgentSession {
       runtimeSettings: this.runtimeSettings,
       overlays: [
         this.launchEnv,
-        claudeAccountEnv(resolveClaudeAccount(this.accounts, this.config.featureValues?.account)),
+        claudeAccountEnv(resolveClaudeAccount(this.accounts, this.config.providerOptions.account)),
         // Makes the CLI announce session_state_changed, whose "idle" is the safety net that closes
         // an autonomous turn (see consumeSessionStateChange).
         { CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS: "1" },
@@ -4250,10 +4359,14 @@ class ClaudeAgentSession implements AgentSession {
   private async buildOptions(permissionMode: PermissionMode): Promise<ClaudeOptions> {
     const { thinking, effort, ultracode } = this.resolveThinkingConfig();
     const appendedSystemPrompt = this.buildAppendedSystemPrompt();
-    const providerOptions = applyClaudeToolPolicy(
-      this.config.providerOptions,
-      this.config.toolPolicy,
-    );
+    // `fast_mode` and `account` are composer controls: fast mode is applied through flag settings,
+    // the account through the launch environment (CLAUDE_CONFIG_DIR).
+    const {
+      fast_mode: _fastMode,
+      account: _account,
+      ...sdkProviderOptions
+    } = this.config.providerOptions;
+    const providerOptions = applyClaudeToolPolicy(sdkProviderOptions, this.config.toolPolicy);
     const settingsOptions = await this.buildSettingsOptions(providerOptions, { ultracode });
     const sdkEnv = this.harnessEnvironment;
     assertClaudeModeCanRun(permissionMode, sdkEnv);
@@ -4374,7 +4487,7 @@ class ClaudeAgentSession implements AgentSession {
     if (!claudeModelSupportsFastMode(this.config.model)) {
       return null;
     }
-    return this.config.featureValues?.fast_mode === true;
+    return this.config.providerOptions.fast_mode === true;
   }
 
   private normalizeMcpServers(
@@ -4531,7 +4644,7 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private createTurnId(owner: "foreground" | "autonomous"): string {
-    return `${owner}-turn-${this.nextTurnOrdinal++}`;
+    return `${owner}-turn-${this.turnNamespace}-${this.nextTurnOrdinal++}`;
   }
 
   private isTerminalTurnEvent(event: AgentStreamEvent): boolean {
@@ -4753,11 +4866,15 @@ class ClaudeAgentSession implements AgentSession {
   }
 
   private failRunningRuntimeTasks(): void {
-    this.dispatchEvents(
-      foldSubagentObservations(this.taskProtocolSource.failRunningTasks()).map(
+    for (const finish of this.backgroundStops.values()) finish("connection lost");
+    this.runtimeSafety.retire();
+    this.dispatchEvents([
+      ...foldSubagentObservations(this.taskProtocolSource.failRunningTasks()).map(
         (event): AgentStreamEvent => ({ type: "provider_subagent", provider: "claude", event }),
       ),
-    );
+      // The SDK resets its background task set when the CLI process (re)starts.
+      { type: "background_work", provider: "claude", items: null },
+    ]);
   }
 
   private startQueryPump(): void {
@@ -4825,7 +4942,9 @@ class ClaudeAgentSession implements AgentSession {
       if (!this.acceptsQueryEvents(activeQuery)) return true;
       this.processingSdkMessages++;
       try {
-        this.runtimeSafety.observe(message);
+        const backgroundWork = this.runtimeSafety.observe(message);
+        if (message.type === "system" && message.subtype === "task_notification")
+          this.backgroundStops.get(message.task_id)?.(message.status);
         logRawMessage(message);
         consecutiveInterruptAbortRecoveries = 0;
         if (
@@ -4836,6 +4955,11 @@ class ClaudeAgentSession implements AgentSession {
         }
         if (!this.acceptsQueryEvents(activeQuery)) return true;
         await this.routeSdkMessageFromPump(message, activeQuery);
+        if (!this.acceptsQueryEvents(activeQuery)) return true;
+        if (backgroundWork && this.runtimeSafety.isCurrentInventory(backgroundWork))
+          this.dispatchEvents([
+            { type: "background_work", provider: "claude", items: backgroundWork },
+          ]);
         return false;
       } finally {
         this.processingSdkMessages--;
@@ -5076,6 +5200,21 @@ class ClaudeAgentSession implements AgentSession {
               }) satisfies AgentStreamEvent,
           );
 
+    if (!readClaudeParentToolUseId(message)) {
+      if (message.type === "assistant" && message.error) {
+        this.withheldErrorReply.push(...assistantTimelineEvents.map((event) => event.item));
+        return messageEvents;
+      }
+      if (
+        message.type === "assistant" ||
+        message.type === "user" ||
+        message.type === "stream_event"
+      ) {
+        const released: AgentStreamEvent[] = [];
+        this.releaseWithheldErrorReply(released);
+        return [...released, ...messageEvents, ...assistantTimelineEvents];
+      }
+    }
     return [...messageEvents, ...assistantTimelineEvents];
   }
 
@@ -5514,6 +5653,13 @@ class ClaudeAgentSession implements AgentSession {
       this.appendTaskNotificationEvents(message, events);
       return;
     }
+    if (message.subtype === "background_tasks_changed") {
+      this.logger.debug(
+        { tasks: message.tasks.map(({ task_id, task_type }) => ({ task_id, task_type })) },
+        "claude.background_tasks_changed",
+      );
+      return;
+    }
     if (message.subtype === "task_progress") {
       return;
     }
@@ -5772,6 +5918,7 @@ class ClaudeAgentSession implements AgentSession {
     }
   }
 
+  // oxlint-disable-next-line complexity -- merge of compaction-marker close (local) plus API-error results (upstream)
   private appendResultEvents(
     message: Extract<SDKMessage, { type: "result" }>,
     events: AgentStreamEvent[],
@@ -5779,13 +5926,31 @@ class ClaudeAgentSession implements AgentSession {
     const usage = this.convertUsage(message);
     // A compaction that ends without a `compact_boundary` (failed, interrupted, or a no-op
     // /compact) would otherwise leave the spinner running until something else redraws it.
-    // An error result did not compact, so the marker must not say it did.
+    // An error result did not compact, so the marker must not say it did; Claude Code reports
+    // a turn that stopped on an API error as `success` with `is_error`.
     const closedCompaction = this.closeCompactionMarker(
-      message.subtype === "success" ? undefined : "failed",
+      message.subtype === "success" && !message.is_error ? undefined : "failed",
     );
     if (closedCompaction) {
       events.push(closedCompaction);
     }
+    // Claude Code reports a turn that stopped on an API error (a usage limit, an overloaded or
+    // rejected request) as `success` with `is_error`, carrying the error text in `result`.
+    if (message.subtype === "success" && message.is_error) {
+      const withheld = this.withheldErrorReply;
+      this.withheldErrorReply = [];
+      const resultText = typeof message.result === "string" ? message.result.trim() : "";
+      const withheldText = withheld
+        .map((item) => (item.type === "assistant_message" ? item.text : ""))
+        .join("\n")
+        .trim();
+      if (usage) events.push({ type: "usage_updated", provider: "claude", usage });
+      events.push(...this.sidechainTracker.finishAll("failed"));
+      events.push(this.buildTurnFailedEvent(resultText || withheldText || "Claude run failed"));
+      return;
+    }
+    const releasedErrorReply = this.withheldErrorReply.length > 0;
+    this.releaseWithheldErrorReply(events);
     if (message.subtype === "success") {
       events.push(...this.sidechainTracker.finishAll("completed"));
       // Built-in slash commands (e.g. /voice, /usage, "Unknown command: …")
@@ -5795,7 +5960,12 @@ class ClaudeAgentSession implements AgentSession {
       // accounting from provider gateways does not duplicate streamed output.
       const resultText = typeof message.result === "string" ? message.result.trim() : "";
       const outputTokens = message.usage?.output_tokens;
-      if (resultText.length > 0 && outputTokens === 0 && !this.activeTurnHasAssistantText) {
+      if (
+        resultText.length > 0 &&
+        outputTokens === 0 &&
+        !this.activeTurnHasAssistantText &&
+        !releasedErrorReply
+      ) {
         events.push({
           type: "timeline",
           provider: "claude",
@@ -5813,8 +5983,17 @@ class ClaudeAgentSession implements AgentSession {
       "errors" in message && Array.isArray(message.errors) && message.errors.length > 0
         ? message.errors.join("\n")
         : "Claude run failed";
+    if (usage) events.push({ type: "usage_updated", provider: "claude", usage });
     events.push(...this.sidechainTracker.finishAll("failed"));
     events.push(this.buildTurnFailedEvent(errorMessage));
+  }
+
+  private releaseWithheldErrorReply(events: AgentStreamEvent[]): void {
+    if (this.withheldErrorReply.length === 0) return;
+    for (const item of this.withheldErrorReply) {
+      events.push({ type: "timeline", item, provider: "claude" });
+    }
+    this.withheldErrorReply = [];
   }
 
   private createClaudeSessionChangedNotice(
@@ -7720,40 +7899,79 @@ function normalizeClaudeSessionTitle(title: string | null): string | null {
 }
 
 const CLAUDE_CUSTOM_TITLE_TYPE = "custom-title";
+const CLAUDE_CUSTOM_TITLE_NEEDLE = Buffer.from(`"${CLAUDE_CUSTOM_TITLE_TYPE}"`);
+const CLAUDE_TITLE_SCAN_CHUNK_BYTES = 64 * 1024;
+
+function readClaudeCustomTitleFromRecord(record: Buffer): string | null {
+  // The needle also matches a prompt that quotes it, so a record still has to
+  // parse as a `custom-title` entry carrying a usable name. Records without the
+  // needle are never decoded, so a long one costs a byte search and nothing more.
+  if (!record.includes(CLAUDE_CUSTOM_TITLE_NEEDLE)) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(record.toString("utf8").trim());
+  } catch {
+    return null;
+  }
+  const entry = toObjectRecord(parsed);
+  if (!entry || entry.isSidechain || entry.type !== CLAUDE_CUSTOM_TITLE_TYPE) {
+    return null;
+  }
+  return normalizeClaudeSessionTitle(
+    typeof entry.customTitle === "string" ? entry.customTitle : null,
+  );
+}
 
 /**
  * The `custom-title` record is re-emitted every time the session is saved, so
- * the current name is the last usable one in the file. Searching backwards finds it without
- * walking the transcript, which matters because sessions reach tens of
- * megabytes.
+ * the current name is the last usable one in the file. Reading backwards a chunk
+ * at a time finds it without walking the transcript, which matters because
+ * sessions reach tens of megabytes, and never holds the file as one string, so a
+ * transcript past V8's maximum string length still imports.
  */
-function readLastClaudeCustomTitle(content: string): string | null {
-  const needle = `"${CLAUDE_CUSTOM_TITLE_TYPE}"`;
-  let at = content.lastIndexOf(needle);
-  while (at >= 0) {
-    const lineStart = content.lastIndexOf("\n", at) + 1;
-    const lineEnd = content.indexOf("\n", at);
-    const line = lineEnd === -1 ? content.slice(lineStart) : content.slice(lineStart, lineEnd);
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(line.trim());
-    } catch {
-      parsed = undefined;
-    }
-    const entry = toObjectRecord(parsed);
-    if (entry && !entry.isSidechain && entry.type === CLAUDE_CUSTOM_TITLE_TYPE) {
-      const title = normalizeClaudeSessionTitle(
-        typeof entry.customTitle === "string" ? entry.customTitle : null,
+async function readLastClaudeCustomTitle(filePath: string): Promise<string | null> {
+  const handle = await fsPromises.open(filePath, "r");
+  try {
+    const stats = await handle.stat();
+    if (!stats.isFile()) {
+      // Opening a directory succeeds on Windows even though reading it does not,
+      // so reject the way reading the transcript as a file would.
+      throw Object.assign(
+        new Error(`EISDIR: illegal operation on a directory, read '${filePath}'`),
+        { code: "EISDIR", path: filePath },
       );
-      if (title) {
-        return title;
-      }
     }
-    // The needle also matches a prompt that quotes it, and a record can carry no
-    // usable name, so keep looking backwards for one that does.
-    at = at <= 0 ? -1 : content.lastIndexOf(needle, at - 1);
+    let end = stats.size;
+    // Retain unfinished record pieces in reverse file order. Assemble each
+    // complete record once, so a large tool/image record costs linear work.
+    let pieces: Buffer[] = [];
+    while (end > 0) {
+      const length = Math.min(CLAUDE_TITLE_SCAN_CHUNK_BYTES, end);
+      const chunk = Buffer.alloc(length);
+      await handle.read(chunk, 0, length, end - length);
+      let recordEnd = chunk.length;
+      for (
+        let at = chunk.lastIndexOf(10);
+        at >= 0;
+        at = at === 0 ? -1 : chunk.lastIndexOf(10, at - 1)
+      ) {
+        pieces.push(chunk.subarray(at + 1, recordEnd));
+        const record = Buffer.concat(pieces.toReversed());
+        const title = readClaudeCustomTitleFromRecord(record);
+        if (title) return title;
+        pieces = [];
+        recordEnd = at;
+      }
+      if (recordEnd > 0) pieces.push(chunk.subarray(0, recordEnd));
+      end -= length;
+    }
+    // The first record in the file has no newline in front of it.
+    return readClaudeCustomTitleFromRecord(Buffer.concat(pieces.toReversed()));
+  } finally {
+    await handle.close();
   }
-  return null;
 }
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
@@ -7765,9 +7983,8 @@ async function readClaudeRenamedSessionTitle(input: {
   sessionId: string;
   configDir: string;
 }): Promise<string | null> {
-  let content: string;
   try {
-    content = await fsPromises.readFile(await claudeTranscriptPath(input), "utf8");
+    return await readLastClaudeCustomTitle(await claudeTranscriptPath(input));
   } catch (error) {
     // A session with no transcript on disk has no rename to carry over. Every
     // other read failure is a real fault and stays explicit.
@@ -7776,7 +7993,6 @@ async function readClaudeRenamedSessionTitle(input: {
     }
     throw error;
   }
-  return readLastClaudeCustomTitle(content);
 }
 
 function normalizeImportablePromptPreview(text: string): string | null {

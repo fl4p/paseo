@@ -147,8 +147,6 @@ export const PaneFind = forwardRef<PaneFindHandle, PaneFindProps>(function PaneF
   const controlSize = smallIconButtonChromeFrameSize(isCompact);
   const glyphSize = paneContentToolbarIconSize(isCompact);
   const rowHeight = Math.max(COLLAPSED_FIELD_HEIGHT, controlSize);
-  // Keep the replace actions on the same row height as the icon controls beside them.
-  const actionSize = isCompact ? "sm" : "xs";
   const input = useRef<EditingTextInputHandle>(null);
   const replacementInput = useRef<EditingTextInputHandle>(null);
   useLayoutEffect(() => {
@@ -295,7 +293,7 @@ export const PaneFind = forwardRef<PaneFindHandle, PaneFindProps>(function PaneF
             />
             <Button
               variant="ghost"
-              size={actionSize}
+              size="sm"
               style={styles.replaceAction}
               disabled={!canNavigate}
               onPress={replace.onReplace}
@@ -304,7 +302,7 @@ export const PaneFind = forwardRef<PaneFindHandle, PaneFindProps>(function PaneF
             </Button>
             <Button
               variant="ghost"
-              size={actionSize}
+              size="sm"
               style={styles.replaceAction}
               disabled={!canNavigate}
               onPress={replace.onReplaceAll}

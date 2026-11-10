@@ -187,7 +187,6 @@ export function inheritedForkConfig(config: AgentSessionConfig): Partial<AgentSe
   copy("providerOptions");
   copy("toolPolicy");
   copy("mcpServers");
-  copy("featureValues");
   return inherited;
 }
 

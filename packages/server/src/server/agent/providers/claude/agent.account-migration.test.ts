@@ -171,7 +171,7 @@ migrationTest(
   async () => {
     const f = await fixture();
     try {
-      await f.session.setFeature?.("account", "work");
+      await f.session.applyOptions?.({ account: "work" });
       expect(f.channels[0]!.closed).toBe(true);
       expect(f.launches).toHaveLength(2);
       expect(f.launches[1]!.options.env?.CLAUDE_CONFIG_DIR).toBe(f.target);
@@ -218,7 +218,9 @@ migrationTest.each([null, "", '{"type":"user","message":{"content":"ok"}}\n{brok
   async (transcript) => {
     const f = await fixture(transcript);
     try {
-      await expect(f.session.setFeature?.("account", "work")).rejects.toThrow("saved transcript");
+      await expect(f.session.applyOptions?.({ account: "work" })).rejects.toThrow(
+        "saved transcript",
+      );
       expect(f.channels[0]!.closed).toBe(false);
       expect(f.session.describePersistence()?.sessionId).toBe(f.sourceId);
       expect(f.launches).toHaveLength(1);
@@ -259,7 +261,7 @@ migrationTest.each(["local_bash", "local_workflow", "unknown"])(
           }),
         ),
       );
-      await expect(f.session.setFeature?.("account", "work")).rejects.toThrow(
+      await expect(f.session.applyOptions?.({ account: "work" })).rejects.toThrow(
         "shell commands and workflows",
       );
       expect(f.channels[0]!.closed).toBe(false);
@@ -276,7 +278,9 @@ migrationTest(
     const f = await fixture();
     try {
       await fs.writeFile(f.target, "not a directory");
-      await expect(f.session.setFeature?.("account", "work")).rejects.toThrow("original account");
+      await expect(f.session.applyOptions?.({ account: "work" })).rejects.toThrow(
+        "original account",
+      );
       expect(f.channels[0]!.closed).toBe(true);
       expect(f.session.describePersistence()?.sessionId).toBe(f.sourceId);
       expect(f.launches[1]!.options.env?.CLAUDE_CONFIG_DIR).toBe(f.source);
@@ -306,7 +310,7 @@ migrationTest.each([
     );
     if (metadata === null) await fs.rm(metaPath);
     else await fs.writeFile(metaPath, metadata);
-    await expect(f.session.setFeature?.("account", "work")).rejects.toThrow("saved transcript");
+    await expect(f.session.applyOptions?.({ account: "work" })).rejects.toThrow("saved transcript");
     expect(f.channels[0]!.closed).toBe(false);
   } finally {
     await f.session.close();
@@ -326,7 +330,7 @@ migrationTest("recovers after confirmed process exit even when SDK return reject
   });
   f.channels[0]!.rejectReturn(new Error("query shutdown failed"));
   try {
-    await expect(f.session.setFeature?.("account", "work")).rejects.toThrow("original account");
+    await expect(f.session.applyOptions?.({ account: "work" })).rejects.toThrow("original account");
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
     expect(f.launches).toHaveLength(2);
     expect(f.launches[1]!.options.env?.CLAUDE_CONFIG_DIR).toBe(f.source);
@@ -372,7 +376,7 @@ migrationTest(
           is_backgrounded: true,
         });
       });
-      await f.session.setFeature?.("account", "work");
+      await f.session.applyOptions?.({ account: "work" });
       const prompt = f.launches[1]!.prompt;
       if (typeof prompt === "string") throw new Error("Expected streaming input");
       const recovery = JSON.stringify((await prompt[Symbol.asyncIterator]().next()).value);
@@ -407,7 +411,7 @@ migrationTest("reports a late shell even if the last agent completed during shut
         is_backgrounded: true,
       });
     });
-    await f.session.setFeature?.("account", "work");
+    await f.session.applyOptions?.({ account: "work" });
     expect(f.launches).toHaveLength(2);
     const prompt = f.launches[1]!.prompt;
     if (typeof prompt === "string") throw new Error("Expected streaming input");
@@ -423,7 +427,7 @@ migrationTest("a timed out old pump cannot complete the new recovery turn", asyn
   const f = await fixture();
   try {
     f.channels[0]!.holdOutputOpen();
-    await expect(f.session.setFeature?.("account", "work")).rejects.toThrow("unverified");
+    await expect(f.session.applyOptions?.({ account: "work" })).rejects.toThrow("unverified");
     expect(f.launches).toHaveLength(2);
     const completed = f.events.filter((e) => e.type === "turn_completed").length;
     const delivered = f.channels[0]!.delivered;
@@ -447,7 +451,7 @@ migrationTest(
   async () => {
     const f = await fixture();
     try {
-      await f.session.setFeature?.("account", "work");
+      await f.session.applyOptions?.({ account: "work" });
       expect(f.session.describePersistence()?.metadata?.claudeAccountRecovery).toEqual([
         "child123",
       ]);
@@ -462,9 +466,12 @@ migrationTest(
       const handle = f.session.describePersistence();
       if (!handle) throw new Error("Missing saved handle");
       await f.session.close();
-      const reopened = await f.client.resumeSession(handle);
+      // The daemon reopens an agent with its stored options; the handle carries no account.
+      const reopened = await f.client.resumeSession(handle, {
+        providerOptions: { account: "work" },
+      });
       try {
-        await reopened.setFeature?.("account", "default");
+        await reopened.applyOptions?.({ account: "default" });
         expect(f.launches).toHaveLength(3);
         const prompt = f.launches[2]!.prompt;
         if (typeof prompt === "string") throw new Error("Expected streaming input");
@@ -500,7 +507,7 @@ test.runIf(process.platform === "win32")(
   async () => {
     const f = await fixture();
     try {
-      await expect(f.session.setFeature?.("account", "work")).rejects.toThrow(
+      await expect(f.session.applyOptions?.({ account: "work" })).rejects.toThrow(
         "not supported on Windows",
       );
       expect(f.channels[0]!.closed).toBe(false);

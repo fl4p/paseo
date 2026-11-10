@@ -19,14 +19,15 @@ test("offers the configured subscription accounts when creating a session", asyn
     logger: createTestLogger(),
     providerParams: { accounts: { work: { label: "Work", configDir: "/tmp/claude-work" } } },
   });
-  expect(await client.listFeatures({ provider: "claude", cwd: process.cwd() })).toContainEqual(
+  const { controls } = await client.listControls({ provider: "claude", cwd: process.cwd() });
+  expect(controls).toContainEqual(
     expect.objectContaining({
       type: "select",
-      id: "account",
-      value: "default",
-      options: [
-        { id: "default", label: "Default account" },
-        { id: "work", label: "Work" },
+      key: "account",
+      defaultValue: "default",
+      choices: [
+        { value: "default", label: "Default account" },
+        { value: "work", label: "Work" },
       ],
     }),
   );
@@ -59,13 +60,16 @@ test("switches a resumed conversation into an isolated account and persists that
     metadata: { cwd: root },
   });
   try {
-    const switching = session.setFeature?.("account", "work");
-    await expect(session.setFeature?.("account", "work")).rejects.toThrow("already in progress");
+    const switching = session.applyOptions?.({ account: "work" });
+    await expect(session.applyOptions?.({ account: "work" })).rejects.toThrow(
+      "already in progress",
+    );
     await expect(session.startTurn("race")).rejects.toThrow("Account switch in progress");
     await switching;
     const handle = session.describePersistence();
     expect(handle?.sessionId).not.toBe(sourceId);
-    expect(handle?.metadata).toMatchObject({ featureValues: { account: "work" } });
+    // The daemon stores the selected account with the agent's options, not in the handle.
+    expect(handle?.metadata).not.toHaveProperty("featureValues");
     const targetProject = claudeProjectDirSync(root, { configDir: target });
     const copied = await fs.readFile(
       path.join(targetProject, `${handle?.sessionId}.jsonl`),
@@ -74,16 +78,19 @@ test("switches a resumed conversation into an isolated account and persists that
     expect(JSON.parse(copied)).toEqual({ ...entry, sessionId: handle?.sessionId });
     expect(await fs.readFile(path.join(project, `${sourceId}.jsonl`), "utf8")).toBe(original);
     expect(process.env.CLAUDE_CONFIG_DIR).toBe(source);
-    expect(session.features).toContainEqual(
-      expect.objectContaining({ id: "account", value: "work" }),
-    );
+    // Selecting the account already in use is a no-op: the conversation is not copied again.
+    await session.applyOptions?.({ account: "work" });
+    expect(session.describePersistence()?.sessionId).toBe(handle?.sessionId);
     const fork = await session.forkProviderSession?.({});
     const forkPath = path.join(targetProject, `${fork?.providerHandleId}.jsonl`);
     expect(await fs.readFile(forkPath, "utf8")).toContain("Remember this conversation");
-    await session.setFeature?.("account", "default");
-    expect(session.describePersistence()?.metadata).toMatchObject({
-      featureValues: { account: "default" },
-    });
+    await session.applyOptions?.({ account: "default" });
+    // Back on the default account the conversation moves to the source config dir.
+    const back = session.describePersistence()?.sessionId;
+    expect(back).not.toBe(handle?.sessionId);
+    expect(await fs.readFile(path.join(project, `${back}.jsonl`), "utf8")).toContain(
+      "Remember this conversation",
+    );
   } finally {
     await session.close();
   }
@@ -95,7 +102,7 @@ test("does not fall back to another account when the selected account was remove
     client.createSession({
       provider: "claude",
       cwd: process.cwd(),
-      featureValues: { account: "deleted" },
+      providerOptions: { account: "deleted" },
     }),
   ).rejects.toThrow("Unknown Claude account: deleted");
 });
@@ -122,11 +129,8 @@ test.each([undefined, "", "not json", '{"type":"user"}\n{"partial":'])(
       metadata: { cwd: root },
     });
     try {
-      await expect(session.setFeature?.("account", "work")).rejects.toThrow();
+      await expect(session.applyOptions?.({ account: "work" })).rejects.toThrow();
       expect(session.id).toBe("original");
-      expect(session.features).toContainEqual(
-        expect.objectContaining({ id: "account", value: "default" }),
-      );
       await expect(fs.stat(target)).rejects.toMatchObject({ code: "ENOENT" });
     } finally {
       await session.close();
@@ -168,7 +172,7 @@ test("isolates concurrent launch environments and keeps the chosen account after
   const work = await client.createSession({
     provider: "claude",
     cwd: process.cwd(),
-    featureValues: { account: "work" },
+    providerOptions: { account: "work" },
   });
   const personal = await client.resumeSession({
     provider: "claude",
@@ -215,12 +219,13 @@ test("the provider registry passes account configuration to Claude", async () =>
     },
   });
   const client = registry.claude.createClient(logger);
-  expect(await client.listFeatures?.({ provider: "claude", cwd: process.cwd() })).toContainEqual(
+  const listed = await client.listControls?.({ provider: "claude", cwd: process.cwd() });
+  expect(listed?.controls).toContainEqual(
     expect.objectContaining({
-      id: "account",
-      options: [
-        { id: "default", label: "Default account" },
-        { id: "work", label: "Work" },
+      key: "account",
+      choices: [
+        { value: "default", label: "Default account" },
+        { value: "work", label: "Work" },
       ],
     }),
   );
@@ -244,10 +249,11 @@ test("refuses an account switch while a turn is starting", async () => {
   const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
   const starting = session.startTurn("hello");
   try {
-    await expect(session.setFeature?.("account", "work")).rejects.toThrow("Stop the current turn");
-    expect(session.features).toContainEqual(
-      expect.objectContaining({ id: "account", value: "default" }),
+    await expect(session.applyOptions?.({ account: "work" })).rejects.toThrow(
+      "Stop the current turn",
     );
+    // Still on the default account: selecting it again is a no-op rather than a switch.
+    await expect(session.applyOptions?.({ account: "default" })).resolves.toBeUndefined();
   } finally {
     finishResolve("/test/claude");
     await starting;

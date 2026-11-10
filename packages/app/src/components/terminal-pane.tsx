@@ -85,6 +85,7 @@ import {
 } from "./terminal-resize-debouncer";
 import { useIsCompactFormFactor } from "@/constants/layout";
 import { getIsElectron, isNative } from "@/constants/platform";
+import { useKeyboardFocusSurface } from "@/keyboard";
 import {
   applyTerminalRendererReadyChange,
   resolveTerminalStreamTarget,
@@ -257,6 +258,7 @@ function KeyboardToggleButton({
   );
 }
 
+// oxlint-disable-next-line complexity -- merge of the Electron Find widget switch (local) and the keyboard focus surface (upstream)
 export function TerminalPane({
   serverId,
   cwd,
@@ -463,6 +465,8 @@ export function TerminalPane({
       requestTerminalFocus();
     }
   }, [isMobile, isPaneFocused, isWorkspaceFocused, requestTerminalFocus, scopeKey, terminalId]);
+
+  useKeyboardFocusSurface("terminal", isTerminalPresented && isPaneFocused && terminalId != null);
 
   useEffect(() => {
     const canRequest = canRequestFocusClaim({

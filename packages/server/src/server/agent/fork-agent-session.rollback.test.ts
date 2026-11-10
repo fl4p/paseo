@@ -254,7 +254,7 @@ describe("a fork whose import fails after registering the agent", () => {
     // No agent survives, in memory or on disk. Either one would be an agent
     // pointing at the transcript the rollback below deleted.
     expect(manager.listAgents()).toEqual([]);
-    expect(await storage.list()).toEqual([]);
+    expect(await storage.listAll()).toEqual([]);
     // The provider session the failed registration owned is closed, not leaked.
     expect(client.importedSessions.map((session) => session.closed)).toEqual([true]);
 
