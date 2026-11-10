@@ -56,6 +56,13 @@ const DEFAULT_REFRESH_TIMEOUT_MS = 120_000;
 const MAX_REFRESH_TIMEOUT_MS = 2_147_483_647;
 const DEFAULT_DIAGNOSTIC_TIMEOUT_MS = 120_000;
 const PROVIDER_REFRESH_DEADLINE_ENV = "PASEO_PROVIDER_REFRESH_TIMEOUT_MS";
+/**
+ * A failed refresh is a transient fact, not a cached catalogue. Once this long has passed, the
+ * next ordinary read retries it, so one slow probe (e.g. `which` timing out under boot load)
+ * cannot pin the provider to "error" for the daemon's lifetime. The delay bounds retry churn
+ * from snapshot reads while a provider is genuinely broken.
+ */
+const FAILED_REFRESH_RETRY_AFTER_MS = 5_000;
 export const GLOBAL_PROVIDER_SNAPSHOT_KEY = "paseo:global";
 
 function validRefreshDeadline(value: unknown): number | undefined {
@@ -209,6 +216,8 @@ interface CatalogBinding {
 interface ProviderCatalog {
   result?: ProviderSnapshotRecord;
   stale?: boolean;
+  /** Date.now() when `result` was published as an error; cleared by any non-error result. */
+  failedAt?: number;
   load?: Promise<void>;
 }
 
@@ -964,7 +973,11 @@ export class ProviderSnapshotManager {
       catalogs.set(provider, catalog);
     }
     this.publishTargets([snapshotCwd]);
-    if (!force && (catalog.load || (catalog.result && !catalog.stale))) return catalog.load;
+    const failedRefreshExpired =
+      catalog.failedAt !== undefined &&
+      Date.now() - catalog.failedAt >= FAILED_REFRESH_RETRY_AFTER_MS;
+    if (!force && (catalog.load || (catalog.result && !catalog.stale && !failedRefreshExpired)))
+      return catalog.load;
     catalog.stale = false;
 
     const current = catalog;
@@ -983,6 +996,7 @@ export class ProviderSnapshotManager {
           publish: (entry) => {
             if (!isCurrent()) return false;
             current.result = identifyEntry(structuredClone(entry));
+            current.failedAt = entry.status === "error" ? Date.now() : undefined;
             const boundTargets = [...this.targets].flatMap(([cwd, target]) =>
               target.bindings.get(provider)?.key === key ? [cwd] : [],
             );

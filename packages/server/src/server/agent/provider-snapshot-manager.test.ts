@@ -611,6 +611,88 @@ describe("ProviderSnapshotManager public surface", () => {
     }
   });
 
+  test("an ordinary read retries a failed refresh once the retry delay has passed", async () => {
+    // Regression: one `which -a claude` timing out at boot pinned the provider to "error"
+    // until a forced refresh, so every agent creation replayed the stale error.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    let failing = true;
+    const isAvailable = vi.fn(async () => {
+      if (failing) throw new Error("Command failed: /usr/bin/which -a codex\n");
+      return true;
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      refreshTimeoutMs: TEST_REFRESH_TIMEOUT_MS,
+      providerOverrides: {
+        claude: { enabled: false },
+        copilot: { enabled: false },
+        opencode: { enabled: false },
+        pi: { enabled: false },
+      },
+      extraClients: { codex: createExtraClient("codex", { isAvailable }) },
+    });
+    const read = () => manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+
+    try {
+      await expect(read()).resolves.toMatchObject({
+        status: "error",
+        error: "Command failed: /usr/bin/which -a codex\n",
+      });
+      failing = false;
+
+      // Within the retry delay the failure is served from cache, without re-probing.
+      vi.advanceTimersByTime(4_999);
+      await expect(read()).resolves.toMatchObject({ status: "error" });
+      expect(isAvailable).toHaveBeenCalledTimes(1);
+
+      vi.advanceTimersByTime(1);
+      await expect(read()).resolves.toMatchObject({ status: "ready" });
+      expect(isAvailable).toHaveBeenCalledTimes(2);
+
+      // A ready result stays cached; the retry applies only to failures.
+      vi.advanceTimersByTime(60_000);
+      await expect(read()).resolves.toMatchObject({ status: "ready" });
+      expect(isAvailable).toHaveBeenCalledTimes(2);
+    } finally {
+      manager.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  test("a provider that keeps failing is re-probed at most once per retry delay", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const isAvailable = vi.fn(async () => {
+      throw new Error("still broken");
+    });
+    const manager = new ProviderSnapshotManager({
+      logger: createTestLogger(),
+      refreshTimeoutMs: TEST_REFRESH_TIMEOUT_MS,
+      providerOverrides: {
+        claude: { enabled: false },
+        copilot: { enabled: false },
+        opencode: { enabled: false },
+        pi: { enabled: false },
+      },
+      extraClients: { codex: createExtraClient("codex", { isAvailable }) },
+    });
+    const read = () => manager.getProvider({ cwd: "/tmp/project", provider: "codex", wait: true });
+
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        await expect(read()).resolves.toMatchObject({ status: "error", error: "still broken" });
+      }
+      expect(isAvailable).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(5_000);
+      for (let i = 0; i < 5; i += 1) {
+        await expect(read()).resolves.toMatchObject({ status: "error", error: "still broken" });
+      }
+      expect(isAvailable).toHaveBeenCalledTimes(2);
+    } finally {
+      manager.destroy();
+      vi.useRealTimers();
+    }
+  });
+
   test("defaults provider refreshes to a two-minute deadline", async () => {
     vi.useFakeTimers();
     let recovered = false;
