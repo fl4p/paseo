@@ -3027,7 +3027,18 @@ class ClaudeAgentSession implements AgentSession {
     // itself, carrying the conversation and resumable subagents over to the selected account.
     if (Object.hasOwn(options, CLAUDE_ACCOUNT_FEATURE)) {
       const { [CLAUDE_ACCOUNT_FEATURE]: account, ...rest } = options;
-      await this.switchAccount(account);
+      const selectedId = resolveClaudeAccount(this.accounts, account)?.id ?? DEFAULT_CLAUDE_ACCOUNT;
+      const currentId = this.config.providerOptions.account ?? DEFAULT_CLAUDE_ACCOUNT;
+      if (selectedId !== currentId) {
+        // The switch commits (new account, copied conversation, relaunched query) before
+        // anything else could be checked, so a failure in the rest of the patch would reject
+        // the call after the account had already changed, and the daemon would not record it.
+        if (Object.keys(rest).length > 0) {
+          throw new ClaudeAccountError("Change the account on its own, not with other options.");
+        }
+        await this.switchAccount(account);
+        return;
+      }
       if (Object.keys(rest).length === 0) return;
       options = rest;
     }

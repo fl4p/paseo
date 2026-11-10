@@ -260,3 +260,28 @@ test("refuses an account switch while a turn is starting", async () => {
     await session.close();
   }
 });
+
+test("rejects an account switch combined with other options before switching", async () => {
+  const queryFactory = vi.fn(() => {
+    throw new Error("an account switch must not relaunch");
+  });
+  const client = new ClaudeAgentClient({
+    logger: createTestLogger(),
+    resolveBinary: async () => "/test/claude",
+    providerParams: { accounts: { work: { label: "Work", configDir: "/tmp/work-claude" } } },
+    queryFactory,
+  });
+  const session = await client.createSession({ provider: "claude", cwd: process.cwd() });
+  try {
+    // A later failure in the rest of the patch would otherwise reject the call after the
+    // account had already changed, leaving the daemon's stored options behind the session.
+    await expect(session.applyOptions?.({ account: "work", unknownOption: true })).rejects.toThrow(
+      "Change the account on its own",
+    );
+    expect(queryFactory).not.toHaveBeenCalled();
+    // Still on the default account: selecting it again is a no-op rather than a switch.
+    await expect(session.applyOptions?.({ account: "default" })).resolves.toBeUndefined();
+  } finally {
+    await session.close();
+  }
+});

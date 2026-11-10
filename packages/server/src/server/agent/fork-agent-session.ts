@@ -5,6 +5,7 @@ import type { PersistedWorkspaceRecord } from "../workspace-registry.js";
 import { resolveForkBoundaryMessageId } from "./activity-curator.js";
 import { isSameRealDirectory } from "../../utils/path.js";
 import type { AgentTimelineRow } from "./agent-timeline-store-types.js";
+import { AgentManagerShuttingDownError } from "./agent-manager.js";
 
 export interface ForkAgentSessionRequest {
   agentId: string;
@@ -261,6 +262,17 @@ async function withForkRollback<T>(
   try {
     return await run();
   } catch (error) {
+    if (error instanceof AgentManagerShuttingDownError) {
+      // A shutdown that interrupts the import keeps the half-registered agent as a closed,
+      // resumable record pointing at this provider session, so deleting it here would leave
+      // that record without a conversation. If the shutdown came before registration, the
+      // transcript stays behind unreferenced, which loses nothing.
+      deps.logger.warn(
+        { err: error, agentId, providerHandleId },
+        "agent.fork_session.rollback_skipped: kept the forked provider session across shutdown",
+      );
+      throw error;
+    }
     try {
       await deps.deleteForkedProviderSession(agentId, { providerHandleId });
       deps.logger.warn(

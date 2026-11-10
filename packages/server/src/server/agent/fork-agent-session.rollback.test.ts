@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import pino from "pino";
 
-import { AgentManager } from "./agent-manager.js";
+import { AgentManager, AgentManagerShuttingDownError } from "./agent-manager.js";
 import { AgentStorage } from "./agent-storage.js";
 import { forkAgentSessionNatively, type ForkAgentSessionDeps } from "./fork-agent-session.js";
 import type {
@@ -171,6 +171,9 @@ describe("a fork whose import fails after registering the agent", () => {
   /** How many snapshot writes to let through before failing one. */
   let failSnapshotWriteNumber: number | null;
   let snapshotWrites: number;
+  /** Start a daemon shutdown (and its close of the agent) right after this snapshot write. */
+  let shutDownAfterSnapshotWriteNumber: number | null;
+  let shutdownClose: Promise<unknown> | null;
 
   beforeEach(() => {
     workdir = mkdtempSync(join(tmpdir(), "paseo-fork-rollback-"));
@@ -180,6 +183,8 @@ describe("a fork whose import fails after registering the agent", () => {
 
     snapshotWrites = 0;
     failSnapshotWriteNumber = null;
+    shutDownAfterSnapshotWriteNumber = null;
+    shutdownClose = null;
     const applySnapshot = storage.applySnapshot.bind(storage);
     storage.applySnapshot = async (agent, options) => {
       snapshotWrites += 1;
@@ -187,6 +192,10 @@ describe("a fork whose import fails after registering the agent", () => {
         throw new Error("snapshot store is full");
       }
       await applySnapshot(agent, options);
+      if (snapshotWrites === shutDownAfterSnapshotWriteNumber) {
+        manager.prepareForShutdown();
+        shutdownClose = manager.closeAgent(agent.id);
+      }
     };
 
     // Stand-in for the branched provider transcript: the fork creates it and
@@ -263,6 +272,25 @@ describe("a fork whose import fails after registering the agent", () => {
       providerHandleId: "forked-session",
     });
     expect(existsSync(forkTranscriptPath)).toBe(false);
+  });
+
+  it("keeps the transcript a shutdown-retained agent record points at", async () => {
+    // Shutdown interrupts the registration after its first snapshot. The import fails, but
+    // shutdown's close keeps the agent as a closed, resumable record of the forked session,
+    // so the rollback must leave that session's transcript alone.
+    shutDownAfterSnapshotWriteNumber = 1;
+
+    await expect(
+      forkAgentSessionNatively({ agentId: "agent-source", requestId: "req-3" }, deps),
+    ).rejects.toBeInstanceOf(AgentManagerShuttingDownError);
+    await shutdownClose;
+    await storage.flush();
+
+    const records = await storage.listAll();
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ lastStatus: "closed" });
+    expect(deps.deleteForkedProviderSession).not.toHaveBeenCalled();
+    expect(existsSync(forkTranscriptPath)).toBe(true);
   });
 
   it("keeps the transcript when the agent survives", async () => {
