@@ -413,6 +413,8 @@ function createSessionForTest(options: SessionForTestOptions = {}): Session {
       listProviderSubagentActivity: vi.fn(() => []),
       getAgentBackgroundWorkSummary: () => undefined,
       subscribe: vi.fn(() => () => {}),
+      discardHeldPrompts: vi.fn(() => 0),
+      isHoldingPromptsForCompaction: vi.fn(() => false),
       ...options.agentManager,
     }),
     agentStorage: asAgentStorage({

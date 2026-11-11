@@ -70,6 +70,13 @@ class FakeLifecycleAgentManager implements LifecycleAgentManager {
       : ({ status: "not_running" } as const);
   }
 
+  readonly discardedHeldPromptAgentIds: string[] = [];
+
+  discardHeldPrompts(agentId: string): number {
+    this.discardedHeldPromptAgentIds.push(agentId);
+    return 0;
+  }
+
   async clearAgentAttention(agentId: string): Promise<void> {
     this.clearedAttentionAgentIds.push(agentId);
   }

@@ -488,6 +488,13 @@ export type AgentStreamEvent =
       event: import("./provider-subagents/store.js").ProviderSubagentInputEvent;
     }
   | {
+      /** A prompt the client submitted never reached the provider and never will. */
+      type: "prompt_discarded";
+      provider: AgentProvider;
+      clientMessageId: string;
+      reason: string;
+    }
+  | {
       /** Full replacement of the agent's live background work (shells, monitors…). */
       type: "background_work";
       provider: AgentProvider;
@@ -774,8 +781,21 @@ export interface AgentSession {
    * (if any) is left untouched, so this is how mid-turn side-effect commands
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
+export type OutOfBandPromptHandler = {
+  /** The command is a compaction: prompts must be held from the dispatch onward. */
+  compaction?: boolean;
+  run(ctx: {
+    emit: (event: AgentStreamEvent) => void;
+  }): Promise<{ compactionStarted?: boolean } | void>;
+};
+
+export interface AgentSessionControl {
   tryHandleOutOfBand?(prompt: AgentPromptInput): {
-    run(ctx: { emit: (event: AgentStreamEvent) => void }): Promise<void>;
+    /** The command is a compaction: prompts must be held from the dispatch onward. */
+    compaction?: boolean;
+    run(ctx: {
+      emit: (event: AgentStreamEvent) => void;
+    }): Promise<{ compactionStarted?: boolean } | void>;
   } | null;
 }
 
