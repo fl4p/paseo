@@ -842,6 +842,11 @@ interface CompactionGate {
   release: () => void;
   /** The provider has an open `loading` compaction marker it has not terminalized. */
   markerOpen: boolean;
+  /**
+   * The open marker came with no turn: a compaction that runs beside turns (pi, OMP), which no
+   * cancel of a turn can have ended.
+   */
+  markerOutOfBand: boolean;
   /** Manual compactions dispatched whose first marker has not arrived yet. */
   arms: Set<CompactionArm>;
   /**
@@ -954,6 +959,7 @@ export class AgentManager {
       windowMs: options.agentStreamCoalesceWindowMs ?? AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
       timers: { setTimeout, clearTimeout },
       onFlush: ({ agentId, item, provider, turnId }) => {
+        this.trackCompactionGate(agentId, item, turnId);
         const event = this.recordAndDispatchTimelineItem(agentId, item, provider, turnId);
         this.notifyForegroundTurnWaiters(agentId, event);
       },
@@ -1025,6 +1031,14 @@ export class AgentManager {
 
   prepareForShutdown(): void {
     this.acceptingAgentRegistrations = false;
+    // Nothing held in memory survives the daemon. Fail the prompts visibly instead of dropping
+    // them, so the client stops showing them as still sending.
+    for (const agentId of Array.from(this.heldPrompts.keys())) {
+      this.discardHeldPrompts(
+        agentId,
+        "the daemon shut down while the message waited for a compaction",
+      );
+    }
   }
 
   setPaseoToolsEnabled(enabled: boolean): void {
@@ -3115,21 +3129,21 @@ export class AgentManager {
       this.dispatchStream(agent.id, event, { timestamp: new Date().toISOString() });
     };
     const disarm = handler.compaction ? this.armCompactionGate(agent.id, "out_of_band") : null;
-    void this.runForegroundMutation(agentId, async () => {
-      try {
-        const outcome = await handler.run({ emit: dispatch });
+    const outOfBand = handler.run({ emit: dispatch });
+    void outOfBand
+      .then((outcome) => {
         if (outcome && outcome.compactionStarted === false) {
           disarm?.();
         }
-      } catch (error) {
+      })
+      .catch((error: unknown) => {
         const text = error instanceof Error ? error.message : "Out-of-band command failed";
         dispatch({
           type: "timeline",
           provider: agent.provider,
           item: { type: "assistant_message", text: `[Error] ${text}` },
         });
-      }
-    });
+      });
     return true;
   }
 
@@ -3306,6 +3320,12 @@ export class AgentManager {
     agent.lastError = undefined;
 
     const pendingRun = this.runs.createPendingRun(agentId);
+    // A provider whose manual compaction is a normal prompt (Claude's `/compact`) arms the gate
+    // here, so a prompt sent before the provider's first marker is held instead of replacing —
+    // and cancelling — the compaction turn. The arm is turn-scoped: the turn's end drops it.
+    if (agent.session.isManualCompactionPrompt?.(prompt)) {
+      this.armCompactionGate(agentId, "turn");
+    }
 
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
@@ -3929,6 +3949,16 @@ export class AgentManager {
       this.touchUpdatedAt(agent);
       this.emitState(agent);
     }
+    // A settled cancel ended any compaction the run was doing, even on a path that published no
+    // terminal event. Release its held prompts rather than leave them waiting on an idle agent.
+    // A running out-of-band compaction (pi, OMP) is not the run's: pi's abort returns only once
+    // its agent is idle, so a Stop pressed just before /compact settles after that compaction has
+    // started. Releasing it here let the next prompt reach pi, which refused it (2026-11-01).
+    if (this.compactionGates.get(agentId)?.markerOutOfBand) {
+      this.releaseTurnScopedCompactionGate(agentId);
+      return { status: "settled" };
+    }
+    this.releaseCompactionGate(agentId);
     return { status: "settled" };
   }
 
@@ -5146,6 +5176,9 @@ export class AgentManager {
         if (isForegroundEvent) {
           this.finalizeForegroundTurn(agent, eventTurnId);
         }
+        // No turn-scoped compaction outlives a turn end, whether or not the provider closed its
+        // marker. Released last, so a held prompt sees the run already settled.
+        this.releaseTurnScopedCompactionGate(agent.id);
       }
 
       if (flags.shouldDispatchEvent) {
@@ -6604,6 +6637,7 @@ export class AgentManager {
       released,
       release,
       markerOpen: false,
+      markerOutOfBand: false,
       arms: new Set(),
       requiresRun: scope === "turn",
       timeout: setTimeout(() => undefined, 0),
@@ -6628,6 +6662,7 @@ export class AgentManager {
   private openCompactionMarker(agentId: string, scope: CompactionArm["scope"]): void {
     const gate = this.ensureCompactionGate(agentId, scope);
     gate.markerOpen = true;
+    gate.markerOutOfBand = scope === "out_of_band";
     // The marker this arm was waiting for: the arm has done its job of covering the dispatch
     // window, and the marker now keeps the gate open on its own.
     const oldestArm = gate.arms.values().next();
@@ -6642,6 +6677,7 @@ export class AgentManager {
       return;
     }
     gate.markerOpen = false;
+    gate.markerOutOfBand = false;
     this.refreshCompactionGateBackstop(agentId, gate);
     this.settleCompactionGate(agentId);
   }

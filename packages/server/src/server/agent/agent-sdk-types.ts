@@ -782,6 +782,8 @@ export interface AgentSession {
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
   tryHandleOutOfBand?(prompt: AgentPromptInput): OutOfBandPromptHandler | null;
+  /** Whether this prompt is a manual compaction the provider runs as a normal turn. */
+  isManualCompactionPrompt?(prompt: AgentPromptInput): boolean;
 }
 
 export type OutOfBandPromptHandler = {

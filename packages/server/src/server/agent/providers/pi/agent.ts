@@ -32,6 +32,7 @@ import {
   type AgentSlashCommand,
   type AgentSlashCommandKind,
   type AgentStreamEvent,
+  type AgentTimelineItem,
   type FetchCatalogOptions,
   type SteerActiveTurnOptions,
   type SteerResult,
@@ -1049,6 +1050,27 @@ function isPiAgentSessionEvent(event: PiRuntimeEvent): event is PiAgentSessionEv
     default:
       return false;
   }
+}
+
+/**
+ * Pi ends a failed or aborted compaction with the same `compaction_end`, before its compact RPC
+ * rejects. Without an outcome the separator claims a compaction that did not happen.
+ */
+function mapPiCompactionEnd(
+  event: Extract<PiAgentSessionEvent, { type: "compaction_end" }>,
+): Extract<AgentTimelineItem, { type: "compaction" }> {
+  const item: Extract<AgentTimelineItem, { type: "compaction" }> = {
+    type: "compaction",
+    status: "completed",
+    trigger: event.reason === "manual" ? "manual" : "auto",
+  };
+  if (event.aborted) {
+    return { ...item, outcome: "canceled" };
+  }
+  if (event.errorMessage) {
+    return { ...item, outcome: "failed" };
+  }
+  return item;
 }
 
 function buildExtensionUiQuestionPermission(
@@ -2336,14 +2358,7 @@ export class PiRpcAgentSession implements AgentSession {
         });
         return;
       case "compaction_end":
-        this.emitCompactionTimeline({
-          turnId,
-          item: {
-            type: "compaction",
-            status: "completed",
-            trigger: event.reason === "manual" ? "manual" : "auto",
-          },
-        });
+        this.emitCompactionTimeline({ turnId, item: mapPiCompactionEnd(event) });
         return;
       case "auto_retry_start":
         this.emit({

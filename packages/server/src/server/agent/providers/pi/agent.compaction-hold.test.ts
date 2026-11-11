@@ -71,3 +71,146 @@ test("a prompt sent during a Pi compaction is held and delivered once the compac
     await manager.closeAgent(agent.id);
   }
 });
+
+/**
+ * The sequence from 2026-11-01 (rpi daemon, agent b43fd9d9): a prompt hangs on a dead provider,
+ * the user presses Stop, then sends `/compact` while Pi is still aborting, then a prompt. Pi's abort
+ * waits for its agent to go idle, so the Stop settles only after the compaction has started; that
+ * settle released the out-of-band compaction's hold and the prompt reached Pi, which refused it.
+ */
+test("a Stop that settles after /compact started does not release the compaction's hold", async () => {
+  const pi = new FakePi();
+  const manager = new AgentManager({
+    clients: { pi: new PiRpcAgentClient({ logger, runtime: pi }) },
+    logger,
+  });
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const session = pi.latestSession();
+
+    // A turn whose provider request never answers.
+    const hung = await startAgentRun(manager, agent.id, "?", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "interrupt",
+    });
+    expect(hung.disposition).toBe("turn_started");
+    await expect.poll(() => session.prompts.length).toBe(1);
+    await expect.poll(() => manager.hasInFlightRun(agent.id)).toBe(true);
+
+    // Stop: Pi's abort does not return until its agent is idle.
+    let finishAbort!: () => void;
+    session.abortGate = new Promise<void>((resolve) => {
+      finishAbort = resolve;
+    });
+    const stop = manager.cancelAgentRun(agent.id);
+    await expect.poll(() => session.abortRequested).toBe(true);
+
+    // /compact while the abort is still in flight.
+    let endCompaction!: () => void;
+    session.compactGate = new Promise<void>((resolve) => {
+      endCompaction = resolve;
+    });
+    const compact = await startAgentRun(manager, agent.id, "/compact", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "interrupt",
+    });
+    expect(compact.disposition).toBe("out_of_band");
+    await expect
+      .poll(() =>
+        timelineItems(events).some(
+          (item) => item.type === "compaction" && item.status === "loading",
+        ),
+      )
+      .toBe(true);
+
+    // Pi goes idle: the Stop settles while Pi is compacting.
+    finishAbort();
+    await expect(stop).resolves.toEqual({ status: "settled" });
+
+    const followUp = await startAgentRun(manager, agent.id, "?", logger, {
+      replaceRunning: true,
+      activeTurnBehavior: "interrupt",
+      runOptions: { clientMessageId: "client-after-stop" },
+    });
+    expect(followUp.disposition).toBe("held");
+    expect(session.prompts.map((prompt) => prompt.message)).toEqual(["?"]);
+
+    endCompaction();
+    await expect.poll(() => session.prompts.length).toBe(2);
+    expect(session.compactRequests).toHaveLength(1);
+  } finally {
+    unsubscribe();
+    await manager.closeAgent(agent.id);
+  }
+});
+
+test("a Pi compaction that fails after it started is marked failed, not compacted", async () => {
+  const pi = new FakePi();
+  const manager = new AgentManager({
+    clients: { pi: new PiRpcAgentClient({ logger, runtime: pi }) },
+    logger,
+  });
+  const events: AgentManagerEvent[] = [];
+  const unsubscribe = manager.subscribe((event) => events.push(event), { replayState: false });
+  const agent = await manager.createAgent({ provider: "pi", cwd: process.cwd() }, undefined, {
+    workspaceId: undefined,
+  });
+  try {
+    const session = pi.latestSession();
+    // What pi 0.84 does when the summarization request fails: compaction_end carries the error,
+    // then the compact RPC rejects.
+    session.emitCompactEnd = false;
+    session.compactError = new Error(
+      "Summarization failed: this lane lost a rank (rank 1 stopped answering)",
+    );
+    let failCompaction!: () => void;
+    session.compactGate = new Promise<void>((resolve) => {
+      failCompaction = resolve;
+    });
+
+    await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+    await expect.poll(() => session.compactRequests.length).toBe(1);
+    await expect.poll(() => manager.isHoldingPromptsForCompaction(agent.id)).toBe(true);
+
+    session.emit({
+      type: "compaction_end",
+      reason: "manual",
+      aborted: false,
+      errorMessage: "Compaction failed: Summarization failed: this lane lost a rank",
+    });
+    failCompaction();
+
+    await expect
+      .poll(() =>
+        timelineItems(events).some(
+          (item) => item.type === "assistant_message" && item.text.includes("Failed to compact"),
+        ),
+      )
+      .toBe(true);
+    const ends = timelineItems(events).filter(
+      (item) => item.type === "compaction" && item.status === "completed",
+    );
+    expect(ends).toEqual([
+      { type: "compaction", status: "completed", trigger: "manual", outcome: "failed" },
+    ]);
+    // The hold is gone and a second /compact is accepted again.
+    expect(manager.isHoldingPromptsForCompaction(agent.id)).toBe(false);
+    session.compactGate = null;
+    session.compactError = null;
+    session.emitCompactEnd = true;
+    await startAgentRun(manager, agent.id, "/compact", logger, { replaceRunning: true });
+    await expect.poll(() => session.compactRequests.length).toBe(2);
+    expect(
+      timelineItems(events).some(
+        (item) => item.type === "assistant_message" && item.text.includes("already running"),
+      ),
+    ).toBe(false);
+  } finally {
+    unsubscribe();
+    await manager.closeAgent(agent.id);
+  }
+});
