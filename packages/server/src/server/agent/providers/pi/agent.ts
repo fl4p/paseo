@@ -68,6 +68,7 @@ import {
 import {
   materializeProviderImage,
   renderProviderImageOutputAsAssistantMarkdown,
+  type ProviderImageOutput,
 } from "../provider-image-output.js";
 import { PiCliRuntime } from "./cli-runtime.js";
 import {

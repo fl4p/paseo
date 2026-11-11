@@ -1,3 +1,6 @@
+import { getPeerMessageDisplayText, getPeerMessagePreview } from "@/components/message-peer-display";
+import { getPeerMessageOriginLabel } from "./message-peer-origin-label";
+import type { PeerMessageOrigin } from "@getpaseo/protocol/agent-types";
 import { useDisclosureHold } from "@/agent-stream/disclosure";
 import { MessagePreview, MessageSender } from "@/components/user-message";
 import { useStableEvent } from "@/hooks/use-stable-event";
@@ -48,6 +51,7 @@ import {
   Scissors,
   TriangleAlertIcon,
   XCircle,
+  Bot,
 } from "lucide-react-native";
 import type { ComponentType, ReactNode } from "react";
 import * as React from "react";
@@ -148,6 +152,8 @@ const foregroundColorMapping = (theme: Theme) => ({ color: theme.colors.foregrou
 const foregroundMutedColorMapping = (theme: Theme) => ({
   color: theme.colors.foregroundMuted,
 });
+
+const ThemedBot = withUnistyles(Bot, foregroundMutedColorMapping);
 const mutedForegroundColorMapping = (theme: Theme) => ({
   color: theme.colors.mutedForeground,
 });

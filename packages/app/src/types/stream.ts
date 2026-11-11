@@ -4,6 +4,7 @@ import type {
   AgentTimelineItem,
   JsonValue,
   ToolCallDetail,
+  PeerMessageOrigin,
 } from "@getpaseo/protocol/agent-types";
 import { timelineItemIdentity } from "@getpaseo/protocol/timeline-identity";
 import type { AgentAttachment, AgentStreamEventPayload } from "@getpaseo/protocol/messages";

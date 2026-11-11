@@ -10,6 +10,7 @@ import type {
 } from "@getpaseo/protocol/agent-types";
 import type { AgentMessage } from "@getpaseo/protocol/agent-message";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
+import type { PeerMessageOrigin } from "@getpaseo/protocol/agent-types";
 import type { PaseoToolCatalog } from "./tools/types.js";
 
 export type {
