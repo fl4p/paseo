@@ -781,6 +781,9 @@ export interface AgentSession {
    * (if any) is left untouched, so this is how mid-turn side-effect commands
    * (e.g. /goal pause) reach the provider without canceling the running turn.
    */
+  tryHandleOutOfBand?(prompt: AgentPromptInput): OutOfBandPromptHandler | null;
+}
+
 export type OutOfBandPromptHandler = {
   /** The command is a compaction: prompts must be held from the dispatch onward. */
   compaction?: boolean;
@@ -788,16 +791,6 @@ export type OutOfBandPromptHandler = {
     emit: (event: AgentStreamEvent) => void;
   }): Promise<{ compactionStarted?: boolean } | void>;
 };
-
-export interface AgentSessionControl {
-  tryHandleOutOfBand?(prompt: AgentPromptInput): {
-    /** The command is a compaction: prompts must be held from the dispatch onward. */
-    compaction?: boolean;
-    run(ctx: {
-      emit: (event: AgentStreamEvent) => void;
-    }): Promise<{ compactionStarted?: boolean } | void>;
-  } | null;
-}
 
 export type FetchCatalogOptions = { providerOptions?: ProviderOptions } & (
   | {
